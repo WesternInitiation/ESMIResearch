@@ -109,7 +109,7 @@ class ArchiveImageTests(unittest.TestCase):
                 self.assertEqual(dataset.count, 2)
                 self.assertEqual(dataset.crs.to_string(), "EPSG:4326")
                 self.assertEqual(dataset.transform, transform)
-                self.assertEqual(dataset.compression.name, "DEFLATE")
+                self.assertEqual(dataset.compression.name.lower(), "deflate")
 
 
 if __name__ == "__main__":
