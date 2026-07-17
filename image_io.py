@@ -1,10 +1,12 @@
-"""Load satellite imagery from PNG and GeoTIFF sources."""
+"""Load and export satellite imagery, including images packaged in TAR archives."""
 
 from __future__ import annotations
 
+import tarfile
 from dataclasses import dataclass
 from io import BytesIO
-from typing import BinaryIO
+from pathlib import PurePosixPath
+from typing import Any, BinaryIO
 
 import numpy as np
 from PIL import Image
@@ -24,13 +26,121 @@ class LoadedImage:
     band_order: list[str]
     source_type: str
     metadata: dict
+    raster_profile: dict | None = None
+    raster_dataset_tags: dict[str, dict[str, str]] | None = None
+    raster_band_tags: list[dict[str, dict[str, str]]] | None = None
+    raster_descriptions: tuple[str | None, ...] | None = None
+    raster_scales: tuple[float, ...] | None = None
+    raster_offsets: tuple[float, ...] | None = None
+    raster_units: tuple[str | None, ...] | None = None
+    raster_colorinterp: tuple[Any, ...] | None = None
+    raster_mask: np.ndarray | None = None
+    raster_gcps: tuple[Any, Any] | None = None
+    raster_rpcs: Any | None = None
+
+
+SUPPORTED_IMAGE_SUFFIXES = (".tif", ".tiff", ".geotiff", ".png", ".jpg", ".jpeg", ".webp")
+SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
+MAX_ARCHIVE_IMAGE_BYTES = 256 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 2_048
+MAX_DECODED_IMAGE_BYTES = 512 * 1024 * 1024
+
+
+def is_tar_archive(filename: str) -> bool:
+    """Return whether a filename represents a supported TAR archive."""
+    return filename.lower().endswith(SUPPORTED_ARCHIVE_SUFFIXES)
+
+
+def list_archive_images(archive_bytes: bytes) -> list[str]:
+    """List supported regular image files in a TAR archive without extracting it."""
+    candidates: list[str] = []
+    seen_candidates: set[str] = set()
+    expanded_bytes = 0
+    try:
+        with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as archive:
+            for member_count, member in enumerate(archive, start=1):
+                if member_count > MAX_ARCHIVE_MEMBERS:
+                    raise ValueError("The TAR archive contains too many members.")
+                expanded_bytes += member.size
+                if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise ValueError("The expanded TAR archive is too large to process.")
+                if not member.isfile():
+                    continue
+                if not member.name.lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
+                    continue
+                if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
+                    raise ValueError("An image in the TAR archive is too large to process.")
+                if member.name in seen_candidates:
+                    raise ValueError(
+                        "The TAR archive contains duplicate image paths and is ambiguous."
+                    )
+                seen_candidates.add(member.name)
+                candidates.append(member.name)
+    except (tarfile.TarError, OSError) as exc:
+        raise ValueError("The uploaded file is not a readable TAR archive.") from exc
+
+    if not candidates:
+        raise ValueError(
+            "The TAR archive does not contain a supported image "
+            "(GeoTIFF, PNG, JPEG, or WebP)."
+        )
+    return candidates
+
+
+def load_archive_image(
+    archive_bytes: bytes,
+    member_name: str,
+) -> LoadedImage:
+    """Load one selected image directly from a TAR archive."""
+    if not member_name.lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
+        raise ValueError("The selected archive member is not a supported image.")
+
+    image_bytes: bytes | None = None
+    expanded_bytes = 0
+    try:
+        with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as archive:
+            for member_count, member in enumerate(archive, start=1):
+                if member_count > MAX_ARCHIVE_MEMBERS:
+                    raise ValueError("The TAR archive contains too many members.")
+                expanded_bytes += member.size
+                if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise ValueError("The expanded TAR archive is too large to process.")
+                if not member.isfile():
+                    continue
+                if member.name != member_name:
+                    continue
+                if image_bytes is not None:
+                    raise ValueError(
+                        "The selected archive image path is duplicated and ambiguous."
+                    )
+                if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
+                    raise ValueError("The selected image is too large to process.")
+
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise ValueError(
+                        "The selected image could not be read from the archive."
+                    )
+                image_bytes = extracted.read(MAX_ARCHIVE_IMAGE_BYTES + 1)
+    except (tarfile.TarError, OSError) as exc:
+        raise ValueError("The uploaded file is not a readable TAR archive.") from exc
+
+    if image_bytes is None:
+        raise ValueError("The selected archive image is missing.")
+    if len(image_bytes) > MAX_ARCHIVE_IMAGE_BYTES:
+        raise ValueError("The selected image is too large to process.")
+
+    loaded = load_image(BytesIO(image_bytes), PurePosixPath(member_name).name)
+    loaded.metadata["archive_member"] = member_name
+    return loaded
 
 
 def _normalize_band_name(index: int, count: int) -> str:
     defaults = {
         1: ["gray"],
         3: ["red", "green", "blue"],
-        4: ["blue", "green", "red", "nir"],
+        4: ["red", "green", "blue", "alpha"],
     }
     if count in defaults:
         return defaults[count][index]
@@ -39,6 +149,15 @@ def _normalize_band_name(index: int, count: int) -> str:
 
 def load_png(file: BinaryIO) -> LoadedImage:
     image = Image.open(file)
+    if image.mode == "P":
+        image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+    elif image.mode not in ("1", "L", "LA", "I", "I;16", "F", "RGB", "RGBA"):
+        image = image.convert("RGB")
+    channel_count = max(1, len(image.getbands()))
+    estimated_bytes = image.width * image.height * channel_count * 4
+    if estimated_bytes > MAX_DECODED_IMAGE_BYTES:
+        raise ValueError("The decoded image is too large to process.")
+    image.load()
     array = np.asarray(image)
 
     if array.ndim == 2:
@@ -46,7 +165,18 @@ def load_png(file: BinaryIO) -> LoadedImage:
         order = ["gray"]
     elif array.ndim == 3:
         count = array.shape[2]
-        order = [_normalize_band_name(i, count) for i in range(count)]
+        pillow_names = {
+            "R": "red",
+            "G": "green",
+            "B": "blue",
+            "A": "alpha",
+            "L": "gray",
+        }
+        raw_names = image.getbands()
+        order = [
+            pillow_names.get(raw_names[i], _normalize_band_name(i, count))
+            for i in range(count)
+        ]
         bands = {name: array[..., i] for i, name in enumerate(order)}
     else:
         raise ValueError("Unsupported PNG shape")
@@ -66,16 +196,39 @@ def load_geotiff(file: BinaryIO) -> LoadedImage:
     data = file.read()
     with MemoryFile(data) as memfile:
         with memfile.open() as dataset:
-            array = dataset.read()
-            descriptions = dataset.descriptions or tuple(
-                f"band_{i + 1}" for i in range(dataset.count)
+            estimated_bytes = sum(
+                dataset.width * dataset.height * np.dtype(dtype).itemsize
+                for dtype in dataset.dtypes
             )
+            if estimated_bytes > MAX_DECODED_IMAGE_BYTES:
+                raise ValueError("The decoded GeoTIFF is too large to process.")
+            array = dataset.read()
+            descriptions = dataset.descriptions
+            profile = dataset.profile.copy()
+            crs = str(dataset.crs) if dataset.crs else None
+            transform = tuple(dataset.transform)
+            dataset_tags = _read_raster_tags(dataset)
+            band_tags = [
+                _read_raster_tags(dataset, band_index)
+                for band_index in range(1, dataset.count + 1)
+            ]
+            scales = dataset.scales
+            offsets = dataset.offsets
+            units = dataset.units
+            colorinterp = dataset.colorinterp
+            mask = dataset.dataset_mask()
+            gcps = dataset.gcps
+            rpcs = dataset.rpcs
 
     bands: dict[str, np.ndarray] = {}
     order: list[str] = []
 
     for i, desc in enumerate(descriptions):
-        name = (desc or f"band_{i + 1}").strip().lower().replace(" ", "_")
+        name = (
+            desc.strip().lower().replace(" ", "_")
+            if desc
+            else f"band_{i + 1}"
+        )
         if name in bands:
             name = f"{name}_{i + 1}"
         bands[name] = array[i]
@@ -87,8 +240,34 @@ def load_geotiff(file: BinaryIO) -> LoadedImage:
         bands=bands,
         band_order=order,
         source_type="geotiff",
-        metadata={"band_count": len(order)},
+        metadata={
+            "band_count": len(order),
+            "width": int(array.shape[2]),
+            "height": int(array.shape[1]),
+            "dtype": str(array.dtype),
+            "crs": crs,
+            "transform": transform,
+        },
+        raster_profile=profile,
+        raster_dataset_tags=dataset_tags,
+        raster_band_tags=band_tags,
+        raster_descriptions=descriptions,
+        raster_scales=scales,
+        raster_offsets=offsets,
+        raster_units=units,
+        raster_colorinterp=colorinterp,
+        raster_mask=mask,
+        raster_gcps=gcps,
+        raster_rpcs=rpcs,
     )
+
+
+def _read_raster_tags(dataset, band_index: int = 0) -> dict[str, dict[str, str]]:
+    """Collect default and namespaced GeoTIFF tags."""
+    result = {"": dataset.tags(band_index)}
+    for namespace in dataset.tag_namespaces(band_index):
+        result[namespace] = dataset.tags(band_index, ns=namespace)
+    return result
 
 
 def _apply_common_band_aliases(bands: dict[str, np.ndarray], order: list[str]) -> None:
@@ -101,11 +280,11 @@ def _apply_common_band_aliases(bands: dict[str, np.ndarray], order: list[str]) -
         "nir": "nir",
         "near_infrared": "nir",
     }
-    for key, alias in alias_map.items():
-        if key in bands and alias not in bands:
-            bands[alias] = bands[key]
-            if alias not in order:
-                order.append(alias)
+    for index, name in enumerate(list(order)):
+        alias = alias_map.get(name)
+        if alias and alias != name and alias not in bands:
+            bands[alias] = bands.pop(name)
+            order[index] = alias
 
 
 def load_image(file: BinaryIO, filename: str) -> LoadedImage:
@@ -149,3 +328,91 @@ def array_to_png_bytes(array: np.ndarray) -> bytes:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def encode_reconstructed_image(
+    loaded: LoadedImage,
+    reconstructed_bands: dict[str, np.ndarray],
+) -> tuple[bytes, str, str]:
+    """
+    Encode reconstructed pixels as a downloadable image.
+
+    GeoTIFF inputs retain their raster profile and are stored with lossless DEFLATE.
+    Other inputs are exported as lossless PNG files.
+    """
+    ordered = [reconstructed_bands[name] for name in loaded.band_order]
+
+    if loaded.source_type == "geotiff":
+        if not HAS_RASTERIO:
+            raise RuntimeError("rasterio is required to export GeoTIFF results")
+        if loaded.raster_profile is None:
+            raise ValueError("The source GeoTIFF profile is unavailable.")
+
+        profile = loaded.raster_profile.copy()
+        profile.update(
+            driver="GTiff",
+            count=len(ordered),
+            height=ordered[0].shape[0],
+            width=ordered[0].shape[1],
+            dtype=ordered[0].dtype,
+            compress="deflate",
+        )
+        profile.pop("blockxsize", None)
+        profile.pop("blockysize", None)
+        profile.pop("tiled", None)
+
+        with MemoryFile() as memfile:
+            with memfile.open(**profile) as dataset:
+                dataset.write(np.stack(ordered, axis=0))
+                for index, name in enumerate(loaded.band_order, start=1):
+                    original_description = (
+                        loaded.raster_descriptions[index - 1]
+                        if loaded.raster_descriptions
+                        else None
+                    )
+                    dataset.set_band_description(
+                        index, original_description or name
+                    )
+                if loaded.raster_scales is not None:
+                    dataset.scales = loaded.raster_scales
+                if loaded.raster_offsets is not None:
+                    dataset.offsets = loaded.raster_offsets
+                if loaded.raster_units is not None:
+                    dataset.units = loaded.raster_units
+                if loaded.raster_colorinterp is not None:
+                    dataset.colorinterp = loaded.raster_colorinterp
+                if loaded.raster_mask is not None:
+                    dataset.write_mask(loaded.raster_mask)
+                if loaded.raster_gcps is not None and loaded.raster_gcps[0]:
+                    dataset.gcps = loaded.raster_gcps
+                if loaded.raster_rpcs is not None:
+                    dataset.rpcs = loaded.raster_rpcs
+                _write_raster_tags(dataset, loaded)
+            output = memfile.read()
+        return output, "compressed_image.tif", "image/tiff"
+
+    if len(ordered) == 1:
+        array = ordered[0]
+    else:
+        array = np.stack(ordered, axis=-1)
+    if array.dtype != np.uint8 and not (array.ndim == 2 and array.dtype == np.uint16):
+        raise ValueError(
+            "This image's pixel type cannot be exported as PNG; use GeoTIFF input "
+            "for high-bit-depth or multiband imagery."
+        )
+    return array_to_png_bytes(array), "compressed_image.png", "image/png"
+
+
+def _write_raster_tags(dataset, loaded: LoadedImage) -> None:
+    """Restore dataset-level and per-band GeoTIFF tags."""
+    for namespace, tags in (loaded.raster_dataset_tags or {}).items():
+        if namespace:
+            dataset.update_tags(ns=namespace, **tags)
+        else:
+            dataset.update_tags(**tags)
+    for band_index, tag_groups in enumerate(loaded.raster_band_tags or [], start=1):
+        for namespace, tags in tag_groups.items():
+            if namespace:
+                dataset.update_tags(band_index, ns=namespace, **tags)
+            else:
+                dataset.update_tags(band_index, **tags)
