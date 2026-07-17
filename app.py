@@ -63,6 +63,7 @@ UPLOAD_FILE_TYPES = [
     "tar",
     "tar.gz",
     "tgz",
+    "gz",
 ]
 
 
@@ -80,6 +81,11 @@ def _load_uploaded(
 @st.cache_data(show_spinner=False)
 def _list_archive_images(file_bytes: bytes) -> list[str]:
     return list_archive_images(file_bytes)
+
+
+def _reset_ndvi_confirmation() -> None:
+    st.session_state["confirm_ndvi"] = False
+    st.session_state.pop("ndvi_run", None)
 
 
 def _max_rank(shape: tuple[int, ...]) -> int:
@@ -332,7 +338,7 @@ try:
             help="Only supported image files are listed; archive contents are read in memory.",
         )
     loaded = _load_uploaded(uploaded_bytes, uploaded.name, archive_member)
-except (RuntimeError, ValueError) as exc:
+except (OSError, RuntimeError, ValueError) as exc:
     st.error(str(exc))
     st.stop()
 
@@ -609,12 +615,14 @@ with tab_ndvi:
         options=band_order,
         index=band_order.index("red") if "red" in band_order else 0,
         key="ndvi_red_band",
+        on_change=_reset_ndvi_confirmation,
     )
     nir_name = st.selectbox(
         "NIR band for NDVI",
         options=band_order,
         index=band_order.index("nir") if "nir" in band_order else min(1, band_count - 1),
         key="ndvi_nir_band",
+        on_change=_reset_ndvi_confirmation,
     )
 
     distinct_ndvi_bands = red_name != nir_name
@@ -757,7 +765,7 @@ with tab_matrix:
 
     st.subheader("Source metadata")
     metadata_df = pd.DataFrame(
-        [{"key": key, "value": value} for key, value in loaded.metadata.items()]
+        [{"key": key, "value": str(value)} for key, value in loaded.metadata.items()]
     )
     st.dataframe(metadata_df, use_container_width=True, hide_index=True)
 

@@ -41,6 +41,11 @@ def _valid_mask(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def compare_ndvi(reference: np.ndarray, candidate: np.ndarray) -> NDVIMetrics:
     """Benchmark how well compressed imagery preserves NDVI."""
+    if reference.shape != candidate.shape:
+        raise ValueError("NDVI arrays must have the same shape.")
+    if reference.ndim != 2:
+        raise ValueError("NDVI comparison requires two-dimensional arrays.")
+
     mask = _valid_mask(reference, candidate)
     if not np.any(mask):
         return NDVIMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
@@ -58,18 +63,27 @@ def compare_ndvi(reference: np.ndarray, candidate: np.ndarray) -> NDVIMetrics:
     else:
         correlation = 0.0
 
-    data_range = float(np.nanmax(reference) - np.nanmin(reference))
+    data_range = float(ref.max() - ref.min())
     if data_range <= 0:
         data_range = 1.0
 
-    ssim_value = float(
-        ssim(
-            reference,
-            candidate,
+    min_dimension = min(reference.shape)
+    if min_dimension >= 3:
+        window_size = min(7, min_dimension)
+        if window_size % 2 == 0:
+            window_size -= 1
+        reference_filled = np.where(mask, reference, 0.0)
+        candidate_filled = np.where(mask, candidate, 0.0)
+        _, ssim_map = ssim(
+            reference_filled,
+            candidate_filled,
             data_range=data_range,
-            mask=mask,
+            win_size=window_size,
+            full=True,
         )
-    )
+        ssim_value = float(np.mean(ssim_map[mask]))
+    else:
+        ssim_value = float(np.allclose(ref, cand))
 
     return NDVIMetrics(
         rmse=rmse,

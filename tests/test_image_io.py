@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tarfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -59,6 +60,19 @@ class ArchiveImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not contain"):
             list_archive_images(archive)
 
+    def test_rejects_archives_over_the_expanded_size_limit(self) -> None:
+        archive = _tar_bytes({"source.png": _png_bytes()})
+
+        with patch("image_io.MAX_ARCHIVE_EXPANDED_BYTES", 1):
+            with self.assertRaisesRegex(ValueError, "expanded TAR archive"):
+                list_archive_images(archive)
+
+    def test_malformed_archive_image_raises_an_image_error(self) -> None:
+        archive = _tar_bytes({"source.png": b"not an image"})
+
+        with self.assertRaises(OSError):
+            load_archive_image(archive, "source.png")
+
     def test_exports_reconstructed_png(self) -> None:
         loaded = load_archive_image(
             _tar_bytes({"source.png": _png_bytes()}),
@@ -91,6 +105,14 @@ class ArchiveImageTests(unittest.TestCase):
                 dataset.write(np.ones((2, 8, 8), dtype=np.uint16))
                 dataset.set_band_description(1, "B4")
                 dataset.set_band_description(2, "B8")
+                dataset.scales = (0.01, 0.02)
+                dataset.offsets = (1.0, 2.0)
+                dataset.units = ("reflectance", "reflectance")
+                dataset.update_tags(PRODUCT="test-scene")
+                dataset.update_tags(1, BAND_ROLE="red")
+                mask = np.full((8, 8), 255, dtype=np.uint8)
+                mask[0, 0] = 0
+                dataset.write_mask(mask)
             source.write(memfile.read())
 
         loaded = load_archive_image(
@@ -110,6 +132,13 @@ class ArchiveImageTests(unittest.TestCase):
                 self.assertEqual(dataset.crs.to_string(), "EPSG:4326")
                 self.assertEqual(dataset.transform, transform)
                 self.assertEqual(dataset.compression.name.lower(), "deflate")
+                self.assertEqual(dataset.descriptions, ("B4", "B8"))
+                self.assertEqual(dataset.scales, (0.01, 0.02))
+                self.assertEqual(dataset.offsets, (1.0, 2.0))
+                self.assertEqual(dataset.units, ("reflectance", "reflectance"))
+                self.assertEqual(dataset.tags()["PRODUCT"], "test-scene")
+                self.assertEqual(dataset.tags(1)["BAND_ROLE"], "red")
+                self.assertEqual(dataset.dataset_mask()[0, 0], 0)
 
 
 if __name__ == "__main__":
