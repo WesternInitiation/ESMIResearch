@@ -6,7 +6,10 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
+from pathlib import PurePosixPath
 from typing import Callable
 
 import matplotlib.pyplot as plt
@@ -19,7 +22,14 @@ from compression.bandwidth import run_bandwidth_compression
 from compression.jpeg2000 import run_jpeg2000_compression
 from compression.svd import run_svd_compression
 from compression.wavelet import run_wavelet_compression
-from image_io import load_image, to_display_rgb
+from image_io import (
+    encode_reconstructed_image,
+    is_tar_archive,
+    list_archive_images,
+    load_archive_image,
+    load_image,
+    to_display_rgb,
+)
 from ndvi import compare_ndvi, compute_ndvi
 from svd_compression import (
     ChannelCompressionConfig,
@@ -43,12 +53,33 @@ COMPRESSION_METHODS = [
     "JPEG2000",
 ]
 
-UPLOAD_FILE_TYPES = ["tif", "tiff", "png", "jpg", "jpeg", "webp"]
+UPLOAD_FILE_TYPES = [
+    "tif",
+    "tiff",
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "tar",
+    "tar.gz",
+    "tgz",
+]
 
 
 @st.cache_data(show_spinner=False)
-def _load_uploaded(file_bytes: bytes, filename: str):
+def _load_uploaded(
+    file_bytes: bytes,
+    filename: str,
+    archive_member: str | None = None,
+):
+    if archive_member is not None:
+        return load_archive_image(file_bytes, archive_member)
     return load_image(io.BytesIO(file_bytes), filename)
+
+
+@st.cache_data(show_spinner=False)
+def _list_archive_images(file_bytes: bytes) -> list[str]:
+    return list_archive_images(file_bytes)
 
 
 def _max_rank(shape: tuple[int, ...]) -> int:
@@ -278,25 +309,40 @@ method = st.selectbox(
 )
 
 uploaded = st.file_uploader(
-    "Upload image for compression",
+    "Upload an image or TAR archive for compression",
     type=UPLOAD_FILE_TYPES,
 )
 
 if uploaded is None:
     st.info(
-        "Select a compression method and upload an image. GeoTIFF is best for NDVI "
-        "analysis because it can preserve multiple bands including Red and NIR."
+        "Select a compression method and upload an image or TAR archive. GeoTIFF is "
+        "best for optional NDVI analysis because it can preserve Red and NIR bands."
     )
     st.stop()
 
-loaded = _load_uploaded(uploaded.getvalue(), uploaded.name)
+uploaded_bytes = uploaded.getvalue()
+archive_member: str | None = None
+try:
+    if is_tar_archive(uploaded.name):
+        archive_images = _list_archive_images(uploaded_bytes)
+        archive_member = st.selectbox(
+            "Image inside archive",
+            options=archive_images,
+            format_func=lambda name: f"{PurePosixPath(name).name} — {name}",
+            help="Only supported image files are listed; archive contents are read in memory.",
+        )
+    loaded = _load_uploaded(uploaded_bytes, uploaded.name, archive_member)
+except (RuntimeError, ValueError) as exc:
+    st.error(str(exc))
+    st.stop()
+
 bands = {k: v.copy() for k, v in loaded.bands.items()}
 band_order = loaded.band_order
 band_count = len(band_order)
 
 with st.sidebar:
     st.header("Compression settings")
-    compare_all_methods = st.checkbox("Run all-method runtime comparison", value=True)
+    compare_all_methods = st.checkbox("Enable all-method runtime comparison", value=False)
 
     st.subheader("Matrix preprocessing")
     use_custom_matrix = st.checkbox("Edit preprocessing matrix", value=False)
@@ -422,23 +468,82 @@ svd_config = CompressionConfig(
     normalize_before_svd=normalize,
 )
 
-result = _recompute_channel_report(
-    _run_selected_method(
-        method,
-        bands,
-        working_bands,
-        band_order,
-        weight_matrix,
-        svd_config,
-        wavelet_name,
-        wavelet_level,
-        wavelet_keep_fraction,
-        bandwidth_keep_fraction,
-        jpeg2000_rate,
-    ),
-    bands,
+signature_payload = {
+    "input_sha256": hashlib.sha256(uploaded_bytes).hexdigest(),
+    "archive_member": archive_member,
+    "method": method,
+    "weight_matrix": weight_matrix.tolist(),
+    "svd_mode": mode,
+    "svd_normalize": normalize,
+    "svd_channels": {
+        name: {
+            "rank": config.rank,
+            "energy_fraction": config.energy_fraction,
+            "weight": config.weight,
+        }
+        for name, config in channel_configs.items()
+    },
+    "wavelet": [wavelet_name, wavelet_level, wavelet_keep_fraction],
+    "bandwidth_keep_fraction": bandwidth_keep_fraction,
+    "jpeg2000_rate": jpeg2000_rate,
+}
+compression_signature = hashlib.sha256(
+    json.dumps(signature_payload, sort_keys=True).encode("utf-8")
+).hexdigest()
+
+run_compression = st.button(
+    "Run compression",
+    type="primary",
+    help="Compression only. NDVI testing is a separate confirmed step.",
 )
 
+if run_compression:
+    try:
+        with st.spinner(f"Running {method} compression…"):
+            new_result = _recompute_channel_report(
+                _run_selected_method(
+                    method,
+                    bands,
+                    working_bands,
+                    band_order,
+                    weight_matrix,
+                    svd_config,
+                    wavelet_name,
+                    wavelet_level,
+                    wavelet_keep_fraction,
+                    bandwidth_keep_fraction,
+                    jpeg2000_rate,
+                ),
+                bands,
+            )
+            artifact_bytes, artifact_filename, artifact_mime = (
+                encode_reconstructed_image(loaded, new_result.reconstructed_bands)
+            )
+
+        source_name = archive_member or uploaded.name
+        source_stem = PurePosixPath(source_name).stem
+        artifact_suffix = PurePosixPath(artifact_filename).suffix
+        method_slug = method.lower().replace(" ", "_")
+        download_name = f"{source_stem}_{method_slug}_compressed{artifact_suffix}"
+        st.session_state["compression_run"] = {
+            "signature": compression_signature,
+            "result": new_result,
+            "artifact_bytes": artifact_bytes,
+            "artifact_filename": download_name,
+            "artifact_mime": artifact_mime,
+        }
+        st.session_state.pop("ndvi_run", None)
+        st.session_state["confirm_ndvi"] = False
+    except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+        st.error(f"Compression failed: {exc}")
+        st.stop()
+
+stored_run = st.session_state.get("compression_run")
+if stored_run is None or stored_run["signature"] != compression_signature:
+    st.info("Review the settings, then select **Run compression** to create the output.")
+    st.stop()
+
+result = stored_run["result"]
 original_rgb = to_display_rgb(bands, band_order)
 compressed_rgb = to_display_rgb(result.reconstructed_bands, band_order)
 ratio = (
@@ -455,15 +560,17 @@ col3.metric("Compression ratio", f"{ratio:.2%}")
 col4.metric("Bands", band_count)
 col5.metric("Estimated compressed size", f"{result.compressed_bytes_estimate:,} B")
 
-red_name = st.selectbox(
-    "Red band for NDVI",
-    options=band_order,
-    index=band_order.index("red") if "red" in band_order else 0,
+st.download_button(
+    "Download compressed image",
+    data=stored_run["artifact_bytes"],
+    file_name=stored_run["artifact_filename"],
+    mime=stored_run["artifact_mime"],
+    type="primary",
 )
-nir_name = st.selectbox(
-    "NIR band for NDVI",
-    options=band_order,
-    index=band_order.index("nir") if "nir" in band_order else min(1, band_count - 1),
+st.caption(
+    f"Download size: {len(stored_run['artifact_bytes']):,} B. "
+    "The algorithm size above estimates its compact representation; the download "
+    "contains the reconstructed pixels in a portable image format."
 )
 
 tab_overview, tab_ndvi, tab_methods, tab_matrix, tab_report = st.tabs(
@@ -490,16 +597,61 @@ with tab_overview:
     st.subheader("Per-band quality metrics")
     st.dataframe(report_df, use_container_width=True, hide_index=True)
 
+ndvi_run = st.session_state.get("ndvi_run")
 with tab_ndvi:
+    st.subheader("Optional NDVI preservation test")
+    st.caption(
+        "NDVI is not run during compression. Select the bands and explicitly confirm "
+        "this separate test when you are ready."
+    )
+    red_name = st.selectbox(
+        "Red band for NDVI",
+        options=band_order,
+        index=band_order.index("red") if "red" in band_order else 0,
+        key="ndvi_red_band",
+    )
+    nir_name = st.selectbox(
+        "NIR band for NDVI",
+        options=band_order,
+        index=band_order.index("nir") if "nir" in band_order else min(1, band_count - 1),
+        key="ndvi_nir_band",
+    )
+
+    distinct_ndvi_bands = red_name != nir_name
     if red_name == nir_name:
         st.warning("Select distinct Red and NIR bands to compute NDVI.")
-    else:
-        ndvi_orig = compute_ndvi(bands[red_name], bands[nir_name])
-        ndvi_comp = compute_ndvi(
-            result.reconstructed_bands[red_name],
-            result.reconstructed_bands[nir_name],
-        )
-        ndvi_metrics = compare_ndvi(ndvi_orig, ndvi_comp)
+
+    st.checkbox(
+        "I confirm that I want to run the NDVI test",
+        key="confirm_ndvi",
+    )
+    run_ndvi = st.button(
+        "Confirm and run NDVI test",
+        disabled=not st.session_state.get("confirm_ndvi", False)
+        or not distinct_ndvi_bands,
+    )
+    ndvi_signature = f"{compression_signature}:{red_name}:{nir_name}"
+
+    if run_ndvi:
+        with st.spinner("Running NDVI preservation test…"):
+            ndvi_orig = compute_ndvi(bands[red_name], bands[nir_name])
+            ndvi_comp = compute_ndvi(
+                result.reconstructed_bands[red_name],
+                result.reconstructed_bands[nir_name],
+            )
+            ndvi_metrics = compare_ndvi(ndvi_orig, ndvi_comp)
+        ndvi_run = {
+            "signature": ndvi_signature,
+            "original": ndvi_orig,
+            "compressed": ndvi_comp,
+            "metrics": ndvi_metrics,
+        }
+        st.session_state["ndvi_run"] = ndvi_run
+
+    if ndvi_run is not None and ndvi_run["signature"] == ndvi_signature:
+        ndvi_orig = ndvi_run["original"]
+        ndvi_comp = ndvi_run["compressed"]
+        ndvi_metrics = ndvi_run["metrics"]
 
         n1, n2, n3, n4, n5 = st.columns(5)
         n1.metric("NDVI RMSE", f"{ndvi_metrics.rmse:.5f}")
@@ -518,6 +670,8 @@ with tab_ndvi:
         plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
         st.pyplot(fig)
         plt.close(fig)
+    else:
+        st.info("NDVI has not been run for this compression result and band selection.")
 
 with tab_methods:
     st.subheader("Runtime and fidelity across compression methods")
@@ -617,15 +771,11 @@ with tab_report:
         {"metric": "compression_ratio", "value": ratio},
         {"metric": "band_count", "value": band_count},
     ]
-    if red_name != nir_name:
-        ndvi_orig = compute_ndvi(bands[red_name], bands[nir_name])
-        ndvi_comp = compute_ndvi(
-            result.reconstructed_bands[red_name],
-            result.reconstructed_bands[nir_name],
-        )
-        ndvi_metrics = compare_ndvi(ndvi_orig, ndvi_comp)
+    if ndvi_run is not None and ndvi_run["signature"] == ndvi_signature:
+        ndvi_metrics = ndvi_run["metrics"]
         report_rows.extend(
             [
+                {"metric": "ndvi_status", "value": "completed"},
                 {"metric": "ndvi_rmse", "value": ndvi_metrics.rmse},
                 {"metric": "ndvi_mae", "value": ndvi_metrics.mae},
                 {"metric": "ndvi_correlation", "value": ndvi_metrics.correlation},
@@ -633,6 +783,8 @@ with tab_report:
                 {"metric": "ndvi_bias", "value": ndvi_metrics.bias},
             ]
         )
+    else:
+        report_rows.append({"metric": "ndvi_status", "value": "not_run"})
 
     summary_df = pd.DataFrame(report_rows)
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
