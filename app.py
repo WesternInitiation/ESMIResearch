@@ -269,17 +269,25 @@ def _recompute_channel_report(
 def _comparison_runner(
     runners: dict[str, Callable[[], CompressionExecutionResult]],
     original_bands: dict[str, np.ndarray],
-) -> pd.DataFrame:
+    progress_callback: Callable[[str, float], None] | None = None,
+) -> tuple[pd.DataFrame, dict[str, CompressionExecutionResult]]:
+    """Run each method once and collect benchmarking rows plus full results."""
     rows = []
-    for label, runner in runners.items():
+    results: dict[str, CompressionExecutionResult] = {}
+    labels = list(runners.keys())
+    for index, label in enumerate(labels):
+        if progress_callback is not None:
+            progress_callback(label, index / max(len(labels), 1))
         try:
-            result = _recompute_channel_report(runner(), original_bands)
+            result = _recompute_channel_report(runners[label](), original_bands)
+            results[label] = result
             ratio = (
                 result.compressed_bytes_estimate / result.original_bytes
                 if result.original_bytes
                 else 0.0
             )
             report_df = _report_table(result)
+            mean_psnr = float(report_df["psnr_db"].replace([np.inf, -np.inf], np.nan).mean())
             rows.append(
                 {
                     "method": label,
@@ -287,7 +295,8 @@ def _comparison_runner(
                     "compression_ratio": ratio,
                     "compressed_bytes_estimate": result.compressed_bytes_estimate,
                     "mean_rmse": float(report_df["rmse"].mean()),
-                    "mean_psnr_db": float(report_df["psnr_db"].replace(np.inf, np.nan).mean()),
+                    "mean_mae": float(report_df["mae"].mean()),
+                    "mean_psnr_db": mean_psnr,
                     "mean_ssim": float(report_df["ssim"].mean()),
                     "status": "ok",
                 }
@@ -300,12 +309,45 @@ def _comparison_runner(
                     "compression_ratio": np.nan,
                     "compressed_bytes_estimate": np.nan,
                     "mean_rmse": np.nan,
+                    "mean_mae": np.nan,
                     "mean_psnr_db": np.nan,
                     "mean_ssim": np.nan,
                     "status": str(exc),
                 }
             )
-    return pd.DataFrame(rows)
+    if progress_callback is not None:
+        progress_callback("done", 1.0)
+    return pd.DataFrame(rows), results
+
+
+def _method_runners(
+    bands: dict[str, np.ndarray],
+    working_bands: dict[str, np.ndarray],
+    band_order: list[str],
+    weight_matrix: np.ndarray,
+    svd_config: CompressionConfig,
+    wavelet_name: str,
+    wavelet_level: int,
+    wavelet_keep_fraction: float,
+    bandwidth_keep_fraction: float,
+    jpeg2000_rate: int,
+) -> dict[str, Callable[[], CompressionExecutionResult]]:
+    common = (
+        bands,
+        working_bands,
+        band_order,
+        weight_matrix,
+        svd_config,
+        wavelet_name,
+        wavelet_level,
+        wavelet_keep_fraction,
+        bandwidth_keep_fraction,
+        jpeg2000_rate,
+    )
+    return {
+        label: (lambda method=label: _run_selected_method(method, *common))
+        for label in COMPRESSION_METHODS
+    }
 
 
 method = st.selectbox(
@@ -348,7 +390,15 @@ band_count = len(band_order)
 
 with st.sidebar:
     st.header("Compression settings")
-    compare_all_methods = st.checkbox("Enable all-method runtime comparison", value=False)
+    compare_all_methods = st.checkbox(
+        "Enable all-method runtime comparison",
+        value=False,
+        help=(
+            "Unlocks the Method Comparison tab so you can benchmark SVD, wavelet, "
+            "bandwidth, and JPEG2000 on the same image without re-running on every "
+            "page interaction."
+        ),
+    )
 
     st.subheader("Matrix preprocessing")
     use_custom_matrix = st.checkbox("Edit preprocessing matrix", value=False)
@@ -497,6 +547,23 @@ compression_signature = hashlib.sha256(
     json.dumps(signature_payload, sort_keys=True).encode("utf-8")
 ).hexdigest()
 
+comparison_signature = hashlib.sha256(
+    json.dumps(
+        {
+            "input_sha256": signature_payload["input_sha256"],
+            "archive_member": archive_member,
+            "weight_matrix": weight_matrix.tolist(),
+            "svd_mode": mode,
+            "svd_normalize": normalize,
+            "svd_channels": signature_payload["svd_channels"],
+            "wavelet": [wavelet_name, wavelet_level, wavelet_keep_fraction],
+            "bandwidth_keep_fraction": bandwidth_keep_fraction,
+            "jpeg2000_rate": jpeg2000_rate,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+).hexdigest()
+
 run_compression = st.button(
     "Run compression",
     type="primary",
@@ -540,6 +607,13 @@ if run_compression:
         }
         st.session_state.pop("ndvi_run", None)
         st.session_state["confirm_ndvi"] = False
+        # Keep method comparison only if its settings signature still matches.
+        stored_comparison = st.session_state.get("method_comparison")
+        if (
+            stored_comparison is not None
+            and stored_comparison.get("signature") != comparison_signature
+        ):
+            st.session_state.pop("method_comparison", None)
     except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
         st.error(f"Compression failed: {exc}")
         st.stop()
@@ -585,9 +659,13 @@ tab_overview, tab_ndvi, tab_methods, tab_matrix, tab_report = st.tabs(
 
 with tab_overview:
     st.subheader("Side-by-side image comparison")
+    st.caption(
+        "Primary result for the selected compression method: original vs reconstructed "
+        "preview, absolute error map, and per-band quality metrics."
+    )
     c1, c2 = st.columns(2)
-    c1.image(original_rgb, caption="Original preview", width="stretch")
-    c2.image(compressed_rgb, caption="Compressed preview", width="stretch")
+    c1.image(original_rgb, caption="Original preview", use_container_width=True)
+    c2.image(compressed_rgb, caption="Compressed preview", use_container_width=True)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     axes[0].imshow(original_rgb)
@@ -597,18 +675,22 @@ with tab_overview:
     axes[1].set_title("Compressed")
     axes[1].axis("off")
     _render_error_map(axes[2], original_rgb, compressed_rgb)
-    st.pyplot(fig)
+    st.pyplot(fig, clear_figure=True)
     plt.close(fig)
 
     st.subheader("Per-band quality metrics")
-    st.dataframe(report_df, width="stretch", hide_index=True)
+    if report_df.empty:
+        st.warning("No per-band metrics were produced for this run.")
+    else:
+        st.dataframe(report_df, use_container_width=True, hide_index=True)
 
 ndvi_run = st.session_state.get("ndvi_run")
 with tab_ndvi:
     st.subheader("Optional NDVI preservation test")
     st.caption(
-        "NDVI is not run during compression. Select the bands and explicitly confirm "
-        "this separate test when you are ready."
+        "Use this when your image has Red and NIR bands (typical for GeoTIFF "
+        "satellite scenes). NDVI is not run during compression — confirm and run "
+        "it here to measure vegetation-index fidelity after compression."
     )
     red_name = st.selectbox(
         "Red band for NDVI",
@@ -676,101 +758,158 @@ with tab_ndvi:
         axes[2].set_title("NDVI difference")
         axes[2].axis("off")
         plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
-        st.pyplot(fig)
+        st.pyplot(fig, clear_figure=True)
         plt.close(fig)
     else:
         st.info("NDVI has not been run for this compression result and band selection.")
 
 with tab_methods:
-    st.subheader("Runtime and fidelity across compression methods")
-    if compare_all_methods:
-        comparison_df = _comparison_runner(
-            {
-                "SVD": lambda: _run_selected_method(
-                    "SVD",
-                    bands,
-                    working_bands,
-                    band_order,
-                    weight_matrix,
-                    svd_config,
-                    wavelet_name,
-                    wavelet_level,
-                    wavelet_keep_fraction,
-                    bandwidth_keep_fraction,
-                    jpeg2000_rate,
-                ),
-                "Wavelet transformation": lambda: _run_selected_method(
-                    "Wavelet transformation",
-                    bands,
-                    working_bands,
-                    band_order,
-                    weight_matrix,
-                    svd_config,
-                    wavelet_name,
-                    wavelet_level,
-                    wavelet_keep_fraction,
-                    bandwidth_keep_fraction,
-                    jpeg2000_rate,
-                ),
-                "Bandwidth transformation": lambda: _run_selected_method(
-                    "Bandwidth transformation",
-                    bands,
-                    working_bands,
-                    band_order,
-                    weight_matrix,
-                    svd_config,
-                    wavelet_name,
-                    wavelet_level,
-                    wavelet_keep_fraction,
-                    bandwidth_keep_fraction,
-                    jpeg2000_rate,
-                ),
-                "JPEG2000": lambda: _run_selected_method(
-                    "JPEG2000",
-                    bands,
-                    working_bands,
-                    band_order,
-                    weight_matrix,
-                    svd_config,
-                    wavelet_name,
-                    wavelet_level,
-                    wavelet_keep_fraction,
-                    bandwidth_keep_fraction,
-                    jpeg2000_rate,
-                ),
-            },
-            bands,
-        )
-        st.dataframe(comparison_df, width="stretch", hide_index=True)
-        numeric_df = comparison_df.dropna(subset=["runtime_seconds", "compression_ratio"])
-        if not numeric_df.empty:
-            st.line_chart(
-                numeric_df.set_index("method")[["runtime_seconds", "compression_ratio"]]
-            )
-    else:
-        st.info("Enable all-method comparison in the sidebar to benchmark every method.")
+    st.subheader("Benchmark every compression method")
+    st.caption(
+        "Compare SVD, wavelet, bandwidth, and JPEG2000 on the same image using the "
+        "current sidebar parameters. Results are stored until you change settings or "
+        "upload a new file — they do not re-run on every page refresh."
+    )
 
-    st.subheader("Method diagnostics")
+    if not compare_all_methods:
+        st.info(
+            "Turn on **Enable all-method runtime comparison** in the sidebar, then "
+            "click **Run all-method comparison** below."
+        )
+    else:
+        run_comparison = st.button(
+            "Run all-method comparison",
+            type="primary",
+            help="Runs all four algorithms once and caches runtime/fidelity metrics.",
+        )
+        if run_comparison:
+            progress = st.progress(0.0, text="Starting method comparison…")
+            status = st.empty()
+
+            def _on_progress(label: str, fraction: float) -> None:
+                if label == "done":
+                    progress.progress(1.0, text="Comparison complete")
+                    status.empty()
+                else:
+                    progress.progress(fraction, text=f"Running {label}…")
+                    status.caption(f"Currently benchmarking: {label}")
+
+            try:
+                comparison_df, comparison_results = _comparison_runner(
+                    _method_runners(
+                        bands,
+                        working_bands,
+                        band_order,
+                        weight_matrix,
+                        svd_config,
+                        wavelet_name,
+                        wavelet_level,
+                        wavelet_keep_fraction,
+                        bandwidth_keep_fraction,
+                        jpeg2000_rate,
+                    ),
+                    bands,
+                    progress_callback=_on_progress,
+                )
+                st.session_state["method_comparison"] = {
+                    "signature": comparison_signature,
+                    "table": comparison_df,
+                    "previews": {
+                        label: to_display_rgb(item.reconstructed_bands, band_order)
+                        for label, item in comparison_results.items()
+                    },
+                }
+            except Exception as exc:
+                st.error(f"All-method comparison failed: {exc}")
+
+        stored_comparison = st.session_state.get("method_comparison")
+        if (
+            stored_comparison is not None
+            and stored_comparison["signature"] == comparison_signature
+        ):
+            comparison_df = stored_comparison["table"]
+            st.success("Comparison results are ready for this image and settings.")
+            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+            numeric_df = comparison_df[
+                comparison_df["status"] == "ok"
+            ].dropna(subset=["runtime_seconds"])
+            if not numeric_df.empty:
+                chart_df = numeric_df.set_index("method")[
+                    ["runtime_seconds", "compression_ratio", "mean_rmse", "mean_ssim"]
+                ]
+                st.subheader("Runtime and compression ratio")
+                st.bar_chart(chart_df[["runtime_seconds", "compression_ratio"]])
+                st.subheader("Fidelity (lower RMSE / higher SSIM is better)")
+                st.bar_chart(chart_df[["mean_rmse", "mean_ssim"]])
+
+            previews = stored_comparison.get("previews", {})
+            if previews:
+                st.subheader("Reconstructed previews by method")
+                preview_cols = st.columns(min(len(previews), 4))
+                for column, (label, preview) in zip(preview_cols, previews.items()):
+                    column.image(preview, caption=label, use_container_width=True)
+
+            csv_comparison = comparison_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download method comparison CSV",
+                data=csv_comparison,
+                file_name="method_comparison.csv",
+                mime="text/csv",
+            )
+        elif compare_all_methods:
+            st.warning(
+                "No comparison has been run yet for the current image/settings. "
+                "Click **Run all-method comparison**."
+            )
+
+    st.subheader("Selected-method diagnostics")
+    st.caption("Metadata from the currently selected compression run.")
     st.json(result.metadata)
 
 with tab_matrix:
     st.subheader("Preprocessing matrix")
-    st.caption("The matrix is applied before compression and inverted after reconstruction.")
+    st.caption(
+        "Optional spectral mixing applied before compression and inverted afterward. "
+        "Use identity for raw bands, or NDVI emphasis / a custom matrix when you want "
+        "to prioritize Red/NIR combinations."
+    )
     mix_df = pd.DataFrame(
         weight_matrix,
         index=[f"out:{name}" for name in band_order],
         columns=[f"in:{name}" for name in band_order],
     )
-    st.dataframe(mix_df, width="stretch")
+    st.dataframe(mix_df, use_container_width=True)
 
     st.subheader("Source metadata")
-    metadata_df = pd.DataFrame(
-        [{"key": key, "value": str(value)} for key, value in loaded.metadata.items()]
-    )
-    st.dataframe(metadata_df, width="stretch", hide_index=True)
+    if loaded.metadata:
+        metadata_df = pd.DataFrame(
+            [{"key": key, "value": str(value)} for key, value in loaded.metadata.items()]
+        )
+        st.dataframe(metadata_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No source metadata was attached to this upload.")
+
+    st.subheader("Loaded bands")
+    band_rows = [
+        {
+            "band": name,
+            "height": int(bands[name].shape[0]),
+            "width": int(bands[name].shape[1]),
+            "dtype": str(bands[name].dtype),
+            "min": float(np.min(bands[name])),
+            "max": float(np.max(bands[name])),
+        }
+        for name in band_order
+    ]
+    st.dataframe(pd.DataFrame(band_rows), use_container_width=True, hide_index=True)
 
 with tab_report:
     st.subheader("Analysis-ready summary")
+    st.caption(
+        "Exportable summary for research notes: compression settings, runtime, "
+        "size estimates, band quality, and optional NDVI metrics."
+    )
     report_rows = [
         {"metric": "compression_method", "value": method},
         {"metric": "runtime_seconds", "value": result.runtime_seconds},
@@ -778,6 +917,11 @@ with tab_report:
         {"metric": "compressed_bytes_estimate", "value": result.compressed_bytes_estimate},
         {"metric": "compression_ratio", "value": ratio},
         {"metric": "band_count", "value": band_count},
+        {"metric": "source_type", "value": loaded.source_type},
+        {
+            "metric": "archive_member",
+            "value": archive_member if archive_member is not None else "",
+        },
     ]
     if ndvi_run is not None and ndvi_run["signature"] == ndvi_signature:
         ndvi_metrics = ndvi_run["metrics"]
@@ -794,10 +938,21 @@ with tab_report:
     else:
         report_rows.append({"metric": "ndvi_status", "value": "not_run"})
 
+    stored_comparison = st.session_state.get("method_comparison")
+    if (
+        stored_comparison is not None
+        and stored_comparison["signature"] == comparison_signature
+    ):
+        report_rows.append({"metric": "all_method_comparison", "value": "completed"})
+    else:
+        report_rows.append({"metric": "all_method_comparison", "value": "not_run"})
+
     summary_df = pd.DataFrame(report_rows)
     summary_df["value"] = summary_df["value"].map(str)
-    st.dataframe(summary_df, width="stretch", hide_index=True)
-    st.dataframe(report_df, width="stretch", hide_index=True)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Per-band metrics")
+    st.dataframe(report_df, use_container_width=True, hide_index=True)
 
     export_df = report_df.copy()
     export_df.insert(0, "method", method)
