@@ -67,6 +67,23 @@ class ArchiveImageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "expanded TAR archive"):
                 list_archive_images(archive)
 
+    def test_counts_non_regular_member_payloads_toward_archive_limit(self) -> None:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            special = tarfile.TarInfo("large-special-member")
+            special.type = b"X"
+            special.size = 64
+            archive.addfile(special, io.BytesIO(b"x" * special.size))
+
+            image = _png_bytes()
+            regular = tarfile.TarInfo("source.png")
+            regular.size = len(image)
+            archive.addfile(regular, io.BytesIO(image))
+
+        with patch("image_io.MAX_ARCHIVE_EXPANDED_BYTES", 32):
+            with self.assertRaisesRegex(ValueError, "expanded TAR archive"):
+                list_archive_images(buffer.getvalue())
+
     def test_malformed_archive_image_raises_an_image_error(self) -> None:
         archive = _tar_bytes({"source.png": b"not an image"})
 

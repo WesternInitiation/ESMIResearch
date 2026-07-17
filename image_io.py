@@ -62,12 +62,11 @@ def list_archive_images(archive_bytes: bytes) -> list[str]:
             for member_count, member in enumerate(archive, start=1):
                 if member_count > MAX_ARCHIVE_MEMBERS:
                     raise ValueError("The TAR archive contains too many members.")
-                if not member.isfile():
-                    continue
-
                 expanded_bytes += member.size
                 if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
                     raise ValueError("The expanded TAR archive is too large to process.")
+                if not member.isfile():
+                    continue
                 if not member.name.lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
                     continue
                 if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
@@ -104,12 +103,11 @@ def load_archive_image(
             for member_count, member in enumerate(archive, start=1):
                 if member_count > MAX_ARCHIVE_MEMBERS:
                     raise ValueError("The TAR archive contains too many members.")
-                if not member.isfile():
-                    continue
-
                 expanded_bytes += member.size
                 if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
                     raise ValueError("The expanded TAR archive is too large to process.")
+                if not member.isfile():
+                    continue
                 if member.name != member_name:
                     continue
                 if image_bytes is not None:
