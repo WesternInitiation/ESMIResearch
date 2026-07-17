@@ -1,5 +1,5 @@
 """
-ESMI Research — SVD satellite image compression with NDVI benchmarking.
+ESMI Research — satellite image compression benchmarking workbench.
 
 Run: streamlit run app.py
 """
@@ -7,33 +7,43 @@ Run: streamlit run app.py
 from __future__ import annotations
 
 import io
+from typing import Callable
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+from compression.base import CompressionExecutionResult, compute_band_metrics
+from compression.bandwidth import run_bandwidth_compression
+from compression.jpeg2000 import run_jpeg2000_compression
+from compression.svd import run_svd_compression
+from compression.wavelet import run_wavelet_compression
 from image_io import load_image, to_display_rgb
 from ndvi import compare_ndvi, compute_ndvi
 from svd_compression import (
     ChannelCompressionConfig,
     CompressionConfig,
     apply_channel_weight_matrix,
-    compress_multiband,
     identity_weight_matrix,
 )
 
-st.set_page_config(
-    page_title="ESMI SVD Compression",
-    page_icon="🛰️",
-    layout="wide",
+st.set_page_config(page_title="ESMI Compression Lab", page_icon="🛰️", layout="wide")
+
+st.title("ESMI Research — Compression Analysis Lab")
+st.caption(
+    "Benchmark satellite image compression with SVD, wavelets, bandwidth-domain "
+    "filtering, and JPEG2000 while tracking runtime, fidelity, and NDVI preservation."
 )
 
-st.title("ESMI Research — SVD Satellite Compression")
-st.caption(
-    "Compress multispectral imagery with truncated SVD, tune per-band priorities, "
-    "and benchmark NDVI preservation."
-)
+COMPRESSION_METHODS = [
+    "SVD",
+    "Wavelet transformation",
+    "Bandwidth transformation",
+    "JPEG2000",
+]
+
+UPLOAD_FILE_TYPES = ["tif", "tiff", "png", "jpg", "jpeg", "webp"]
 
 
 @st.cache_data(show_spinner=False)
@@ -48,6 +58,16 @@ def _max_rank(shape: tuple[int, ...]) -> int:
 def _render_ndvi(ax, ndvi: np.ndarray, title: str) -> None:
     im = ax.imshow(ndvi, cmap="RdYlGn", vmin=-1, vmax=1)
     ax.set_title(title)
+    ax.axis("off")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+
+def _render_error_map(ax, original_rgb: np.ndarray, compressed_rgb: np.ndarray) -> None:
+    diff = np.abs(
+        compressed_rgb.astype(np.float64) - original_rgb.astype(np.float64)
+    ).mean(axis=-1)
+    im = ax.imshow(diff, cmap="magma")
+    ax.set_title("Absolute RGB error")
     ax.axis("off")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
@@ -77,15 +97,195 @@ def _build_weight_matrix(
     return matrix
 
 
+def _recover_original_band_space(
+    mixed_bands: dict[str, np.ndarray],
+    weight_matrix: np.ndarray,
+    band_order: list[str],
+) -> dict[str, np.ndarray]:
+    if np.allclose(weight_matrix, np.eye(weight_matrix.shape[0])):
+        return mixed_bands
+
+    inverse = np.linalg.pinv(weight_matrix)
+    ordered = [mixed_bands[name].astype(np.float64) for name in band_order]
+    cube = np.stack(ordered, axis=-1)
+    flat = cube.reshape(-1, len(band_order))
+    restored = flat @ inverse.T
+    restored = restored.reshape(cube.shape)
+    return {name: restored[..., i] for i, name in enumerate(band_order)}
+
+
+def _align_dtypes(
+    original_bands: dict[str, np.ndarray],
+    restored_bands: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    aligned: dict[str, np.ndarray] = {}
+    for name, original in original_bands.items():
+        restored = np.clip(restored_bands[name], original.min(), original.max())
+        aligned[name] = restored.astype(original.dtype)
+    return aligned
+
+
+def _report_table(result: CompressionExecutionResult) -> pd.DataFrame:
+    rows = []
+    for item in result.channel_reports:
+        rows.append(
+            {
+                "band": item.name,
+                "rmse": item.rmse,
+                "mae": item.mae,
+                "psnr_db": item.psnr,
+                "ssim": item.ssim,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _run_selected_method(
+    method: str,
+    original_bands: dict[str, np.ndarray],
+    working_bands: dict[str, np.ndarray],
+    band_order: list[str],
+    weight_matrix: np.ndarray,
+    svd_config: CompressionConfig,
+    wavelet_name: str,
+    wavelet_level: int,
+    wavelet_keep_fraction: float,
+    bandwidth_keep_fraction: float,
+    jpeg2000_rate: int,
+) -> CompressionExecutionResult:
+    if method == "SVD":
+        raw_result = run_svd_compression(working_bands, svd_config)
+    elif method == "Wavelet transformation":
+        raw_result = run_wavelet_compression(
+            working_bands,
+            wavelet=wavelet_name,
+            level=wavelet_level,
+            keep_fraction=wavelet_keep_fraction,
+        )
+    elif method == "Bandwidth transformation":
+        raw_result = run_bandwidth_compression(
+            working_bands,
+            keep_fraction=bandwidth_keep_fraction,
+        )
+    else:
+        raw_result = run_jpeg2000_compression(
+            working_bands,
+            rate=jpeg2000_rate,
+        )
+
+    restored_bands = _recover_original_band_space(
+        raw_result.reconstructed_bands, weight_matrix, band_order
+    )
+    reconstructed_bands = _align_dtypes(original_bands, restored_bands)
+    return CompressionExecutionResult(
+        method=raw_result.method,
+        reconstructed_bands=reconstructed_bands,
+        reconstructed_image=np.stack(
+            [reconstructed_bands[name] for name in band_order], axis=-1
+        ),
+        original_bytes=raw_result.original_bytes,
+        compressed_bytes_estimate=raw_result.compressed_bytes_estimate,
+        runtime_seconds=raw_result.runtime_seconds,
+        metadata=raw_result.metadata,
+        channel_reports=[
+            type(report)(
+                name=report.name,
+                rmse=float(
+                    np.sqrt(
+                        np.mean(
+                            (
+                                reconstructed_bands[report.name].astype(np.float64)
+                                - original_bands[report.name].astype(np.float64)
+                            )
+                            ** 2
+                        )
+                    )
+                ),
+                mae=float(
+                    np.mean(
+                        np.abs(
+                            reconstructed_bands[report.name].astype(np.float64)
+                            - original_bands[report.name].astype(np.float64)
+                        )
+                    )
+                ),
+                psnr=report.psnr,
+                ssim=report.ssim,
+            )
+            for report in raw_result.channel_reports
+        ],
+    )
+
+
+def _recompute_channel_report(
+    result: CompressionExecutionResult,
+    original_bands: dict[str, np.ndarray],
+) -> CompressionExecutionResult:
+    channel_reports = [
+        compute_band_metrics(name, original_bands[name], result.reconstructed_bands[name])
+        for name in original_bands
+    ]
+    result.channel_reports = channel_reports
+    return result
+
+
+def _comparison_runner(
+    runners: dict[str, Callable[[], CompressionExecutionResult]],
+    original_bands: dict[str, np.ndarray],
+) -> pd.DataFrame:
+    rows = []
+    for label, runner in runners.items():
+        try:
+            result = _recompute_channel_report(runner(), original_bands)
+            ratio = (
+                result.compressed_bytes_estimate / result.original_bytes
+                if result.original_bytes
+                else 0.0
+            )
+            report_df = _report_table(result)
+            rows.append(
+                {
+                    "method": label,
+                    "runtime_seconds": result.runtime_seconds,
+                    "compression_ratio": ratio,
+                    "compressed_bytes_estimate": result.compressed_bytes_estimate,
+                    "mean_rmse": float(report_df["rmse"].mean()),
+                    "mean_psnr_db": float(report_df["psnr_db"].replace(np.inf, np.nan).mean()),
+                    "mean_ssim": float(report_df["ssim"].mean()),
+                    "status": "ok",
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "method": label,
+                    "runtime_seconds": np.nan,
+                    "compression_ratio": np.nan,
+                    "compressed_bytes_estimate": np.nan,
+                    "mean_rmse": np.nan,
+                    "mean_psnr_db": np.nan,
+                    "mean_ssim": np.nan,
+                    "status": str(exc),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+method = st.selectbox(
+    "Compression method",
+    options=COMPRESSION_METHODS,
+    help="Choose which algorithm compresses the uploaded image.",
+)
+
 uploaded = st.file_uploader(
-    "Upload satellite image (GeoTIFF or PNG)",
-    type=["tif", "tiff", "png", "jpg", "jpeg"],
+    "Upload image for compression",
+    type=UPLOAD_FILE_TYPES,
 )
 
 if uploaded is None:
     st.info(
-        "Upload a multispectral GeoTIFF (recommended for NDVI) or a PNG/JPEG. "
-        "For NDVI benchmarking, provide **Red** and **NIR** bands."
+        "Select a compression method and upload an image. GeoTIFF is best for NDVI "
+        "analysis because it can preserve multiple bands including Red and NIR."
     )
     st.stop()
 
@@ -96,19 +296,12 @@ band_count = len(band_order)
 
 with st.sidebar:
     st.header("Compression settings")
+    compare_all_methods = st.checkbox("Run all-method runtime comparison", value=True)
 
-    mode = st.radio(
-        "Truncation mode",
-        options=["rank", "energy"],
-        format_func=lambda x: "Fixed rank (k)" if x == "rank" else "Energy fraction",
-    )
-
-    normalize = st.checkbox("Normalize bands before SVD", value=True)
-
-    st.subheader("Band mixing matrix")
-    use_custom_matrix = st.checkbox("Edit mixing matrix", value=False)
+    st.subheader("Matrix preprocessing")
+    use_custom_matrix = st.checkbox("Edit preprocessing matrix", value=False)
     matrix_preset = st.selectbox(
-        "Preset",
+        "Matrix preset",
         options=["identity", "ndvi_emphasis"],
         format_func=lambda x: {
             "identity": "Identity (no mixing)",
@@ -116,162 +309,204 @@ with st.sidebar:
         }[x],
         disabled=use_custom_matrix,
     )
-
     if use_custom_matrix:
-        st.caption("Rows: output bands. Columns: input bands.")
+        st.caption("Rows are transformed output bands. Columns are input bands.")
         for row, out_name in enumerate(band_order):
             cols = st.columns(min(band_count, 4))
             for col, in_name in enumerate(band_order):
                 with cols[col % len(cols)]:
-                    key = f"w_{row}_{col}"
-                    default = 1.0 if row == col else 0.0
                     st.number_input(
-                        f"{out_name}←{in_name}",
-                        key=key,
-                        value=default,
+                        f"{out_name}<-{in_name}",
+                        key=f"w_{row}_{col}",
+                        value=1.0 if row == col else 0.0,
                         step=0.1,
                         format="%.2f",
                     )
 
-    st.subheader("Per-band SVD parameters")
+    mode = "rank"
+    normalize = True
     channel_configs: dict[str, ChannelCompressionConfig] = {}
+    wavelet_name = "db2"
+    wavelet_level = 2
+    wavelet_keep_fraction = 0.2
+    bandwidth_keep_fraction = 0.25
+    jpeg2000_rate = 20
 
-    for name in band_order:
-        shape = bands[name].shape
-        max_k = _max_rank(shape)
-        st.markdown(f"**{name}** `{shape[1]}×{shape[0]}`")
-
-        weight = st.slider(
-            f"{name} priority weight",
-            min_value=0.1,
-            max_value=3.0,
-            value=1.5 if name in ("red", "nir") else 1.0,
-            step=0.1,
-            help="Scales effective rank for this band (higher = more singular values).",
-            key=f"weight_{name}",
+    if method == "SVD":
+        mode = st.radio(
+            "SVD truncation mode",
+            options=["rank", "energy"],
+            format_func=lambda x: "Fixed rank (k)" if x == "rank" else "Energy fraction",
+        )
+        normalize = st.checkbox("Normalize bands before SVD", value=True)
+        st.subheader("Per-band SVD parameters")
+        for name in band_order:
+            shape = bands[name].shape
+            max_k = _max_rank(shape)
+            st.markdown(f"**{name}** `{shape[1]}x{shape[0]}`")
+            weight = st.slider(
+                f"{name} priority weight",
+                min_value=0.1,
+                max_value=3.0,
+                value=1.5 if name in ("red", "nir") else 1.0,
+                step=0.1,
+                key=f"weight_{name}",
+            )
+            if mode == "rank":
+                base_rank = st.slider(
+                    f"{name} rank (k)",
+                    min_value=1,
+                    max_value=max_k,
+                    value=min(32, max_k),
+                    key=f"rank_{name}",
+                )
+                effective_rank = max(1, min(max_k, int(round(base_rank * weight))))
+                channel_configs[name] = ChannelCompressionConfig(
+                    rank=effective_rank, weight=weight
+                )
+                st.caption(f"Effective rank: {effective_rank}")
+            else:
+                energy = st.slider(
+                    f"{name} energy retained",
+                    min_value=0.5,
+                    max_value=0.999,
+                    value=0.95,
+                    step=0.001,
+                    format="%.3f",
+                    key=f"energy_{name}",
+                )
+                adjusted = min(0.999, energy * (0.8 + 0.2 * weight))
+                channel_configs[name] = ChannelCompressionConfig(
+                    energy_fraction=adjusted, weight=weight
+                )
+                st.caption(f"Effective energy target: {adjusted:.3f}")
+    elif method == "Wavelet transformation":
+        wavelet_name = st.selectbox("Wavelet family", options=["db1", "db2", "haar", "sym2"])
+        wavelet_level = st.slider("Wavelet decomposition level", min_value=1, max_value=5, value=2)
+        wavelet_keep_fraction = st.slider(
+            "Wavelet coefficient keep fraction",
+            min_value=0.01,
+            max_value=1.0,
+            value=0.2,
+            step=0.01,
+        )
+    elif method == "Bandwidth transformation":
+        bandwidth_keep_fraction = st.slider(
+            "Low-frequency bandwidth keep fraction",
+            min_value=0.01,
+            max_value=1.0,
+            value=0.25,
+            step=0.01,
+        )
+    else:
+        jpeg2000_rate = st.slider(
+            "JPEG2000 rate",
+            min_value=5,
+            max_value=100,
+            value=20,
+            help="Larger values generally preserve more detail but use more bytes.",
         )
 
-        if mode == "rank":
-            base_rank = st.slider(
-                f"{name} rank (k)",
-                min_value=1,
-                max_value=max_k,
-                value=min(32, max_k),
-                key=f"rank_{name}",
-            )
-            effective_rank = max(1, min(max_k, int(round(base_rank * weight))))
-            channel_configs[name] = ChannelCompressionConfig(
-                rank=effective_rank, weight=weight
-            )
-            st.caption(f"Effective k after weight: **{effective_rank}**")
-        else:
-            energy = st.slider(
-                f"{name} energy retained",
-                min_value=0.5,
-                max_value=0.999,
-                value=0.95,
-                step=0.001,
-                format="%.3f",
-                key=f"energy_{name}",
-            )
-            adjusted = min(0.999, energy * (0.8 + 0.2 * weight))
-            channel_configs[name] = ChannelCompressionConfig(
-                energy_fraction=adjusted, weight=weight
-            )
-            st.caption(f"Effective energy target: **{adjusted:.3f}**")
-
-    run_benchmark = st.checkbox("Run rank sweep benchmark", value=False)
-    sweep_max = st.slider(
-        "Sweep max rank",
-        min_value=5,
-        max_value=min(128, _max_rank(next(iter(bands.values())).shape)),
-        value=64,
-        disabled=not run_benchmark,
-    )
+if not channel_configs:
+    for name in band_order:
+        default_rank = min(32, _max_rank(bands[name].shape))
+        channel_configs[name] = ChannelCompressionConfig(rank=default_rank, weight=1.0)
 
 weight_matrix = _build_weight_matrix(
     band_count, band_order, use_custom_matrix, matrix_preset
 )
 working_bands = apply_channel_weight_matrix(bands, weight_matrix, band_order)
-
-config = CompressionConfig(
+svd_config = CompressionConfig(
     channels=channel_configs,
     mode=mode,
     normalize_before_svd=normalize,
 )
 
-result = compress_multiband(working_bands, config)
-
-col_meta1, col_meta2, col_meta3 = st.columns(3)
-ratio = (
-    result.total_bytes_compressed_estimate / result.total_bytes_original
-    if result.total_bytes_original
-    else 0
+result = _recompute_channel_report(
+    _run_selected_method(
+        method,
+        bands,
+        working_bands,
+        band_order,
+        weight_matrix,
+        svd_config,
+        wavelet_name,
+        wavelet_level,
+        wavelet_keep_fraction,
+        bandwidth_keep_fraction,
+        jpeg2000_rate,
+    ),
+    bands,
 )
-col_meta1.metric("Bands", band_count)
-col_meta2.metric("Est. compression ratio", f"{ratio:.2%}")
-col_meta3.metric("Source", loaded.source_type.upper())
+
+original_rgb = to_display_rgb(bands, band_order)
+compressed_rgb = to_display_rgb(result.reconstructed_bands, band_order)
+ratio = (
+    result.compressed_bytes_estimate / result.original_bytes
+    if result.original_bytes
+    else 0.0
+)
+report_df = _report_table(result)
+
+col1, col2, col3, col4, col5 = st.columns(5)
+col1.metric("Method", method)
+col2.metric("Runtime", f"{result.runtime_seconds:.4f} s")
+col3.metric("Compression ratio", f"{ratio:.2%}")
+col4.metric("Bands", band_count)
+col5.metric("Estimated compressed size", f"{result.compressed_bytes_estimate:,} B")
 
 red_name = st.selectbox(
-    "Red band (for NDVI)",
+    "Red band for NDVI",
     options=band_order,
     index=band_order.index("red") if "red" in band_order else 0,
 )
 nir_name = st.selectbox(
-    "NIR band (for NDVI)",
+    "NIR band for NDVI",
     options=band_order,
     index=band_order.index("nir") if "nir" in band_order else min(1, band_count - 1),
 )
 
-tab_preview, tab_ndvi, tab_svd, tab_benchmark, tab_matrix = st.tabs(
-    ["Preview", "NDVI", "Singular values", "Benchmark", "Matrices"]
+tab_overview, tab_ndvi, tab_methods, tab_matrix, tab_report = st.tabs(
+    ["Overview", "NDVI", "Method Comparison", "Matrices", "Analysis Report"]
 )
 
-original_rgb = to_display_rgb(bands, band_order)
-compressed_bands = {
-    name: result.channels[i].reconstructed for i, name in enumerate(band_order)
-}
-compressed_rgb = to_display_rgb(compressed_bands, band_order)
-
-with tab_preview:
+with tab_overview:
+    st.subheader("Side-by-side image comparison")
     c1, c2 = st.columns(2)
-    c1.image(original_rgb, caption="Original (RGB preview)", use_container_width=True)
-    c2.image(compressed_rgb, caption="Compressed (RGB preview)", use_container_width=True)
+    c1.image(original_rgb, caption="Original preview", use_container_width=True)
+    c2.image(compressed_rgb, caption="Compressed preview", use_container_width=True)
 
-    st.subheader("Per-band error")
-    rows = []
-    for ch in result.channels:
-        diff = ch.reconstructed.astype(np.float64) - ch.original.astype(np.float64)
-        rows.append(
-            {
-                "band": ch.name,
-                "rank_used": ch.rank_used,
-                "energy_retained": f"{ch.energy_retained:.4f}",
-                "weight": ch.weight,
-                "rmse": float(np.sqrt(np.mean(diff**2))),
-                "mae": float(np.mean(np.abs(diff))),
-            }
-        )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].imshow(original_rgb)
+    axes[0].set_title("Original")
+    axes[0].axis("off")
+    axes[1].imshow(compressed_rgb)
+    axes[1].set_title("Compressed")
+    axes[1].axis("off")
+    _render_error_map(axes[2], original_rgb, compressed_rgb)
+    st.pyplot(fig)
+    plt.close(fig)
+
+    st.subheader("Per-band quality metrics")
+    st.dataframe(report_df, use_container_width=True, hide_index=True)
 
 with tab_ndvi:
     if red_name == nir_name:
-        st.warning("Select distinct Red and NIR bands for NDVI.")
+        st.warning("Select distinct Red and NIR bands to compute NDVI.")
     else:
-        red_orig = bands[red_name]
-        nir_orig = bands[nir_name]
-        red_comp = compressed_bands[red_name]
-        nir_comp = compressed_bands[nir_name]
+        ndvi_orig = compute_ndvi(bands[red_name], bands[nir_name])
+        ndvi_comp = compute_ndvi(
+            result.reconstructed_bands[red_name],
+            result.reconstructed_bands[nir_name],
+        )
+        ndvi_metrics = compare_ndvi(ndvi_orig, ndvi_comp)
 
-        ndvi_orig = compute_ndvi(red_orig, nir_orig)
-        ndvi_comp = compute_ndvi(red_comp, nir_comp)
-        metrics = compare_ndvi(ndvi_orig, ndvi_comp)
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("NDVI RMSE", f"{metrics.rmse:.5f}")
-        m2.metric("NDVI MAE", f"{metrics.mae:.5f}")
-        m3.metric("Correlation", f"{metrics.correlation:.4f}")
-        m4.metric("NDVI SSIM", f"{metrics.ssim:.4f}")
+        n1, n2, n3, n4, n5 = st.columns(5)
+        n1.metric("NDVI RMSE", f"{ndvi_metrics.rmse:.5f}")
+        n2.metric("NDVI MAE", f"{ndvi_metrics.mae:.5f}")
+        n3.metric("NDVI correlation", f"{ndvi_metrics.correlation:.4f}")
+        n4.metric("NDVI SSIM", f"{ndvi_metrics.ssim:.4f}")
+        n5.metric("NDVI bias", f"{ndvi_metrics.bias:.5f}")
 
         fig, axes = plt.subplots(1, 3, figsize=(14, 4))
         _render_ndvi(axes[0], ndvi_orig, "Original NDVI")
@@ -284,111 +519,132 @@ with tab_ndvi:
         st.pyplot(fig)
         plt.close(fig)
 
-with tab_svd:
-    selected = st.selectbox("Band to inspect", options=band_order)
-    ch = next(c for c in result.channels if c.name == selected)
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(ch.singular_values, marker="o", markersize=3)
-    ax.axvline(ch.rank_used - 1, color="red", linestyle="--", label=f"k = {ch.rank_used}")
-    ax.set_xlabel("Index")
-    ax.set_ylabel("Singular value")
-    ax.set_title(f"Singular value spectrum — {selected}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
-    plt.close(fig)
-
-    energy = np.cumsum(ch.singular_values**2) / np.sum(ch.singular_values**2)
-    fig2, ax2 = plt.subplots(figsize=(10, 4))
-    ax2.plot(energy, marker="o", markersize=3)
-    ax2.axhline(ch.energy_retained, color="red", linestyle="--", label="Retained")
-    ax2.set_xlabel("Rank k")
-    ax2.set_ylabel("Cumulative energy fraction")
-    ax2.set_title(f"Energy capture — {selected}")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    st.pyplot(fig2)
-    plt.close(fig2)
-
-with tab_benchmark:
-    if not run_benchmark:
-        st.info("Enable **Run rank sweep benchmark** in the sidebar.")
-    elif red_name == nir_name:
-        st.warning("Configure distinct Red and NIR bands on the NDVI tab first.")
-    else:
-        st.subheader("NDVI preservation vs. SVD rank")
-        ranks = list(range(1, sweep_max + 1, max(1, sweep_max // 20)))
-
-        def _compress_pair(red, nir, rank):
-            red_cfg = ChannelCompressionConfig(rank=rank)
-            nir_cfg = ChannelCompressionConfig(rank=rank)
-            cfg = CompressionConfig(
-                channels={
-                    red_name: red_cfg,
-                    nir_name: nir_cfg,
-                },
-                mode="rank",
-                normalize_before_svd=normalize,
-            )
-            subset = {red_name: red, nir_name: nir}
-            out = compress_multiband(subset, cfg)
-            return (
-                out.channels[0].reconstructed,
-                out.channels[1].reconstructed,
-            )
-
-        ref_ndvi = compute_ndvi(bands[red_name], bands[nir_name])
-        bench_rows = []
-        for rank in ranks:
-            r_c, n_c = _compress_pair(bands[red_name], bands[nir_name], rank)
-            m = compare_ndvi(ref_ndvi, compute_ndvi(r_c, n_c))
-            bench_rows.append(
-                {
-                    "rank": rank,
-                    "ndvi_rmse": m.rmse,
-                    "ndvi_mae": m.mae,
-                    "correlation": m.correlation,
-                    "ssim": m.ssim,
-                }
-            )
-
-        df = pd.DataFrame(bench_rows)
-        st.line_chart(df.set_index("rank")[["ndvi_rmse", "ndvi_mae"]])
-        st.line_chart(df.set_index("rank")[["correlation", "ssim"]])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download benchmark CSV",
-            data=csv,
-            file_name="ndvi_svd_benchmark.csv",
-            mime="text/csv",
+with tab_methods:
+    st.subheader("Runtime and fidelity across compression methods")
+    if compare_all_methods:
+        comparison_df = _comparison_runner(
+            {
+                "SVD": lambda: _run_selected_method(
+                    "SVD",
+                    bands,
+                    working_bands,
+                    band_order,
+                    weight_matrix,
+                    svd_config,
+                    wavelet_name,
+                    wavelet_level,
+                    wavelet_keep_fraction,
+                    bandwidth_keep_fraction,
+                    jpeg2000_rate,
+                ),
+                "Wavelet transformation": lambda: _run_selected_method(
+                    "Wavelet transformation",
+                    bands,
+                    working_bands,
+                    band_order,
+                    weight_matrix,
+                    svd_config,
+                    wavelet_name,
+                    wavelet_level,
+                    wavelet_keep_fraction,
+                    bandwidth_keep_fraction,
+                    jpeg2000_rate,
+                ),
+                "Bandwidth transformation": lambda: _run_selected_method(
+                    "Bandwidth transformation",
+                    bands,
+                    working_bands,
+                    band_order,
+                    weight_matrix,
+                    svd_config,
+                    wavelet_name,
+                    wavelet_level,
+                    wavelet_keep_fraction,
+                    bandwidth_keep_fraction,
+                    jpeg2000_rate,
+                ),
+                "JPEG2000": lambda: _run_selected_method(
+                    "JPEG2000",
+                    bands,
+                    working_bands,
+                    band_order,
+                    weight_matrix,
+                    svd_config,
+                    wavelet_name,
+                    wavelet_level,
+                    wavelet_keep_fraction,
+                    bandwidth_keep_fraction,
+                    jpeg2000_rate,
+                ),
+            },
+            bands,
         )
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+        numeric_df = comparison_df.dropna(subset=["runtime_seconds", "compression_ratio"])
+        if not numeric_df.empty:
+            st.line_chart(
+                numeric_df.set_index("method")[["runtime_seconds", "compression_ratio"]]
+            )
+    else:
+        st.info("Enable all-method comparison in the sidebar to benchmark every method.")
+
+    st.subheader("Method diagnostics")
+    st.json(result.metadata)
 
 with tab_matrix:
-    st.subheader("Band mixing matrix")
-    st.caption("Applied before SVD. Identity = compress raw bands.")
+    st.subheader("Preprocessing matrix")
+    st.caption("The matrix is applied before compression and inverted after reconstruction.")
     mix_df = pd.DataFrame(
         weight_matrix,
-        index=[f"out:{n}" for n in band_order],
-        columns=[f"in:{n}" for n in band_order],
+        index=[f"out:{name}" for name in band_order],
+        columns=[f"in:{name}" for name in band_order],
     )
     st.dataframe(mix_df, use_container_width=True)
 
-    st.subheader("Effective compression parameters")
-    param_rows = []
-    for name in band_order:
-        cfg = channel_configs[name]
-        ch = next(c for c in result.channels if c.name == name)
-        param_rows.append(
-            {
-                "band": name,
-                "weight": cfg.weight,
-                "rank_setting": cfg.rank,
-                "energy_setting": cfg.energy_fraction,
-                "rank_used": ch.rank_used,
-                "energy_retained": ch.energy_retained,
-            }
+    st.subheader("Source metadata")
+    metadata_df = pd.DataFrame(
+        [{"key": key, "value": value} for key, value in loaded.metadata.items()]
+    )
+    st.dataframe(metadata_df, use_container_width=True, hide_index=True)
+
+with tab_report:
+    st.subheader("Analysis-ready summary")
+    report_rows = [
+        {"metric": "compression_method", "value": method},
+        {"metric": "runtime_seconds", "value": result.runtime_seconds},
+        {"metric": "original_bytes", "value": result.original_bytes},
+        {"metric": "compressed_bytes_estimate", "value": result.compressed_bytes_estimate},
+        {"metric": "compression_ratio", "value": ratio},
+        {"metric": "band_count", "value": band_count},
+    ]
+    if red_name != nir_name:
+        ndvi_orig = compute_ndvi(bands[red_name], bands[nir_name])
+        ndvi_comp = compute_ndvi(
+            result.reconstructed_bands[red_name],
+            result.reconstructed_bands[nir_name],
         )
-    st.dataframe(pd.DataFrame(param_rows), use_container_width=True, hide_index=True)
+        ndvi_metrics = compare_ndvi(ndvi_orig, ndvi_comp)
+        report_rows.extend(
+            [
+                {"metric": "ndvi_rmse", "value": ndvi_metrics.rmse},
+                {"metric": "ndvi_mae", "value": ndvi_metrics.mae},
+                {"metric": "ndvi_correlation", "value": ndvi_metrics.correlation},
+                {"metric": "ndvi_ssim", "value": ndvi_metrics.ssim},
+                {"metric": "ndvi_bias", "value": ndvi_metrics.bias},
+            ]
+        )
+
+    summary_df = pd.DataFrame(report_rows)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(report_df, use_container_width=True, hide_index=True)
+
+    export_df = report_df.copy()
+    export_df.insert(0, "method", method)
+    export_df.insert(1, "runtime_seconds", result.runtime_seconds)
+    csv_data = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download analysis CSV",
+        data=csv_data,
+        file_name="compression_analysis_report.csv",
+        mime="text/csv",
+    )
