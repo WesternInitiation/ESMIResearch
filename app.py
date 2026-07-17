@@ -586,8 +586,8 @@ tab_overview, tab_ndvi, tab_methods, tab_matrix, tab_report = st.tabs(
 with tab_overview:
     st.subheader("Side-by-side image comparison")
     c1, c2 = st.columns(2)
-    c1.image(original_rgb, caption="Original preview", use_container_width=True)
-    c2.image(compressed_rgb, caption="Compressed preview", use_container_width=True)
+    c1.image(original_rgb, caption="Original preview", width="stretch")
+    c2.image(compressed_rgb, caption="Compressed preview", width="stretch")
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     axes[0].imshow(original_rgb)
@@ -601,7 +601,7 @@ with tab_overview:
     plt.close(fig)
 
     st.subheader("Per-band quality metrics")
-    st.dataframe(report_df, use_container_width=True, hide_index=True)
+    st.dataframe(report_df, width="stretch", hide_index=True)
 
 ndvi_run = st.session_state.get("ndvi_run")
 with tab_ndvi:
@@ -741,7 +741,7 @@ with tab_methods:
             },
             bands,
         )
-        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+        st.dataframe(comparison_df, width="stretch", hide_index=True)
         numeric_df = comparison_df.dropna(subset=["runtime_seconds", "compression_ratio"])
         if not numeric_df.empty:
             st.line_chart(
@@ -761,13 +761,13 @@ with tab_matrix:
         index=[f"out:{name}" for name in band_order],
         columns=[f"in:{name}" for name in band_order],
     )
-    st.dataframe(mix_df, use_container_width=True)
+    st.dataframe(mix_df, width="stretch")
 
     st.subheader("Source metadata")
     metadata_df = pd.DataFrame(
         [{"key": key, "value": str(value)} for key, value in loaded.metadata.items()]
     )
-    st.dataframe(metadata_df, use_container_width=True, hide_index=True)
+    st.dataframe(metadata_df, width="stretch", hide_index=True)
 
 with tab_report:
     st.subheader("Analysis-ready summary")
@@ -795,8 +795,9 @@ with tab_report:
         report_rows.append({"metric": "ndvi_status", "value": "not_run"})
 
     summary_df = pd.DataFrame(report_rows)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
-    st.dataframe(report_df, use_container_width=True, hide_index=True)
+    summary_df["value"] = summary_df["value"].map(str)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
+    st.dataframe(report_df, width="stretch", hide_index=True)
 
     export_df = report_df.copy()
     export_df.insert(0, "method", method)

@@ -44,6 +44,7 @@ SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
 MAX_ARCHIVE_IMAGE_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_EXPANDED_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 2_048
+MAX_DECODED_IMAGE_BYTES = 512 * 1024 * 1024
 
 
 def is_tar_archive(filename: str) -> bool:
@@ -154,6 +155,10 @@ def load_png(file: BinaryIO) -> LoadedImage:
         image = image.convert("RGBA" if "transparency" in image.info else "RGB")
     elif image.mode not in ("1", "L", "LA", "I", "I;16", "F", "RGB", "RGBA"):
         image = image.convert("RGB")
+    channel_count = max(1, len(image.getbands()))
+    estimated_bytes = image.width * image.height * channel_count * 4
+    if estimated_bytes > MAX_DECODED_IMAGE_BYTES:
+        raise ValueError("The decoded image is too large to process.")
     image.load()
     array = np.asarray(image)
 
@@ -193,6 +198,12 @@ def load_geotiff(file: BinaryIO) -> LoadedImage:
     data = file.read()
     with MemoryFile(data) as memfile:
         with memfile.open() as dataset:
+            estimated_bytes = sum(
+                dataset.width * dataset.height * np.dtype(dtype).itemsize
+                for dtype in dataset.dtypes
+            )
+            if estimated_bytes > MAX_DECODED_IMAGE_BYTES:
+                raise ValueError("The decoded GeoTIFF is too large to process.")
             array = dataset.read()
             descriptions = dataset.descriptions
             profile = dataset.profile.copy()
