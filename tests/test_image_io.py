@@ -71,7 +71,7 @@ class ArchiveImageTests(unittest.TestCase):
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w") as archive:
             special = tarfile.TarInfo("large-special-member")
-            special.type = b"X"
+            special.type = tarfile.DIRTYPE
             special.size = 64
             archive.addfile(special, io.BytesIO(b"x" * special.size))
 
