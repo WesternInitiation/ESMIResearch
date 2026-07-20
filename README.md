@@ -25,7 +25,7 @@ tab, choose distinct Red and NIR bands, confirm the test, and run it explicitly.
 ## Supabase setup (storage + shared results)
 
 1. Create a free project at [supabase.com](https://supabase.com).
-2. In the SQL editor, run [`supabase/migrations/001_init.sql`](supabase/migrations/001_init.sql).
+2. In the SQL editor, run [`supabase_schema/migrations/001_init.sql`](supabase_schema/migrations/001_init.sql).
 3. In Storage, create a **private** bucket named `esmi-images`.
 4. Copy Project URL and `service_role` key into Streamlit secrets
    (see [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example)).
@@ -72,5 +72,5 @@ Free-tier notes:
 | `compression/` | SVD / wavelet / bandwidth / JPEG2000 implementations |
 | `persistence.py` | Supabase save/load helpers |
 | `supabase_client.py` | Client from Streamlit secrets |
-| `supabase/migrations/` | Database schema |
+| `supabase_schema/migrations/` | Database schema SQL |
 | `packages.txt` | System deps for Community Cloud (GDAL) |
