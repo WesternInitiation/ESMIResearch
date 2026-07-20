@@ -103,11 +103,12 @@ def _max_rank(shape: tuple[int, ...]) -> int:
 
 def _show_image(target, image, caption: str | None = None, **kwargs):
     """Show an image with Streamlit API compatibility across versions."""
+    # Prefer older Anaconda-friendly kwargs first, then newer APIs, then bare call.
     attempts = (
-        {"use_container_width": True},
         {"use_column_width": True},
-        {"width": "stretch"},
         {},
+        {"use_container_width": True},
+        {"width": "stretch"},
     )
     last_error: TypeError | None = None
     for options in attempts:
@@ -123,9 +124,9 @@ def _show_image(target, image, caption: str | None = None, **kwargs):
 def _show_dataframe(target, data, **kwargs):
     """Show a dataframe with Streamlit API compatibility across versions."""
     attempts = (
+        {},
         {"use_container_width": True},
         {"width": "stretch"},
-        {},
     )
     last_error: TypeError | None = None
     for options in attempts:
