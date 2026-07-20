@@ -6,7 +6,16 @@ from functools import lru_cache
 from typing import Any
 
 import streamlit as st
-from supabase import Client, create_client
+
+try:
+    from supabase import Client, create_client
+except ImportError as exc:  # pragma: no cover - environment/package issues
+    raise ImportError(
+        "Could not import the PyPI 'supabase' package. Install it with "
+        "`pip install supabase` and make sure this repo has no local folder "
+        "named `supabase/` shadowing the package (schema lives in "
+        "`supabase_schema/`)."
+    ) from exc
 
 
 class SupabaseNotConfiguredError(RuntimeError):

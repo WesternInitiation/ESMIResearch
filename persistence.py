@@ -7,9 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-from supabase import Client
-
 from supabase_client import get_storage_bucket, get_supabase_client
+
+try:
+    from supabase import Client
+except ImportError:  # pragma: no cover
+    Client = Any  # type: ignore[misc,assignment]
 
 
 @dataclass
