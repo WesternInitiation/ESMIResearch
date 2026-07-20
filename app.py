@@ -31,14 +31,6 @@ from image_io import (
     to_display_rgb,
 )
 from ndvi import compare_ndvi, compute_ndvi
-from persistence import (
-    build_share_url,
-    list_recent_runs,
-    load_run_by_share_token,
-    save_compression_run,
-    save_method_comparison,
-    save_ndvi_for_run,
-)
 from supabase_client import SupabaseNotConfiguredError, supabase_configured
 from svd_compression import (
     ChannelCompressionConfig,
@@ -46,6 +38,29 @@ from svd_compression import (
     apply_channel_weight_matrix,
     identity_weight_matrix,
 )
+
+try:
+    from persistence import (
+        build_share_url,
+        list_recent_runs,
+        load_run_by_share_token,
+        save_compression_run,
+        save_method_comparison,
+        save_ndvi_for_run,
+    )
+except ImportError:
+    # Older/partial local persistence.py — provide minimal share-url helper.
+    from persistence import (  # type: ignore
+        list_recent_runs,
+        load_run_by_share_token,
+        save_compression_run,
+        save_method_comparison,
+        save_ndvi_for_run,
+    )
+
+    def build_share_url(base_url: str, share_token: str) -> str:
+        return f"{base_url.rstrip('/')}/?run={share_token}"
+
 
 st.set_page_config(page_title="ESMI Compression Lab", page_icon="🛰️", layout="wide")
 
