@@ -9,10 +9,9 @@ from uuid import uuid4
 
 from supabase_client import get_storage_bucket, get_supabase_client
 
-try:
-    from supabase import Client
-except ImportError:  # pragma: no cover
-    Client = Any  # type: ignore[misc,assignment]
+# Avoid importing supabase types at module load — the package may be missing
+# in some local environments. Runtime calls still require it.
+Client = Any
 
 
 @dataclass

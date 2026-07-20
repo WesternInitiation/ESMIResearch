@@ -7,19 +7,37 @@ from typing import Any
 
 import streamlit as st
 
-try:
-    from supabase import Client, create_client
-except ImportError as exc:  # pragma: no cover - environment/package issues
-    raise ImportError(
-        "Could not import the PyPI 'supabase' package. Install it with "
-        "`pip install supabase` and make sure this repo has no local folder "
-        "named `supabase/` shadowing the package (schema lives in "
-        "`supabase_schema/`)."
-    ) from exc
-
 
 class SupabaseNotConfiguredError(RuntimeError):
     """Raised when Streamlit secrets for Supabase are missing."""
+
+
+class SupabaseImportError(RuntimeError):
+    """Raised when the PyPI supabase package is unavailable."""
+
+
+def _import_supabase():
+    """Import the real PyPI package, with a clear error if it fails."""
+    try:
+        from supabase import create_client
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise SupabaseImportError(
+            "Could not import the PyPI 'supabase' package in this Python "
+            "environment. Install it into the SAME interpreter that runs "
+            "Streamlit, e.g.\n"
+            "  C:\\ProgramData\\Anaconda3\\python.exe -m pip install -U supabase\n"
+            "Also ensure there is no local folder named `supabase/` in the "
+            "project (schema lives in `supabase_schema/`)."
+        ) from exc
+    return create_client
+
+
+def supabase_package_available() -> bool:
+    try:
+        _import_supabase()
+        return True
+    except SupabaseImportError:
+        return False
 
 
 def supabase_configured() -> bool:
@@ -31,6 +49,11 @@ def supabase_configured() -> bool:
     url = str(secrets.get("url", "")).strip()
     key = str(secrets.get("service_role_key", "")).strip()
     return bool(url and key)
+
+
+def supabase_ready() -> bool:
+    """True when both the package and secrets are available."""
+    return supabase_configured() and supabase_package_available()
 
 
 def get_supabase_settings() -> dict[str, str]:
@@ -49,11 +72,12 @@ def get_supabase_settings() -> dict[str, str]:
 
 
 @lru_cache(maxsize=1)
-def _cached_client(url: str, key: str) -> Client:
+def _cached_client(url: str, key: str):
+    create_client = _import_supabase()
     return create_client(url, key)
 
 
-def get_supabase_client() -> Client:
+def get_supabase_client():
     """Return a shared Supabase client using the service role key."""
     settings = get_supabase_settings()
     return _cached_client(settings["url"], settings["service_role_key"])

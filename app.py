@@ -31,7 +31,13 @@ from image_io import (
     to_display_rgb,
 )
 from ndvi import compare_ndvi, compute_ndvi
-from supabase_client import SupabaseNotConfiguredError, supabase_configured
+from supabase_client import (
+    SupabaseImportError,
+    SupabaseNotConfiguredError,
+    supabase_configured,
+    supabase_package_available,
+    supabase_ready,
+)
 from svd_compression import (
     ChannelCompressionConfig,
     CompressionConfig,
@@ -183,6 +189,13 @@ def _app_base_url() -> str:
 def _render_shared_run_viewer() -> None:
     """Load and display a shared Supabase run from ?run= or manual token entry."""
     st.subheader("Shared runs")
+    if not supabase_package_available():
+        st.warning(
+            "The `supabase` Python package is not installed in this environment. "
+            "Install it with:\n\n"
+            "`C:\\ProgramData\\Anaconda3\\python.exe -m pip install -U supabase`"
+        )
+        return
     if not supabase_configured():
         st.caption(
             "Configure Supabase secrets to save and share compression runs with "
@@ -870,7 +883,12 @@ st.caption(
 )
 
 st.subheader("Save & share with Supabase")
-if not supabase_configured():
+if not supabase_package_available():
+    st.warning(
+        "Install the Supabase package into Anaconda before saving runs:\n\n"
+        "`C:\\ProgramData\\Anaconda3\\python.exe -m pip install -U supabase`"
+    )
+elif not supabase_configured():
     st.info(
         "Add Supabase secrets to enable cloud storage and shareable run links. "
         "See `.streamlit/secrets.toml.example`."
@@ -924,7 +942,7 @@ else:
                 "compression_signature": compression_signature,
             }
             st.success("Run saved to Supabase.")
-        except (SupabaseNotConfiguredError, Exception) as exc:
+        except (SupabaseNotConfiguredError, SupabaseImportError, Exception) as exc:
             st.error(f"Save failed: {exc}")
 
     saved_meta = st.session_state.get("supabase_saved_run")
@@ -1057,7 +1075,7 @@ with tab_ndvi:
 
         saved_meta = st.session_state.get("supabase_saved_run")
         can_attach_ndvi = (
-            supabase_configured()
+            supabase_ready()
             and saved_meta is not None
             and saved_meta.get("compression_signature") == compression_signature
         )
@@ -1077,7 +1095,7 @@ with tab_ndvi:
                     st.success("NDVI metrics attached to the saved Supabase run.")
                 except Exception as exc:
                     st.error(f"Failed to save NDVI: {exc}")
-        elif supabase_configured():
+        elif supabase_ready():
             st.caption(
                 "Save the compression run to Supabase first, then attach NDVI metrics."
             )
@@ -1179,7 +1197,7 @@ with tab_methods:
                 mime="text/csv",
             )
 
-            if supabase_configured():
+            if supabase_ready():
                 if st.button(
                     "Save method comparison to Supabase",
                     key="save_comparison_supabase",
@@ -1215,6 +1233,10 @@ with tab_methods:
                         )
                     except Exception as exc:
                         st.error(f"Failed to save comparison: {exc}")
+            elif not supabase_package_available():
+                st.caption(
+                    "Install `supabase` into Anaconda to save comparison results."
+                )
         elif compare_all_methods:
             st.warning(
                 "No comparison has been run yet for the current image/settings. "
