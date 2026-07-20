@@ -101,6 +101,51 @@ def _max_rank(shape: tuple[int, ...]) -> int:
     return min(shape[0], shape[1])
 
 
+def _show_image(target, image, caption: str | None = None, **kwargs):
+    """Show an image with Streamlit API compatibility across versions."""
+    attempts = (
+        {"use_container_width": True},
+        {"use_column_width": True},
+        {"width": "stretch"},
+        {},
+    )
+    last_error: TypeError | None = None
+    for options in attempts:
+        try:
+            return target.image(image, caption=caption, **options, **kwargs)
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return None
+
+
+def _show_dataframe(target, data, **kwargs):
+    """Show a dataframe with Streamlit API compatibility across versions."""
+    attempts = (
+        {"use_container_width": True},
+        {"width": "stretch"},
+        {},
+    )
+    last_error: TypeError | None = None
+    for options in attempts:
+        try:
+            return target.dataframe(data, **options, **kwargs)
+        except TypeError as exc:
+            last_error = exc
+            # Older Streamlit may not support hide_index either.
+            if "hide_index" in kwargs:
+                try:
+                    trimmed = dict(kwargs)
+                    trimmed.pop("hide_index", None)
+                    return target.dataframe(data, **options, **trimmed)
+                except TypeError as inner_exc:
+                    last_error = inner_exc
+    if last_error is not None:
+        raise last_error
+    return None
+
+
 def _query_run_token() -> str | None:
     params = st.query_params
     value = params.get("run")
@@ -166,7 +211,7 @@ def _render_shared_run_viewer() -> None:
             )
             if col in recent_df.columns
         ]
-        st.dataframe(recent_df[display_cols], use_container_width=True, hide_index=True)
+        _show_dataframe(st, recent_df[display_cols], hide_index=True)
 
     if not active_token:
         return
@@ -200,9 +245,9 @@ def _render_shared_run_viewer() -> None:
     )
 
     if loaded_shared.band_metrics:
-        st.dataframe(
+        _show_dataframe(
+            st,
             pd.DataFrame(loaded_shared.band_metrics),
-            use_container_width=True,
             hide_index=True,
         )
 
@@ -897,8 +942,8 @@ with tab_overview:
         "preview, absolute error map, and per-band quality metrics."
     )
     c1, c2 = st.columns(2)
-    c1.image(original_rgb, caption="Original preview", use_container_width=True)
-    c2.image(compressed_rgb, caption="Compressed preview", use_container_width=True)
+    _show_image(c1, original_rgb, caption="Original preview")
+    _show_image(c2, compressed_rgb, caption="Compressed preview")
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     axes[0].imshow(original_rgb)
@@ -915,7 +960,7 @@ with tab_overview:
     if report_df.empty:
         st.warning("No per-band metrics were produced for this run.")
     else:
-        st.dataframe(report_df, use_container_width=True, hide_index=True)
+        _show_dataframe(st, report_df, hide_index=True)
 
 ndvi_run = st.session_state.get("ndvi_run")
 with tab_ndvi:
@@ -1089,7 +1134,7 @@ with tab_methods:
         ):
             comparison_df = stored_comparison["table"]
             st.success("Comparison results are ready for this image and settings.")
-            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+            _show_dataframe(st, comparison_df, hide_index=True)
 
             numeric_df = comparison_df[
                 comparison_df["status"] == "ok"
@@ -1108,7 +1153,7 @@ with tab_methods:
                 st.subheader("Reconstructed previews by method")
                 preview_cols = st.columns(min(len(previews), 4))
                 for column, (label, preview) in zip(preview_cols, previews.items()):
-                    column.image(preview, caption=label, use_container_width=True)
+                    _show_image(column, preview, caption=label)
 
             csv_comparison = comparison_df.to_csv(index=False).encode("utf-8")
             st.download_button(
@@ -1176,14 +1221,14 @@ with tab_matrix:
         index=[f"out:{name}" for name in band_order],
         columns=[f"in:{name}" for name in band_order],
     )
-    st.dataframe(mix_df, use_container_width=True)
+    _show_dataframe(st, mix_df)
 
     st.subheader("Source metadata")
     if loaded.metadata:
         metadata_df = pd.DataFrame(
             [{"key": key, "value": str(value)} for key, value in loaded.metadata.items()]
         )
-        st.dataframe(metadata_df, use_container_width=True, hide_index=True)
+        _show_dataframe(st, metadata_df, hide_index=True)
     else:
         st.info("No source metadata was attached to this upload.")
 
@@ -1199,7 +1244,7 @@ with tab_matrix:
         }
         for name in band_order
     ]
-    st.dataframe(pd.DataFrame(band_rows), use_container_width=True, hide_index=True)
+    _show_dataframe(st, pd.DataFrame(band_rows), hide_index=True)
 
 with tab_report:
     st.subheader("Analysis-ready summary")
@@ -1246,10 +1291,10 @@ with tab_report:
 
     summary_df = pd.DataFrame(report_rows)
     summary_df["value"] = summary_df["value"].map(str)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    _show_dataframe(st, summary_df, hide_index=True)
 
     st.subheader("Per-band metrics")
-    st.dataframe(report_df, use_container_width=True, hide_index=True)
+    _show_dataframe(st, report_df, hide_index=True)
 
     export_df = report_df.copy()
     export_df.insert(0, "method", method)
