@@ -42,7 +42,7 @@ Once configured, the app can:
 Streamlit Community Cloud hosts this app for free at a `*.streamlit.app` URL.
 Vercel cannot host Streamlit/Python apps; Community Cloud is the intended free path.
 
-1. Push this repository to GitHub.
+1. Push this repository to GitHub (`main`).
 2. Open [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
 3. **Create app** → select `ESMIResearch`, branch `main`, main file `app.py`.
 4. Under Advanced / Secrets, paste:
@@ -57,6 +57,12 @@ app_base_url = "https://YOUR_APP.streamlit.app"
 ```
 
 5. Deploy, then set `app_base_url` to the assigned Streamlit URL if needed and reboot.
+
+If deploy fails with **Error installing requirements**:
+
+1. Open the app → **Manage app** → read the terminal log (the real pip/apt error is there).
+2. Confirm the repo root has both `requirements.txt` and `packages.txt` (for GDAL/`rasterio`).
+3. Redeploy after pulling the latest `main`.
 
 Free-tier notes:
 

@@ -1,0 +1,3 @@
+# Pin Python version for Streamlit Community Cloud
+# https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/app-dependencies
+3.11
