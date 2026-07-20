@@ -1,0 +1,4 @@
+# Streamlit Community Cloud system packages (apt)
+# Required so rasterio can open GeoTIFF uploads in the free cloud environment.
+gdal-bin
+libgdal-dev

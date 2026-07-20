@@ -31,6 +31,15 @@ from image_io import (
     to_display_rgb,
 )
 from ndvi import compare_ndvi, compute_ndvi
+from persistence import (
+    build_share_url,
+    list_recent_runs,
+    load_run_by_share_token,
+    save_compression_run,
+    save_method_comparison,
+    save_ndvi_for_run,
+)
+from supabase_client import SupabaseNotConfiguredError, supabase_configured
 from svd_compression import (
     ChannelCompressionConfig,
     CompressionConfig,
@@ -90,6 +99,147 @@ def _reset_ndvi_confirmation() -> None:
 
 def _max_rank(shape: tuple[int, ...]) -> int:
     return min(shape[0], shape[1])
+
+
+def _query_run_token() -> str | None:
+    params = st.query_params
+    value = params.get("run")
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    token = str(value).strip()
+    return token or None
+
+
+def _app_base_url() -> str:
+    try:
+        return str(st.secrets.get("app_base_url", "")).strip().rstrip("/")
+    except Exception:
+        return ""
+
+
+def _render_shared_run_viewer() -> None:
+    """Load and display a shared Supabase run from ?run= or manual token entry."""
+    st.subheader("Shared runs")
+    if not supabase_configured():
+        st.caption(
+            "Configure Supabase secrets to save and share compression runs with "
+            "your research group."
+        )
+        return
+
+    query_token = _query_run_token()
+    token_input = st.text_input(
+        "Share token",
+        value=query_token or "",
+        help="Paste a share token or open a link like /?run=<token>.",
+        key="shared_run_token_input",
+    )
+    load_clicked = st.button("Load shared run", key="load_shared_run_btn")
+
+    if load_clicked and token_input.strip():
+        st.query_params["run"] = token_input.strip()
+
+    active_token = (st.query_params.get("run") or token_input or "").strip()
+    if isinstance(active_token, list):
+        active_token = active_token[0] if active_token else ""
+
+    try:
+        recent = list_recent_runs(limit=15)
+    except Exception as exc:
+        st.warning(f"Could not list recent runs: {exc}")
+        recent = []
+
+    if recent:
+        st.caption("Recent saved runs")
+        recent_df = pd.DataFrame(recent)
+        display_cols = [
+            col
+            for col in (
+                "created_at",
+                "method",
+                "source_filename",
+                "runtime_seconds",
+                "compression_ratio",
+                "share_token",
+            )
+            if col in recent_df.columns
+        ]
+        st.dataframe(recent_df[display_cols], use_container_width=True, hide_index=True)
+
+    if not active_token:
+        return
+
+    try:
+        with st.spinner("Loading shared run from Supabase…"):
+            loaded_shared = load_run_by_share_token(active_token)
+    except Exception as exc:
+        st.error(f"Failed to load shared run: {exc}")
+        return
+
+    if loaded_shared is None:
+        st.warning("No run found for that share token.")
+        return
+
+    run = loaded_shared.run
+    st.success(
+        f"Loaded shared run · method **{run.get('method')}** · "
+        f"source `{run.get('source_filename') or 'unknown'}`"
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Runtime", f"{float(run.get('runtime_seconds') or 0):.4f} s")
+    m2.metric(
+        "Compression ratio",
+        f"{float(run.get('compression_ratio') or 0):.2%}",
+    )
+    m3.metric("Original bytes", f"{int(run.get('original_bytes') or 0):,}")
+    m4.metric(
+        "Compressed estimate",
+        f"{int(run.get('compressed_bytes_estimate') or 0):,}",
+    )
+
+    if loaded_shared.band_metrics:
+        st.dataframe(
+            pd.DataFrame(loaded_shared.band_metrics),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if loaded_shared.ndvi is not None:
+        ndvi = loaded_shared.ndvi
+        st.markdown(
+            f"NDVI (`{ndvi.get('red_band')}` / `{ndvi.get('nir_band')}`): "
+            f"RMSE={ndvi.get('rmse')}, SSIM={ndvi.get('ssim')}, "
+            f"corr={ndvi.get('correlation')}"
+        )
+
+    dl1, dl2 = st.columns(2)
+    if loaded_shared.original_bytes is not None:
+        dl1.download_button(
+            "Download original artifact",
+            data=loaded_shared.original_bytes,
+            file_name=loaded_shared.original_filename or "original.bin",
+            mime="application/octet-stream",
+            key="shared_original_dl",
+        )
+    if loaded_shared.compressed_bytes is not None:
+        dl2.download_button(
+            "Download compressed artifact",
+            data=loaded_shared.compressed_bytes,
+            file_name=loaded_shared.compressed_filename or "compressed.bin",
+            mime="application/octet-stream",
+            key="shared_compressed_dl",
+        )
+
+    base = _app_base_url()
+    if base:
+        st.code(build_share_url(base, str(run["share_token"])), language=None)
+    else:
+        st.code(f"?run={run['share_token']}", language=None)
+        st.caption(
+            "Set `app_base_url` in secrets to show a full shareable Streamlit Cloud URL."
+        )
 
 
 def _render_ndvi(ax, ndvi: np.ndarray, title: str) -> None:
@@ -350,6 +500,10 @@ def _method_runners(
     }
 
 
+with st.expander("Shared runs (Supabase)", expanded=bool(_query_run_token())):
+    _render_shared_run_viewer()
+
+
 method = st.selectbox(
     "Compression method",
     options=COMPRESSION_METHODS,
@@ -607,6 +761,7 @@ if run_compression:
         }
         st.session_state.pop("ndvi_run", None)
         st.session_state["confirm_ndvi"] = False
+        st.session_state.pop("supabase_saved_run", None)
         # Keep method comparison only if its settings signature still matches.
         stored_comparison = st.session_state.get("method_comparison")
         if (
@@ -652,6 +807,84 @@ st.caption(
     "The algorithm size above estimates its compact representation; the download "
     "contains the reconstructed pixels in a portable image format."
 )
+
+st.subheader("Save & share with Supabase")
+if not supabase_configured():
+    st.info(
+        "Add Supabase secrets to enable cloud storage and shareable run links. "
+        "See `.streamlit/secrets.toml.example`."
+    )
+else:
+    notes = st.text_input(
+        "Optional notes for this run",
+        key="supabase_run_notes",
+        placeholder="e.g. Sentinel-2 scene, k=32 NDVI emphasis",
+    )
+    if st.button("Save run to Supabase", type="secondary", key="save_run_supabase"):
+        try:
+            with st.spinner("Uploading artifacts and saving metrics…"):
+                params_payload = {
+                    "method": method,
+                    "matrix_preset": matrix_preset,
+                    "use_custom_matrix": use_custom_matrix,
+                    "weight_matrix": weight_matrix.tolist(),
+                    "svd_mode": mode,
+                    "svd_normalize": normalize,
+                    "svd_channels": signature_payload["svd_channels"],
+                    "wavelet": {
+                        "name": wavelet_name,
+                        "level": wavelet_level,
+                        "keep_fraction": wavelet_keep_fraction,
+                    },
+                    "bandwidth_keep_fraction": bandwidth_keep_fraction,
+                    "jpeg2000_rate": jpeg2000_rate,
+                    "band_order": band_order,
+                }
+                band_metric_rows = report_df.to_dict(orient="records")
+                saved = save_compression_run(
+                    method=method,
+                    source_filename=uploaded.name,
+                    archive_member=archive_member,
+                    params=params_payload,
+                    runtime_seconds=float(result.runtime_seconds),
+                    original_bytes_count=int(result.original_bytes),
+                    compressed_bytes_estimate=int(result.compressed_bytes_estimate),
+                    compression_ratio=float(ratio),
+                    band_metrics=band_metric_rows,
+                    original_file_bytes=uploaded_bytes,
+                    original_filename=uploaded.name,
+                    compressed_file_bytes=stored_run["artifact_bytes"],
+                    compressed_filename=stored_run["artifact_filename"],
+                    notes=notes or None,
+                )
+            st.session_state["supabase_saved_run"] = {
+                "run_id": saved.run_id,
+                "share_token": saved.share_token,
+                "compression_signature": compression_signature,
+            }
+            st.success("Run saved to Supabase.")
+        except (SupabaseNotConfiguredError, Exception) as exc:
+            st.error(f"Save failed: {exc}")
+
+    saved_meta = st.session_state.get("supabase_saved_run")
+    if (
+        saved_meta is not None
+        and saved_meta.get("compression_signature") == compression_signature
+    ):
+        share_token = saved_meta["share_token"]
+        base = _app_base_url()
+        share_url = (
+            build_share_url(base, share_token)
+            if base
+            else f"?run={share_token}"
+        )
+        st.markdown(f"**Share link / token:** `{share_token}`")
+        st.code(share_url, language=None)
+        if not base:
+            st.caption(
+                "Set `app_base_url` in secrets (e.g. your "
+                "`https://….streamlit.app` URL) for a full share link."
+            )
 
 tab_overview, tab_ndvi, tab_methods, tab_matrix, tab_report = st.tabs(
     ["Overview", "NDVI", "Method Comparison", "Matrices", "Analysis Report"]
@@ -760,6 +993,33 @@ with tab_ndvi:
         plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
         st.pyplot(fig, clear_figure=True)
         plt.close(fig)
+
+        saved_meta = st.session_state.get("supabase_saved_run")
+        can_attach_ndvi = (
+            supabase_configured()
+            and saved_meta is not None
+            and saved_meta.get("compression_signature") == compression_signature
+        )
+        if can_attach_ndvi:
+            if st.button("Save NDVI results to Supabase", key="save_ndvi_supabase"):
+                try:
+                    save_ndvi_for_run(
+                        run_id=saved_meta["run_id"],
+                        red_band=red_name,
+                        nir_band=nir_name,
+                        rmse=float(ndvi_metrics.rmse),
+                        mae=float(ndvi_metrics.mae),
+                        correlation=float(ndvi_metrics.correlation),
+                        ssim=float(ndvi_metrics.ssim),
+                        bias=float(ndvi_metrics.bias),
+                    )
+                    st.success("NDVI metrics attached to the saved Supabase run.")
+                except Exception as exc:
+                    st.error(f"Failed to save NDVI: {exc}")
+        elif supabase_configured():
+            st.caption(
+                "Save the compression run to Supabase first, then attach NDVI metrics."
+            )
     else:
         st.info("NDVI has not been run for this compression result and band selection.")
 
@@ -857,6 +1117,43 @@ with tab_methods:
                 file_name="method_comparison.csv",
                 mime="text/csv",
             )
+
+            if supabase_configured():
+                if st.button(
+                    "Save method comparison to Supabase",
+                    key="save_comparison_supabase",
+                ):
+                    try:
+                        saved_meta = st.session_state.get("supabase_saved_run")
+                        linked_run_id = None
+                        if (
+                            saved_meta is not None
+                            and saved_meta.get("compression_signature")
+                            == compression_signature
+                        ):
+                            linked_run_id = saved_meta["run_id"]
+                        comparison_params = {
+                            "comparison_signature": comparison_signature,
+                            "wavelet": [
+                                wavelet_name,
+                                wavelet_level,
+                                wavelet_keep_fraction,
+                            ],
+                            "bandwidth_keep_fraction": bandwidth_keep_fraction,
+                            "jpeg2000_rate": jpeg2000_rate,
+                            "svd_channels": signature_payload["svd_channels"],
+                        }
+                        saved_comparison = save_method_comparison(
+                            results=comparison_df.to_dict(orient="records"),
+                            params=comparison_params,
+                            run_id=linked_run_id,
+                        )
+                        st.success(
+                            "Comparison saved. Token: "
+                            f"`{saved_comparison['share_token']}`"
+                        )
+                    except Exception as exc:
+                        st.error(f"Failed to save comparison: {exc}")
         elif compare_all_methods:
             st.warning(
                 "No comparison has been run yet for the current image/settings. "
