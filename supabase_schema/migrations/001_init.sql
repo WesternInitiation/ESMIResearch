@@ -72,9 +72,13 @@ create index if not exists method_comparisons_created_at_idx
 
 -- Notes for operators:
 -- 1. Create private Storage bucket: esmi-images
--- 2. Put Streamlit secrets:
+-- 2. Prefer Vercel (web/) env vars:
+--    NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+--    SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
+--    NEXT_PUBLIC_SUPABASE_BUCKET=esmi-images
+-- 3. Optional Streamlit local secrets:
 --    [supabase]
 --    url = "https://YOUR_PROJECT.supabase.co"
 --    service_role_key = "YOUR_SERVICE_ROLE_KEY"
 --    bucket = "esmi-images"
--- 3. Sharing is via share_token query param handled by the Streamlit app.
+-- 4. Sharing is via ?run=<share_token> on the Vercel (or Streamlit) app.
