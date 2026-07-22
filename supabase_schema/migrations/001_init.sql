@@ -72,7 +72,7 @@ create index if not exists method_comparisons_created_at_idx
 
 -- Notes for operators:
 -- 1. Create private Storage bucket: esmi-images
--- 2. Prefer Vercel (web/) env vars:
+-- 2. Prefer Vercel (repo root Next.js) env vars:
 --    NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 --    SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
 --    NEXT_PUBLIC_SUPABASE_BUCKET=esmi-images

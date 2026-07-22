@@ -1,7 +1,7 @@
 """
 ESMI Research — satellite image compression benchmarking workbench.
 
-Run: streamlit run app.py
+Run: streamlit run streamlit_app.py
 """
 
 from __future__ import annotations
