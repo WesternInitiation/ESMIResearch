@@ -22,6 +22,7 @@ The Streamlit prototype (`streamlit_app.py`) remains for local research notebook
 | `NEXT_PUBLIC_SUPABASE_BUCKET` | `esmi-images` (optional; default) |
 | `COMPRESS_API_URL` | your Cloud Run URL (optional; enables **Cloud Run** engine) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | full JSON key for a SA with Cloud Run Invoker (required if the service is private) |
+| `GCS_UPLOAD_BUCKET` | GCS bucket for large Cloud Run uploads (80–100+ MB) |
 
 5. Deploy. Open the assigned `*.vercel.app` URL.
 
@@ -41,11 +42,12 @@ within Google’s free allowance.
 
 1. Follow [`cloud_run/README.md`](cloud_run/README.md) (or run `./cloud_run/deploy.sh YOUR_PROJECT_ID`).
 2. If your org blocks public (`allUsers`) access, use the **private + service account**
-   path in that README: set `COMPRESS_API_URL` and `GOOGLE_SERVICE_ACCOUNT_JSON` on Vercel.
+   path in that README: set `COMPRESS_API_URL`, `GOOGLE_SERVICE_ACCOUNT_JSON`, and
+   `GCS_UPLOAD_BUCKET` on Vercel (run `./cloud_run/setup_gcs.sh` once).
 3. In the lab UI, set **Engine → Cloud Run** and click **Run on Cloud Run**.
 
-Cloud Run traffic goes through the Next.js `/api/compress` proxy (Vercel ~4.5&nbsp;MB
-body limit). Use the **Browser** engine for large TAR/GeoTIFF files.
+Small jobs go through `/api/compress`. Larger files (80–100+&nbsp;MB) upload to GCS with a
+signed URL, then Cloud Run downloads `gcs_uri`. Method / NDVI compare stay in the browser.
 
 ## Supabase setup
 

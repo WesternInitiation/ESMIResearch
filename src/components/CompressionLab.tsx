@@ -21,7 +21,7 @@ import {
   rgbaToPngDataUrl,
 } from '@/lib/preview'
 import { downsampleBands } from '@/lib/resize'
-import { fetchCloudRunStatus, runServerCompression } from '@/lib/serverCompress'
+import { fetchCloudRunStatus, runServerCompression, VERCEL_PROXY_UPLOAD_BYTES } from '@/lib/serverCompress'
 import { MAX_INGEST_BYTES, extractArchiveMember } from '@/lib/archive'
 import {
   bandsToPngBlob,
@@ -135,6 +135,7 @@ export default function CompressionLab() {
   const [engine, setEngine] = useState<Engine>('browser')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
+  const [gcsUploads, setGcsUploads] = useState(false)
   const [serverOriginalPreview, setServerOriginalPreview] = useState<string | null>(null)
   const [compressedArtifactPreview, setCompressedArtifactPreview] = useState<string | null>(
     null,
@@ -253,9 +254,11 @@ export default function CompressionLab() {
         const status = await fetchCloudRunStatus()
         setCloudRunConfigured(status.urlConfigured)
         setCloudRunOk(status.configured)
+        setGcsUploads(status.gcsUploads)
       } catch {
         setCloudRunConfigured(false)
         setCloudRunOk(false)
+        setGcsUploads(false)
       }
     })()
   }, [])
@@ -747,11 +750,12 @@ export default function CompressionLab() {
           usedMember = memberPath
         }
 
-        // Path B goes through Vercel (~4.5 MB). Direct Cloud Run HTTP/1 is ~32 MB.
-        const uploadLimit = 4.5 * 1024 * 1024
-        if (uploadFile.size > uploadLimit) {
+        // Small files go through Vercel multipart; larger ones use GCS signed PUT.
+        if (uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES && !gcsUploads) {
           setError(
-            `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB — Cloud Run via Vercel is limited to ~4.5 MB. Switch Engine → Browser for larger files (up to ~2 GiB).`,
+            `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB. ` +
+              `Set GCS_UPLOAD_BUCKET on Vercel (see cloud_run/README.md) for 80–100+ MB Cloud Run jobs, ` +
+              `or switch Engine → Browser.`,
           )
           setBusy(false)
           return
@@ -759,8 +763,8 @@ export default function CompressionLab() {
 
         setStatus(
           usedMember
-            ? `Sending ${uploadName} to Cloud Run (cold start may take ~15s)…`
-            : 'Sending job to Cloud Run (cold start may take ~15s)…',
+            ? `Preparing ${uploadName} for Cloud Run…`
+            : 'Preparing Cloud Run job…',
         )
         const out = await runServerCompression({
           file: uploadFile,
@@ -776,6 +780,8 @@ export default function CompressionLab() {
           jpegRate: params.jpegRate,
           redBand,
           nirBand,
+          gcsUploads,
+          onProgress: (message) => setStatus(message),
         })
         setServerOriginalPreview(
           `data:image/png;base64,${out.originalPreviewPngBase64}`,
@@ -1169,9 +1175,10 @@ export default function CompressionLab() {
           )}
           {cloudRunConfigured && cloudRunOk && (
             <p className="hint">
-              Cloud Run uploads one selected image (TAR members extracted in-browser). Method
-              compare + NDVI/NDWI compare always run locally; multi-band TAR pairs auto-use the
-              browser. Via Vercel the upload cap is ~4.5&nbsp;MB.
+              Large Cloud Run jobs (80–100+&nbsp;MB) upload via GCS when{' '}
+              <code>GCS_UPLOAD_BUCKET</code> is set. Method / NDVI compare stay local; multi-band
+              TAR pairs auto-use the browser.
+              {gcsUploads ? ' GCS uploads: ready.' : ' GCS uploads: not configured yet.'}
             </p>
           )}
 

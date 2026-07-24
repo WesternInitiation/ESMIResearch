@@ -58,16 +58,26 @@ app.add_middleware(
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
 # Cloud Run HTTP request bodies are capped by the platform at ~32 MiB.
-# Larger jobs should use the Browser engine (or a future object-storage URL flow).
+# Larger jobs should use gcs_uri (browser → GCS signed PUT → Cloud Run download).
 CLOUD_RUN_HTTP_MAX_BYTES = int(
     os.environ.get("CLOUD_RUN_HTTP_MAX_BYTES", str(30 * 1024 * 1024))
 )
 DEFAULT_MAX_DIM = int(os.environ.get("DEFAULT_MAX_DIM", "1024"))
+DELETE_GCS_AFTER_JOB = os.environ.get("DELETE_GCS_AFTER_JOB", "1").strip() not in (
+    "0",
+    "false",
+    "False",
+    "no",
+)
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "esmi-compress"}
+def health() -> dict[str, str | bool]:
+    return {
+        "status": "ok",
+        "service": "esmi-compress",
+        "gcs": True,
+    }
 
 
 def _png_b64(rgb: np.ndarray) -> str:
@@ -112,6 +122,41 @@ def _load_from_upload(
         return loaded.bands, loaded.band_order, archive_member
     loaded = load_image(BytesIO(raw), filename)
     return loaded.bands, loaded.band_order, filename
+
+
+def _parse_gcs_uri(uri: str) -> tuple[str, str]:
+    if not uri.startswith("gs://"):
+        raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
+    rest = uri[5:]
+    bucket_name, sep, object_name = rest.partition("/")
+    if not sep or not bucket_name or not object_name:
+        raise HTTPException(status_code=400, detail="Invalid gcs_uri")
+    return bucket_name, object_name
+
+
+def _download_gcs(uri: str) -> tuple[bytes, str, Any]:
+    """Download gs:// object; returns (bytes, filename, blob_for_optional_cleanup)."""
+    from google.cloud import storage  # lazy import so local tests without GCS still import
+
+    bucket_name, object_name = _parse_gcs_uri(uri)
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(object_name)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail=f"GCS object not found: {uri}")
+    raw = blob.download_as_bytes()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload exceeds size limit (~2 GiB)")
+    filename = object_name.rsplit("/", 1)[-1] or "upload.bin"
+    return raw, filename, blob
+
+
+def _maybe_delete_gcs_blob(blob: Any) -> None:
+    if not DELETE_GCS_AFTER_JOB or blob is None:
+        return
+    try:
+        blob.delete()
+    except Exception:
+        pass
 
 
 def _run_method(
@@ -205,7 +250,9 @@ async def archive_list(file: UploadFile = File(...)) -> JSONResponse:
 
 @app.post("/v1/compress")
 async def compress(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    gcs_uri: str | None = Form(None),
+    filename: str | None = Form(None),
     method: str = Form(...),
     archive_member: str | None = Form(None),
     max_dim: int = Form(DEFAULT_MAX_DIM),
@@ -225,27 +272,48 @@ async def compress(
     ):
         raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
 
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Empty upload")
-    if len(raw) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Upload exceeds size limit (~2 GiB)")
-    if len(raw) > CLOUD_RUN_HTTP_MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                "Cloud Run direct uploads are limited to ~30 MB by the platform. "
-                "Use Engine → Browser for files up to ~2 GiB, or split the archive."
-            ),
-        )
+    gcs_blob: Any = None
+    uri = (gcs_uri or "").strip() or None
+    if uri:
+        try:
+            raw, gcs_filename, gcs_blob = _download_gcs(uri)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to download gcs_uri: {exc}",
+            ) from exc
+        source_filename = (filename or "").strip() or gcs_filename
+    else:
+        if file is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either multipart file or gcs_uri",
+            )
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Empty upload")
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Upload exceeds size limit (~2 GiB)")
+        if len(raw) > CLOUD_RUN_HTTP_MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Cloud Run direct uploads are limited to ~30 MB by the platform. "
+                    "Upload via GCS (gcs_uri) for 80–100+ MB images, or use Engine → Browser."
+                ),
+            )
+        source_filename = file.filename or filename or "upload.bin"
 
-    filename = file.filename or "upload.bin"
     member = (archive_member or "").strip() or None
     try:
-        bands, band_order, source_name = _load_from_upload(raw, filename, member)
+        bands, band_order, source_name = _load_from_upload(raw, source_filename, member)
     except ValueError as exc:
+        _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
+        _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=400, detail=f"Failed to load image: {exc}") from exc
 
     native = next(iter(bands.values())).shape
@@ -265,6 +333,7 @@ async def compress(
             jpeg_rate=jpeg_rate,
         )
     except Exception as exc:
+        _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
 
     original_preview = to_display_rgb(bands, band_order)
@@ -319,9 +388,13 @@ async def compress(
             }
             for report in result.channel_reports
         ],
-        "metadata": result.metadata,
+        "metadata": {
+            **result.metadata,
+            **({"gcsUri": uri} if uri else {}),
+        },
         "ndvi": ndvi_payload,
         "originalPreviewPngBase64": _png_b64(original_preview),
         "previewPngBase64": _png_b64(reconstructed_preview),
     }
+    _maybe_delete_gcs_blob(gcs_blob)
     return JSONResponse(payload)

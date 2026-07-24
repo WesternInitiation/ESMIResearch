@@ -184,16 +184,34 @@ gcloud iam service-accounts keys create esmi-vercel-key.json \
 |------|--------|----------------|
 | `COMPRESS_API_URL` | `https://esmi-compress-xxxxx-uc.a.run.app` | Production, Preview, Development |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | **entire contents** of `esmi-vercel-key.json` (one line / pasted JSON) | Production, Preview, Development |
+| `GCS_UPLOAD_BUCKET` | e.g. `esmi-research-esmi-uploads` | Production, Preview, Development |
 
 Remove `NEXT_PUBLIC_COMPRESS_API_URL` if you added it earlier (not needed for Path B).
 
-5. **Redeploy** (**Deployments → ⋯ → Redeploy**).
+5. **Create the GCS bucket + IAM** (one-time, for 80–100+ MB jobs):
 
-6. Delete the local key file when done (`del esmi-vercel-key.json` on Windows) and
+```bash
+# From repo root (Git Bash / Cloud Shell)
+./cloud_run/setup_gcs.sh esmi-research
+```
+
+Then **rebuild/redeploy Cloud Run** so it can download from the bucket:
+
+```bash
+gcloud builds submit --config cloudbuild.yaml --substitutions=COMMIT_SHA=manual
+gcloud run deploy esmi-compress --image gcr.io/esmi-research/esmi-compress:latest --region us-central1 --memory 4Gi --cpu 1 --timeout 600 --max-instances 3 --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,GCS_UPLOAD_BUCKET=esmi-research-esmi-uploads"
+```
+
+(Or `./cloud_run/deploy.sh esmi-research` after `git pull`.)
+
+6. **Redeploy** Vercel (**Deployments → ⋯ → Redeploy**).
+
+7. Delete the local key file when done (`del esmi-vercel-key.json` on Windows) and
    never commit it to git.
 
-**Upload size:** Path B is limited by Vercel’s serverless body size (~4.5&nbsp;MB).
-Use **Engine → Browser** for large archives.
+**Upload size:** files under ~4&nbsp;MB go through Vercel multipart. Larger files
+(80–100+&nbsp;MB) use a **signed GCS PUT** from the browser, then Cloud Run reads
+`gcs_uri`. Without `GCS_UPLOAD_BUCKET`, use **Engine → Browser** for large files.
 
 ---
 
@@ -204,7 +222,8 @@ Use **Engine → Browser** for large archives.
    If it says **unset**, `COMPRESS_API_URL` wasn’t set or you didn’t redeploy.  
    If it says **offline**, the URL is wrong, the SA lacks Invoker, or
    `GOOGLE_SERVICE_ACCOUNT_JSON` is missing/invalid.
-3. Upload a **small** image (under ~4&nbsp;MB for Cloud Run via Vercel).
+3. Upload an image (TAR members are extracted in-browser first).  
+   Files over ~4&nbsp;MB use GCS when `GCS_UPLOAD_BUCKET` is configured.
 4. Set **Engine → Cloud Run**.
 5. Optionally raise **Max processing size** (512–2048px).
 6. Click **Run on Cloud Run**.

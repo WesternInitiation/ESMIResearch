@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { cloudRunAuthHeaders } from '@/lib/cloudRunAuth'
+import { gcsUploadsConfigured } from '@/lib/gcs'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -13,7 +14,11 @@ function apiBase(): string | null {
 export async function GET() {
   const base = apiBase()
   if (!base) {
-    return NextResponse.json({ configured: false, urlConfigured: false })
+    return NextResponse.json({
+      configured: false,
+      urlConfigured: false,
+      gcsUploads: gcsUploadsConfigured(),
+    })
   }
   try {
     const headers = await cloudRunAuthHeaders(base)
@@ -25,6 +30,7 @@ export async function GET() {
       health: body,
       urlConfigured: true,
       authConfigured: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim()),
+      gcsUploads: gcsUploadsConfigured(),
       upstreamStatus: res.status,
     })
   } catch (err) {
@@ -33,6 +39,7 @@ export async function GET() {
       configured: false,
       urlConfigured: true,
       authConfigured: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim()),
+      gcsUploads: gcsUploadsConfigured(),
       error: message,
     })
   }

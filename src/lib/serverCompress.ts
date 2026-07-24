@@ -32,25 +32,70 @@ export type ServerCompressResponse = {
   previewPngBase64: string
 }
 
+/** Soft limit for multipart bodies through the Vercel /api/compress proxy. */
+export const VERCEL_PROXY_UPLOAD_BYTES = Math.floor(4 * 1024 * 1024)
+
 /**
- * Cloud Run is reached only via the Next.js /api/compress proxy so private
- * services (org policy blocking allUsers) can authenticate with a service account.
- * Note: Vercel serverless request bodies are capped (~4.5MB on hobby).
+ * Cloud Run is reached via the Next.js /api/compress proxy (private SA auth).
+ * Large files (>~4MB) upload directly to GCS with a signed URL, then Cloud Run
+ * reads `gcs_uri` — bypassing Vercel and Cloud Run HTTP body caps.
  */
 export async function fetchCloudRunStatus(): Promise<{
   configured: boolean
   urlConfigured: boolean
+  gcsUploads: boolean
 }> {
   const res = await fetch('/api/compress', { cache: 'no-store' })
-  if (!res.ok) return { configured: false, urlConfigured: false }
+  if (!res.ok) return { configured: false, urlConfigured: false, gcsUploads: false }
   const data = (await res.json()) as {
     configured?: boolean
     urlConfigured?: boolean
+    gcsUploads?: boolean
   }
   return {
     configured: Boolean(data.configured),
     urlConfigured: Boolean(data.urlConfigured),
+    gcsUploads: Boolean(data.gcsUploads),
   }
+}
+
+async function uploadToGcs(
+  file: Blob,
+  filename: string,
+  onProgress?: (message: string) => void,
+): Promise<string> {
+  onProgress?.(`Requesting GCS upload URL for ${filename}…`)
+  const signRes = await fetch('/api/uploads/sign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename,
+      contentType: file.type || 'application/octet-stream',
+      size: file.size,
+    }),
+  })
+  const signed = await signRes.json()
+  if (!signRes.ok) {
+    throw new Error(signed.error || 'Failed to sign GCS upload URL')
+  }
+
+  onProgress?.(
+    `Uploading ${(file.size / (1024 * 1024)).toFixed(1)} MB to Cloud Storage…`,
+  )
+  const put = await fetch(signed.uploadUrl as string, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': (file.type || 'application/octet-stream') as string,
+    },
+    body: file,
+  })
+  if (!put.ok) {
+    const text = await put.text().catch(() => '')
+    throw new Error(
+      `GCS upload failed (${put.status})${text ? `: ${text.slice(0, 200)}` : ''}`,
+    )
+  }
+  return signed.gcsUri as string
 }
 
 export async function runServerCompression(input: {
@@ -66,9 +111,10 @@ export async function runServerCompression(input: {
   jpegRate: number
   redBand?: string
   nirBand?: string
+  gcsUploads?: boolean
+  onProgress?: (message: string) => void
 }): Promise<ServerCompressResponse> {
   const form = new FormData()
-  form.set('file', input.file, input.filename)
   form.set('method', input.method)
   form.set('max_dim', String(input.maxDim))
   form.set('svd_rank', String(input.svdRank))
@@ -79,6 +125,20 @@ export async function runServerCompression(input: {
   if (input.archiveMember) form.set('archive_member', input.archiveMember)
   if (input.redBand) form.set('red_band', input.redBand)
   if (input.nirBand) form.set('nir_band', input.nirBand)
+
+  const useGcs = Boolean(input.gcsUploads) && input.file.size > VERCEL_PROXY_UPLOAD_BYTES
+  if (useGcs) {
+    const gcsUri = await uploadToGcs(input.file, input.filename, input.onProgress)
+    form.set('gcs_uri', gcsUri)
+    form.set('filename', input.filename)
+    input.onProgress?.('Starting Cloud Run job from Cloud Storage…')
+  } else if (input.file.size > VERCEL_PROXY_UPLOAD_BYTES) {
+    throw new Error(
+      `File is ${(input.file.size / (1024 * 1024)).toFixed(1)} MB. Set GCS_UPLOAD_BUCKET on Vercel (see cloud_run/README.md) to send large jobs to Cloud Run, or use Engine → Browser.`,
+    )
+  } else {
+    form.set('file', input.file, input.filename)
+  }
 
   const res = await fetch('/api/compress', { method: 'POST', body: form })
   const data = await res.json()

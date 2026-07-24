@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.21.0",
     "@supabase/supabase-js": "^2.110.8",
     "fflate": "^0.8.3",
     "fft.js": "^4.0.4",
