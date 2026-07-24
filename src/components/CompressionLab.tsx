@@ -1370,7 +1370,7 @@ export default function CompressionLab() {
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={originalPreview} alt="Original preview" />
                 ) : (
-                  <div className="empty">Upload an image or TAR archive to begin</div>
+                  <div className="empty">Waiting for upload</div>
                 )}
               </figure>
               <figure>
@@ -1379,7 +1379,7 @@ export default function CompressionLab() {
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
                 ) : (
-                  <div className="empty">Run compression to see the encoded artifact</div>
+                  <div className="empty">Waiting for compression</div>
                 )}
               </figure>
               <figure>
@@ -1402,40 +1402,42 @@ export default function CompressionLab() {
                     </button>
                   </>
                 ) : (
-                  <div className="empty">Run compression to decompress and preview</div>
+                  <div className="empty">Waiting for decompression</div>
                 )}
               </figure>
             </div>
-            {residualPreview && (
-              <div className="residual-block">
-                <figcaption>Compression residual (|original − decompressed|)</figcaption>
-                {/* eslint-disable-next-line @next/next/no-img-element */}
+            <div className="residual-block">
+              <figcaption>Compression residual (|original − decompressed|)</figcaption>
+              {residualPreview ? (
+                // eslint-disable-next-line @next/next/no-img-element
                 <img src={residualPreview} alt="Compression residual map" />
-              </div>
-            )}
+              ) : (
+                <div className="empty">Waiting for residual map</div>
+              )}
+            </div>
           </section>
 
-          {result && (
-            <section className="panel">
-              <h2>Band metrics</h2>
-              <p className="hint">
-                Runtime {result.runtimeSeconds.toFixed(2)}s · Estimate{' '}
-                {bytesLabel(result.compressedBytesEstimate)} · Ratio{' '}
-                {fmt(result.compressionRatio, 3)}
-              </p>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Band</th>
-                      <th>RMSE</th>
-                      <th>MAE</th>
-                      <th>PSNR (dB)</th>
-                      <th>SSIM</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.channelReports.map((r) => (
+          <section className="panel">
+            <h2>Band metrics</h2>
+            <p className={`hint ${result ? '' : 'placeholder'}`}>
+              {result
+                ? `Runtime ${result.runtimeSeconds.toFixed(2)}s · Estimate ${bytesLabel(result.compressedBytesEstimate)} · Ratio ${fmt(result.compressionRatio, 3)}`
+                : 'Runtime — · Estimate — · Ratio —'}
+            </p>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Band</th>
+                    <th>RMSE</th>
+                    <th>MAE</th>
+                    <th>PSNR (dB)</th>
+                    <th>SSIM</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result && result.channelReports.length > 0 ? (
+                    result.channelReports.map((r) => (
                       <tr key={r.band}>
                         <td>{r.band}</td>
                         <td>{fmt(r.rmse)}</td>
@@ -1443,130 +1445,162 @@ export default function CompressionLab() {
                         <td>{fmt(r.psnrDb, 3)}</td>
                         <td>{fmt(r.ssim, 3)}</td>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          )}
-
-          {image && result && (
-            <section className="panel">
-              <h2>NDVI/NDWI preservation</h2>
-              <div className="ndvi-row">
-                <label>
-                  Index
-                  <select
-                    value={indexKind}
-                    onChange={(e) => setIndexKind(e.target.value as 'ndvi' | 'ndwi')}
-                  >
-                    <option value="ndvi">NDVI</option>
-                    <option value="ndwi">
-                      {ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'}
-                    </option>
-                  </select>
-                </label>
-                {indexKind === 'ndvi' ? (
-                  <>
-                    <label>
-                      Red band
-                      <select value={redBand} onChange={(e) => setRedBand(e.target.value)}>
-                        {image.bandOrder.map((b) => (
-                          <option key={b} value={b}>
-                            {b}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      NIR band
-                      <select value={nirBand} onChange={(e) => setNirBand(e.target.value)}>
-                        {image.bandOrder.map((b) => (
-                          <option key={b} value={b}>
-                            {b}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </>
-                ) : (
-                  <>
-                    <label>
-                      Green band
-                      <select
-                        value={greenBand}
-                        onChange={(e) => setGreenBand(e.target.value)}
-                      >
-                        {image.bandOrder.map((b) => (
-                          <option key={b} value={b}>
-                            {b}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      {ndwiSecondBand === 'swir' ? 'SWIR band' : 'NIR band'}
-                      <select
-                        value={ndwiSecondBand}
-                        onChange={(e) => setNdwiSecondBand(e.target.value)}
-                      >
-                        {image.bandOrder.map((b) => (
-                          <option key={b} value={b}>
-                            {b}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  </>
-                )}
-                <button type="button" className="secondary" onClick={onIndexCompare}>
-                  Compare {indexKind === 'ndvi' ? 'NDVI' : ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'}
-                </button>
-              </div>
-              {indexMetrics && (
-                <div className="metric-grid">
-                  <div>
-                    <span>RMSE</span>
-                    <strong>{fmt(indexMetrics.rmse)}</strong>
-                  </div>
-                  <div>
-                    <span>MAE</span>
-                    <strong>{fmt(indexMetrics.mae)}</strong>
-                  </div>
-                  <div>
-                    <span>Corr</span>
-                    <strong>{fmt(indexMetrics.correlation, 3)}</strong>
-                  </div>
-                  <div>
-                    <span>SSIM</span>
-                    <strong>{fmt(indexMetrics.ssim, 3)}</strong>
-                  </div>
-                  <div>
-                    <span>Bias</span>
-                    <strong>{fmt(indexMetrics.bias)}</strong>
-                  </div>
-                </div>
-              )}
-            </section>
-          )}
-
-          {compareRows && (
-            <section className="panel">
-              <h2>Method comparison</h2>
-              <div className="table-wrap">
-                <table>
-                  <thead>
+                    ))
+                  ) : (
                     <tr>
-                      <th>Method</th>
-                      <th>Runtime (s)</th>
-                      <th>Ratio</th>
-                      <th>Mean RMSE</th>
-                      <th>Mean PSNR</th>
-                      <th>Mean SSIM</th>
+                      <td colSpan={5} className="hint placeholder">
+                        Waiting for compression results
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {compareRows.map((r) => (
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="panel">
+            <h2>NDVI/NDWI preservation</h2>
+            <div className="ndvi-row">
+              <label>
+                Index
+                <select
+                  value={indexKind}
+                  onChange={(e) => setIndexKind(e.target.value as 'ndvi' | 'ndwi')}
+                >
+                  <option value="ndvi">NDVI</option>
+                  <option value="ndwi">
+                    {ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'}
+                  </option>
+                </select>
+              </label>
+              {indexKind === 'ndvi' ? (
+                <>
+                  <label>
+                    Red band
+                    <select
+                      value={redBand}
+                      disabled={!image}
+                      onChange={(e) => setRedBand(e.target.value)}
+                    >
+                      {(image?.bandOrder?.length ? image.bandOrder : ['—']).map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    NIR band
+                    <select
+                      value={nirBand}
+                      disabled={!image}
+                      onChange={(e) => setNirBand(e.target.value)}
+                    >
+                      {(image?.bandOrder?.length ? image.bandOrder : ['—']).map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </>
+              ) : (
+                <>
+                  <label>
+                    Green band
+                    <select
+                      value={greenBand}
+                      disabled={!image}
+                      onChange={(e) => setGreenBand(e.target.value)}
+                    >
+                      {(image?.bandOrder?.length ? image.bandOrder : ['—']).map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    {ndwiSecondBand === 'swir' ? 'SWIR band' : 'NIR band'}
+                    <select
+                      value={ndwiSecondBand}
+                      disabled={!image}
+                      onChange={(e) => setNdwiSecondBand(e.target.value)}
+                    >
+                      {(image?.bandOrder?.length ? image.bandOrder : ['—']).map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </>
+              )}
+              <button
+                type="button"
+                className="secondary"
+                disabled={!image || !result || busy}
+                onClick={onIndexCompare}
+              >
+                Compare{' '}
+                {indexKind === 'ndvi'
+                  ? 'NDVI'
+                  : ndwiSecondBand === 'swir'
+                    ? 'MNDWI'
+                    : 'NDWI'}
+              </button>
+            </div>
+            <div className="metric-grid">
+              <div>
+                <span>RMSE</span>
+                <strong className={indexMetrics ? undefined : 'placeholder'}>
+                  {indexMetrics ? fmt(indexMetrics.rmse) : '—'}
+                </strong>
+              </div>
+              <div>
+                <span>MAE</span>
+                <strong className={indexMetrics ? undefined : 'placeholder'}>
+                  {indexMetrics ? fmt(indexMetrics.mae) : '—'}
+                </strong>
+              </div>
+              <div>
+                <span>Corr</span>
+                <strong className={indexMetrics ? undefined : 'placeholder'}>
+                  {indexMetrics ? fmt(indexMetrics.correlation, 3) : '—'}
+                </strong>
+              </div>
+              <div>
+                <span>SSIM</span>
+                <strong className={indexMetrics ? undefined : 'placeholder'}>
+                  {indexMetrics ? fmt(indexMetrics.ssim, 3) : '—'}
+                </strong>
+              </div>
+              <div>
+                <span>Bias</span>
+                <strong className={indexMetrics ? undefined : 'placeholder'}>
+                  {indexMetrics ? fmt(indexMetrics.bias) : '—'}
+                </strong>
+              </div>
+            </div>
+          </section>
+
+          <section className="panel">
+            <h2>Method comparison</h2>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Method</th>
+                    <th>Runtime (s)</th>
+                    <th>Ratio</th>
+                    <th>Mean RMSE</th>
+                    <th>Mean PSNR</th>
+                    <th>Mean SSIM</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {compareRows && compareRows.length > 0 ? (
+                    compareRows.map((r) => (
                       <tr key={r.method}>
                         <td>{r.method}</td>
                         <td>{r.runtimeSeconds.toFixed(2)}</td>
@@ -1575,16 +1609,22 @@ export default function CompressionLab() {
                         <td>{fmt(r.meanPsnr, 3)}</td>
                         <td>{fmt(r.meanSsim, 3)}</td>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          )}
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={6} className="hint placeholder">
+                        Waiting for compare-all results
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
 
-          {supabaseOk && recentRuns.length > 0 && (
-            <section className="panel">
-              <h2>Recent shared runs</h2>
+          <section className="panel">
+            <h2>Recent shared runs</h2>
+            {supabaseOk && recentRuns.length > 0 ? (
               <ul className="run-list">
                 {recentRuns.map((r) => (
                   <li key={r.id}>
@@ -1595,8 +1635,14 @@ export default function CompressionLab() {
                   </li>
                 ))}
               </ul>
-            </section>
-          )}
+            ) : (
+              <p className="hint placeholder">
+                {supabaseOk
+                  ? 'No shared runs yet'
+                  : 'Waiting for Supabase connection / shared runs'}
+              </p>
+            )}
+          </section>
         </main>
       </div>
     </div>

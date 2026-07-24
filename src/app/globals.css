@@ -107,9 +107,16 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(260px, 320px) 1fr;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
   gap: 1rem;
   align-items: start;
+}
+
+.controls {
+  position: sticky;
+  top: 1rem;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
 }
 
 .panel {
@@ -333,10 +340,15 @@ th {
   text-transform: uppercase;
 }
 
-.metric-grid strong {
-  font-family: var(--font-display), Fraunces, serif;
-  font-size: 1.2rem;
-  font-weight: 550;
+.metric-grid strong.placeholder,
+.hint.placeholder {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.metric-grid strong.placeholder {
+  font-family: var(--font-body), 'Source Sans 3', sans-serif;
+  font-size: 1rem;
 }
 
 .run-list {
