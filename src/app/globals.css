@@ -340,6 +340,12 @@ th {
   text-transform: uppercase;
 }
 
+.metric-grid strong {
+  font-family: var(--font-display), Fraunces, serif;
+  font-size: 1.2rem;
+  font-weight: 550;
+}
+
 .metric-grid strong.placeholder,
 .hint.placeholder {
   color: var(--muted);
