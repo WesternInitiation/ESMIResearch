@@ -1174,7 +1174,7 @@ export default function CompressionLab() {
 
           {image && result && (
             <section className="panel">
-              <h2>NDVI preservation</h2>
+              <h2>NDVI/NDWI preservation</h2>
               <div className="ndvi-row">
                 <label>
                   Red band
