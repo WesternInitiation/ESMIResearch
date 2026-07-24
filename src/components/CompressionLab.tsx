@@ -112,6 +112,11 @@ function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
   }
 }
 
+/** Multi-member TAR pairs (Red+NIR etc.) must stay in the browser. */
+function isMultiMemberStack(img: LoadedImage | null | undefined): boolean {
+  return Boolean(img?.archiveMember?.includes(' + '))
+}
+
 export default function CompressionLab() {
   const [image, setImage] = useState<WorkingImage | null>(null)
   const [rawFile, setRawFile] = useState<File | null>(null)
@@ -703,6 +708,12 @@ export default function CompressionLab() {
     setBusy(true)
 
     if (engine === 'cloud-run') {
+      // Full NDVI/NDWI stacks from several TAR members — compress locally only.
+      if (isMultiMemberStack(image)) {
+        setStatus(
+          'Multi-band TAR stack detected — running locally so NDVI/NDWI comparison uses the full pair…',
+        )
+      } else {
       try {
         // Prefer the selected TAR member only — never upload the whole archive.
         let uploadFile: Blob = rawFile
@@ -781,6 +792,7 @@ export default function CompressionLab() {
           setCompressedArtifactPreview(decompressed)
         }
         setResidualPreview(null)
+        setIndexMetrics(null)
         setResult({
           method: out.method,
           bands: {},
@@ -798,17 +810,8 @@ export default function CompressionLab() {
             ...(usedMember ? { archiveMemberUploaded: usedMember } : {}),
           },
         })
-        if (out.ndvi) {
-          setIndexMetrics({
-            rmse: out.ndvi.rmse,
-            mae: out.ndvi.mae,
-            correlation: out.ndvi.correlation,
-            ssim: out.ndvi.ssim,
-            bias: out.ndvi.bias,
-          })
-        }
         setStatus(
-          `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · ${out.width}×${out.height} (native ${out.nativeWidth}×${out.nativeHeight})`,
+          `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · ${out.width}×${out.height} (native ${out.nativeWidth}×${out.nativeHeight}). NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.`,
         )
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Cloud Run compression failed')
@@ -817,6 +820,7 @@ export default function CompressionLab() {
         setBusy(false)
       }
       return
+      }
     }
 
     clearResultPreviews()
@@ -847,18 +851,14 @@ export default function CompressionLab() {
 
   async function onCompareAll() {
     if (!image) return
-    if (engine === 'cloud-run') {
-      setError('Compare-all on Cloud Run is not enabled yet — switch to Browser engine.')
-      return
-    }
     setError(null)
     setBusy(true)
     clearResultPreviews()
-    setStatus('Comparing all methods…')
+    setStatus('Comparing all methods locally…')
     try {
       const rows: CompareRow[] = []
       for (const m of COMPRESSION_METHODS) {
-        setStatus(`Comparing: ${m}…`)
+        setStatus(`Comparing locally: ${m}…`)
         const out = await runCompressionAsync({
           method: m,
           bands: image.bands,
@@ -887,7 +887,7 @@ export default function CompressionLab() {
         })
       }
       setCompareRows(rows)
-      setStatus('Comparison complete')
+      setStatus('Local comparison complete')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Comparison failed')
     } finally {
@@ -898,7 +898,10 @@ export default function CompressionLab() {
   function onIndexCompare() {
     if (!image || !result) return
     if (Object.keys(result.bands).length === 0) {
-      setStatus('Index metrics for Cloud Run results are computed on the server when bands exist.')
+      setError(
+        'NDVI/NDWI comparison runs only locally. Run compression with Engine → Browser (multi-band TAR stacks do this automatically).',
+      )
+      setStatus(null)
       return
     }
     if (indexKind === 'ndvi') {
@@ -913,7 +916,7 @@ export default function CompressionLab() {
       const ref = computeNdvi(redO, nirO)
       const cand = computeNdvi(redC, nirC)
       setIndexMetrics(compareIndexMaps(ref, cand))
-      setStatus('NDVI comparison ready')
+      setStatus('NDVI comparison ready (local)')
       return
     }
 
@@ -931,7 +934,9 @@ export default function CompressionLab() {
     const cand = computeNdwi(greenC, secondC)
     setIndexMetrics(compareIndexMaps(ref, cand))
     setStatus(
-      ndwiSecondBand === 'swir' ? 'MNDWI comparison ready' : 'NDWI comparison ready',
+      ndwiSecondBand === 'swir'
+        ? 'MNDWI comparison ready (local)'
+        : 'NDWI comparison ready (local)',
     )
   }
 
@@ -1164,8 +1169,9 @@ export default function CompressionLab() {
           )}
           {cloudRunConfigured && cloudRunOk && (
             <p className="hint">
-              Cloud Run uploads the selected image only (TAR members are extracted in-browser).
-              Via Vercel the body cap is ~4.5&nbsp;MB — use Browser for large files.
+              Cloud Run uploads one selected image (TAR members extracted in-browser). Method
+              compare + NDVI/NDWI compare always run locally; multi-band TAR pairs auto-use the
+              browser. Via Vercel the upload cap is ~4.5&nbsp;MB.
             </p>
           )}
 
@@ -1291,15 +1297,16 @@ export default function CompressionLab() {
             <button type="button" disabled={!image || !rawFile || busy} onClick={() => void onRun()}>
               {busy
                 ? 'Working…'
-                : engine === 'cloud-run'
+                : engine === 'cloud-run' && !isMultiMemberStack(image)
                   ? 'Run on Cloud Run'
                   : 'Run compression'}
             </button>
             <button
               type="button"
               className="secondary"
-              disabled={!image || busy || engine === 'cloud-run'}
+              disabled={!image || busy}
               onClick={() => void onCompareAll()}
+              title="Always runs in the browser worker"
             >
               Compare all methods
             </button>
