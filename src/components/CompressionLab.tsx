@@ -1310,6 +1310,8 @@ export default function CompressionLab() {
               <div className="pair-card">
                 <h3>NDWI</h3>
                 <div className="pair-fields ndwi">
+                  <label>
+                    Formula
                     <select
                       value={ndwiSecondRole}
                       disabled={busy || !archive}
@@ -1323,8 +1325,8 @@ export default function CompressionLab() {
                         }
                       }}
                     >
-                      <option value="nir">Green−NIR</option>
-                      <option value="swir">Green−SWIR (MNDWI)</option>
+                      <option value="nir">Green-NIR</option>
+                      <option value="swir">Green-SWIR (MNDWI)</option>
                     </select>
                   </label>
                   <label>
