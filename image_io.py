@@ -272,14 +272,21 @@ def _read_raster_tags(dataset, band_index: int = 0) -> dict[str, dict[str, str]]
 
 
 def _apply_common_band_aliases(bands: dict[str, np.ndarray], order: list[str]) -> None:
-    """Map common satellite band names to red/nir when possible."""
+    """Map common satellite band names to red/nir/green/swir when possible."""
     alias_map = {
+        "b3": "green",
+        "green": "green",
+        "g": "green",
         "b4": "red",
         "red": "red",
         "r": "red",
+        "b5": "nir",
         "b8": "nir",
         "nir": "nir",
         "near_infrared": "nir",
+        "b6": "swir",
+        "swir": "swir",
+        "swir1": "swir",
     }
     for index, name in enumerate(list(order)):
         alias = alias_map.get(name)

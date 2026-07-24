@@ -857,6 +857,9 @@ export default function CompressionLab() {
       setStatus('Index metrics for Cloud Run results are computed on the server when bands exist.')
       return
     }
+    // Landsat C2 DN→SR + fill masking (NDVI_RR style) when values look like DNs.
+    const indexOpts = { landsatC2Sr: 'auto' as const }
+
     if (indexKind === 'ndvi') {
       const redO = image.bands[redBand]
       const nirO = image.bands[nirBand]
@@ -866,8 +869,8 @@ export default function CompressionLab() {
         setError(`Need both ${redBand} and ${nirBand} in original and reconstructed bands`)
         return
       }
-      const ref = computeNdvi(redO, nirO)
-      const cand = computeNdvi(redC, nirC)
+      const ref = computeNdvi(redO, nirO, indexOpts)
+      const cand = computeNdvi(redC, nirC, indexOpts)
       setIndexMetrics(compareIndexMaps(ref, cand))
       setStatus('NDVI comparison ready')
       return
@@ -883,8 +886,8 @@ export default function CompressionLab() {
       )
       return
     }
-    const ref = computeNdwi(greenO, secondO)
-    const cand = computeNdwi(greenC, secondC)
+    const ref = computeNdwi(greenO, secondO, indexOpts)
+    const cand = computeNdwi(greenC, secondC, indexOpts)
     setIndexMetrics(compareIndexMaps(ref, cand))
     setStatus(
       ndwiSecondBand === 'swir' ? 'MNDWI comparison ready' : 'NDWI comparison ready',

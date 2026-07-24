@@ -59,7 +59,7 @@ body limit). Use the **Browser** engine for large TAR/GeoTIFF files.
 - Upload GeoTIFF, PNG, JPEG, or **TAR / TAR.GZ** archives (**up to ~2 GiB** in the browser / Streamlit)
 - Engines: **Browser** (Web Worker, large files) or **Cloud Run** (Python; direct HTTP uploads ~30 MB max due to platform limits)
 - Methods: SVD, wavelet, bandwidth, JPEG2000
-- Per-band RMSE / MAE / PSNR / SSIM + optional NDVI
+- Per-band RMSE / MAE / PSNR / SSIM + optional NDVI / NDWI (Landsat C2 aware)
 - Optional Supabase save + shared run links
 
 ## Streamlit prototype (local / research)
