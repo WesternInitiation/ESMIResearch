@@ -857,14 +857,18 @@ export default function CompressionLab() {
 
   async function onCompareAll() {
     if (!image) return
+    if (engine === 'cloud-run') {
+      setError('Compare-all on Cloud Run is not enabled yet — switch to Browser engine.')
+      return
+    }
     setError(null)
     setBusy(true)
     clearResultPreviews()
-    setStatus('Comparing all methods locally…')
+    setStatus('Comparing all methods…')
     try {
       const rows: CompareRow[] = []
       for (const m of COMPRESSION_METHODS) {
-        setStatus(`Comparing locally: ${m}…`)
+        setStatus(`Comparing: ${m}…`)
         const out = await runCompressionAsync({
           method: m,
           bands: image.bands,
@@ -893,7 +897,7 @@ export default function CompressionLab() {
         })
       }
       setCompareRows(rows)
-      setStatus('Local comparison complete')
+      setStatus('Comparison complete')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Comparison failed')
     } finally {
@@ -1176,8 +1180,8 @@ export default function CompressionLab() {
           {cloudRunConfigured && cloudRunOk && (
             <p className="hint">
               Large Cloud Run jobs (80–100+&nbsp;MB) upload via GCS when{' '}
-              <code>GCS_UPLOAD_BUCKET</code> is set. Method / NDVI compare stay local; multi-band
-              TAR pairs auto-use the browser.
+              <code>GCS_UPLOAD_BUCKET</code> is set. NDVI/NDWI compare stays local; multi-band TAR
+              pairs auto-use the browser. Compare-all requires Engine → Browser.
               {gcsUploads ? ' GCS uploads: ready.' : ' GCS uploads: not configured yet.'}
             </p>
           )}
@@ -1311,9 +1315,13 @@ export default function CompressionLab() {
             <button
               type="button"
               className="secondary"
-              disabled={!image || busy}
+              disabled={!image || busy || engine === 'cloud-run'}
               onClick={() => void onCompareAll()}
-              title="Always runs in the browser worker"
+              title={
+                engine === 'cloud-run'
+                  ? 'Switch Engine → Browser to compare all methods'
+                  : undefined
+              }
             >
               Compare all methods
             </button>
@@ -1710,7 +1718,9 @@ export default function CompressionLab() {
 
           <section className="panel">
             <h2>Method comparison</h2>
-            <p className="hint">Always runs locally in the browser worker (all four methods).</p>
+            <p className="hint">
+              Requires Engine → Browser. Runs all four methods in the Web Worker.
+            </p>
             <div className="table-wrap">
               <table>
                 <thead>
