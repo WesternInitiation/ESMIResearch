@@ -221,6 +221,34 @@ button.secondary {
   gap: 0.85rem;
 }
 
+.preview-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.preview-download {
+  margin-top: 0.55rem;
+  width: 100%;
+}
+
+.residual-block {
+  margin-top: 1rem;
+}
+
+.residual-block figcaption {
+  margin-bottom: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.residual-block img {
+  width: 100%;
+  display: block;
+  background: #0c1510;
+  border: 1px solid var(--line);
+}
+
 figure {
   margin: 0;
 }
@@ -360,6 +388,7 @@ code {
 @media (max-width: 900px) {
   .layout,
   .preview-grid,
+  .preview-grid-3,
   .ndvi-row,
   .metric-grid {
     grid-template-columns: 1fr;
@@ -368,5 +397,11 @@ code {
   .lab-header {
     flex-direction: column;
     align-items: start;
+  }
+}
+
+@media (min-width: 901px) and (max-width: 1100px) {
+  .preview-grid-3 {
+    grid-template-columns: 1fr 1fr;
   }
 }

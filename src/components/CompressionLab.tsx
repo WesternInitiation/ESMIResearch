@@ -22,6 +22,14 @@ import {
   type LoadedImage,
 } from '@/lib/image'
 import { compareNdvi, computeNdvi, type NdviMetrics } from '@/lib/ndvi'
+import {
+  bandsToCompressedArtifactPreview,
+  bandsToDecompressedPreview,
+  dataUrlToJpegDataUrl,
+  downloadDataUrl,
+  residualPreviewRgba,
+  rgbaToPngDataUrl,
+} from '@/lib/preview'
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression } from '@/lib/serverCompress'
 import { MAX_INGEST_BYTES } from '@/lib/archive'
@@ -104,9 +112,11 @@ export default function CompressionLab() {
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
   const [serverOriginalPreview, setServerOriginalPreview] = useState<string | null>(null)
-  const [serverCompressedPreview, setServerCompressedPreview] = useState<string | null>(
+  const [compressedArtifactPreview, setCompressedArtifactPreview] = useState<string | null>(
     null,
   )
+  const [decompressedPreview, setDecompressedPreview] = useState<string | null>(null)
+  const [residualPreview, setResidualPreview] = useState<string | null>(null)
   const [method, setMethod] = useState<CompressionMethod>('SVD')
   const [params, setParams] = useState<MethodParams>(DEFAULT_PARAMS)
   const [result, setResult] = useState<CompressionResult | null>(null)
@@ -143,17 +153,57 @@ export default function CompressionLab() {
     )
   }, [image, serverOriginalPreview])
 
-  const compressedPreview = useMemo(() => {
-    if (serverCompressedPreview) return serverCompressedPreview
-    if (!result || Object.keys(result.bands).length === 0) return null
-    const rgba = toPreviewRgba(
-      result.bands,
-      result.bandOrder,
-      result.width,
-      result.height,
+  function jpegQualityForMethod(): number {
+    if (method === 'JPEG2000') return params.jpegRate
+    if (method === 'Wavelet transformation') {
+      return Math.min(0.92, Math.max(0.08, params.waveletKeepFraction * 4))
+    }
+    if (method === 'Bandwidth transformation') {
+      return Math.min(0.92, Math.max(0.08, params.bandwidthKeepFraction * 4))
+    }
+    // SVD: lower rank → lower JPEG quality stand-in for the compressed artifact
+    return Math.min(0.92, Math.max(0.08, params.svdRank / 64))
+  }
+
+  function clearResultPreviews() {
+    setCompressedArtifactPreview(null)
+    setDecompressedPreview(null)
+    setResidualPreview(null)
+    setServerOriginalPreview(null)
+  }
+
+  function applyBrowserResultPreviews(
+    out: CompressionResult,
+    source: WorkingImage,
+  ) {
+    const decompressed = bandsToDecompressedPreview(
+      out.bands,
+      out.bandOrder,
+      out.width,
+      out.height,
     )
-    return rgbaToDataUrl(rgba, result.width, result.height)
-  }, [result, serverCompressedPreview])
+    const compressed = bandsToCompressedArtifactPreview(
+      out.bands,
+      out.bandOrder,
+      out.width,
+      out.height,
+      jpegQualityForMethod(),
+    )
+    const residual = rgbaToPngDataUrl(
+      residualPreviewRgba(
+        source.bands,
+        out.bands,
+        out.bandOrder,
+        out.width,
+        out.height,
+      ),
+      out.width,
+      out.height,
+    )
+    setDecompressedPreview(decompressed)
+    setCompressedArtifactPreview(compressed)
+    setResidualPreview(residual)
+  }
 
   useEffect(() => {
     void (async () => {
@@ -225,8 +275,7 @@ export default function CompressionLab() {
     setResult(null)
     setNdvi(null)
     setCompareRows(null)
-    setServerOriginalPreview(null)
-    setServerCompressedPreview(null)
+    clearResultPreviews()
     setStatus('Image ready')
   }
 
@@ -307,6 +356,7 @@ export default function CompressionLab() {
         setResult(null)
         setNdvi(null)
         setCompareRows(null)
+        clearResultPreviews()
         setStatus(
           `Processing size ${working.size.width}×${working.size.height} (native ${working.nativeWidth}×${working.nativeHeight})`,
         )
@@ -317,6 +367,7 @@ export default function CompressionLab() {
         setResult(null)
         setNdvi(null)
         setCompareRows(null)
+        clearResultPreviews()
         setStatus(
           `Processing size ${working.size.width}×${working.size.height} (native ${working.nativeWidth}×${working.nativeHeight})`,
         )
@@ -324,6 +375,7 @@ export default function CompressionLab() {
         const working = toWorkingImage(image, next)
         setImage(working)
         setResult(null)
+        clearResultPreviews()
         setStatus(`Processing size ${working.size.width}×${working.size.height}`)
       }
     } catch (err) {
@@ -366,7 +418,18 @@ export default function CompressionLab() {
         setServerOriginalPreview(
           `data:image/png;base64,${out.originalPreviewPngBase64}`,
         )
-        setServerCompressedPreview(`data:image/png;base64,${out.previewPngBase64}`)
+        const decompressed = `data:image/png;base64,${out.previewPngBase64}`
+        setDecompressedPreview(decompressed)
+        try {
+          const compressed = await dataUrlToJpegDataUrl(
+            decompressed,
+            jpegQualityForMethod(),
+          )
+          setCompressedArtifactPreview(compressed)
+        } catch {
+          setCompressedArtifactPreview(decompressed)
+        }
+        setResidualPreview(null)
         setResult({
           method: out.method,
           bands: {},
@@ -401,8 +464,7 @@ export default function CompressionLab() {
       return
     }
 
-    setServerOriginalPreview(null)
-    setServerCompressedPreview(null)
+    clearResultPreviews()
     setStatus(`Running ${method} in browser worker…`)
     try {
       const out = await runCompressionAsync({
@@ -416,6 +478,7 @@ export default function CompressionLab() {
         onProgress: (message) => setStatus(message),
       })
       setResult(out)
+      applyBrowserResultPreviews(out, image)
       setStatus(
         `Done in ${out.runtimeSeconds.toFixed(2)}s · ratio ${fmt(out.compressionRatio, 3)} · ${out.width}×${out.height}`,
       )
@@ -435,8 +498,7 @@ export default function CompressionLab() {
     }
     setError(null)
     setBusy(true)
-    setServerOriginalPreview(null)
-    setServerCompressedPreview(null)
+    clearResultPreviews()
     setStatus('Comparing all methods…')
     try {
       const rows: CompareRow[] = []
@@ -505,8 +567,8 @@ export default function CompressionLab() {
     setStatus('Saving to Supabase…')
     try {
       let compressedBlob: Blob
-      if (serverCompressedPreview) {
-        const res = await fetch(serverCompressedPreview)
+      if (decompressedPreview) {
+        const res = await fetch(decompressedPreview)
         compressedBlob = await res.blob()
       } else {
         compressedBlob = await bandsToPngBlob(
@@ -856,7 +918,7 @@ export default function CompressionLab() {
         <main className="main-col">
           <section className="panel">
             <h2>Preview</h2>
-            <div className="preview-grid">
+            <div className="preview-grid preview-grid-3">
               <figure>
                 <figcaption>Original</figcaption>
                 {originalPreview ? (
@@ -867,15 +929,45 @@ export default function CompressionLab() {
                 )}
               </figure>
               <figure>
-                <figcaption>Reconstructed</figcaption>
-                {compressedPreview ? (
+                <figcaption>Compressed</figcaption>
+                {compressedArtifactPreview ? (
                   // eslint-disable-next-line @next/next/no-img-element
-                  <img src={compressedPreview} alt="Compressed preview" />
+                  <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
                 ) : (
-                  <div className="empty">Run a method to see reconstruction</div>
+                  <div className="empty">Run compression to see the encoded artifact</div>
+                )}
+              </figure>
+              <figure>
+                <figcaption>Decompressed</figcaption>
+                {decompressedPreview ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={decompressedPreview} alt="Decompressed preview" />
+                    <button
+                      type="button"
+                      className="secondary preview-download"
+                      onClick={() =>
+                        downloadDataUrl(
+                          decompressedPreview,
+                          `esmi-decompressed-${Date.now()}.png`,
+                        )
+                      }
+                    >
+                      Download decompressed PNG
+                    </button>
+                  </>
+                ) : (
+                  <div className="empty">Run compression to decompress and preview</div>
                 )}
               </figure>
             </div>
+            {residualPreview && (
+              <div className="residual-block">
+                <figcaption>Compression residual (|original − decompressed|)</figcaption>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={residualPreview} alt="Compression residual map" />
+              </div>
+            )}
           </section>
 
           {result && (
