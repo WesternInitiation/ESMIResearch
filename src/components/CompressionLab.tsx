@@ -60,6 +60,10 @@ type WorkingImage = LoadedImage & {
   processScale: number
 }
 
+function memberLabel(path: string): string {
+  return path.split('/').pop() || path
+}
+
 function fmt(n: number, digits = 4): string {
   if (!Number.isFinite(n)) return '—'
   return n.toPrecision(digits)
@@ -1059,126 +1063,20 @@ export default function CompressionLab() {
           )}
 
           {archive && (
-            <>
-              <label>
-                Single image inside archive
-                <select
-                  value={archiveMember}
-                  disabled={busy}
-                  onChange={(e) => void onArchiveMemberChange(e.target.value)}
-                >
-                  {archive.members.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <h2>NDVI band pair</h2>
-              <p className="hint">
-                For single-band Landsat/Sentinel TIFs, pick Red (e.g. B4) and NIR (e.g. B5),
-                then load the pair.
-              </p>
-              <label>
-                Red band file
-                <select
-                  value={ndviRedMember}
-                  disabled={busy}
-                  onChange={(e) => setNdviRedMember(e.target.value)}
-                >
-                  {archive.members.map((m) => (
-                    <option key={`red-${m}`} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                NIR band file
-                <select
-                  value={ndviNirMember}
-                  disabled={busy}
-                  onChange={(e) => setNdviNirMember(e.target.value)}
-                >
-                  {archive.members.map((m) => (
-                    <option key={`nir-${m}`} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy || !ndviRedMember || !ndviNirMember}
-                onClick={() => void loadArchiveNdviPair(ndviRedMember, ndviNirMember)}
+            <label>
+              Single image inside archive
+              <select
+                value={archiveMember}
+                disabled={busy}
+                onChange={(e) => void onArchiveMemberChange(e.target.value)}
               >
-                {ndviPairLoaded ? 'Reload NDVI pair' : 'Load NDVI pair (Red + NIR)'}
-              </button>
-
-              <h2>NDWI band pair</h2>
-              <p className="hint">
-                McFeeters NDWI uses Green + NIR (B3 + B5). MNDWI uses Green + SWIR (B3 + B6).
-              </p>
-              <label>
-                NDWI formula
-                <select
-                  value={ndwiSecondRole}
-                  disabled={busy}
-                  onChange={(e) => {
-                    const role = e.target.value as 'nir' | 'swir'
-                    setNdwiSecondRole(role)
-                    if (archive) {
-                      const suggested = suggestNdwiMembers(archive.members, role)
-                      if (suggested.green) setNdwiGreenMember(suggested.green)
-                      if (suggested.second) setNdwiSecondMember(suggested.second)
-                    }
-                  }}
-                >
-                  <option value="nir">NDWI (Green − NIR) / (Green + NIR)</option>
-                  <option value="swir">MNDWI (Green − SWIR) / (Green + SWIR)</option>
-                </select>
-              </label>
-              <label>
-                Green band file
-                <select
-                  value={ndwiGreenMember}
-                  disabled={busy}
-                  onChange={(e) => setNdwiGreenMember(e.target.value)}
-                >
-                  {archive.members.map((m) => (
-                    <option key={`green-${m}`} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                {ndwiSecondRole === 'swir' ? 'SWIR band file' : 'NIR band file'}
-                <select
-                  value={ndwiSecondMember}
-                  disabled={busy}
-                  onChange={(e) => setNdwiSecondMember(e.target.value)}
-                >
-                  {archive.members.map((m) => (
-                    <option key={`ndwi2-${m}`} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy || !ndwiGreenMember || !ndwiSecondMember}
-                onClick={() => void loadArchiveNdwiPair(ndwiGreenMember, ndwiSecondMember)}
-              >
-                {ndwiPairLoaded
-                  ? `Reload ${ndwiSecondRole === 'swir' ? 'MNDWI' : 'NDWI'} pair`
-                  : `Load ${ndwiSecondRole === 'swir' ? 'MNDWI' : 'NDWI'} pair`}
-              </button>
-            </>
+                {archive.members.map((m) => (
+                  <option key={m} value={m}>
+                    {memberLabel(m)}
+                  </option>
+                ))}
+              </select>
+            </label>
           )}
 
           <h2>Engine</h2>
@@ -1361,6 +1259,118 @@ export default function CompressionLab() {
         </aside>
 
         <main className="main-col">
+          <section className="panel pair-panel">
+            <h2>Index band pairs</h2>
+            <p className="hint pair-hint">
+              From a TAR, pick single-band files for NDVI (B4/B5) and NDWI (B3/B5 or B3/B6).
+            </p>
+            <div className="pair-grid">
+              <div className="pair-card">
+                <h3>NDVI</h3>
+                <div className="pair-fields">
+                  <label>
+                    Red
+                    <select
+                      value={ndviRedMember}
+                      disabled={busy || !archive}
+                      onChange={(e) => setNdviRedMember(e.target.value)}
+                    >
+                      {(archive?.members?.length ? archive.members : ['—']).map((m) => (
+                        <option key={`red-${m}`} value={m}>
+                          {memberLabel(m)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    NIR
+                    <select
+                      value={ndviNirMember}
+                      disabled={busy || !archive}
+                      onChange={(e) => setNdviNirMember(e.target.value)}
+                    >
+                      {(archive?.members?.length ? archive.members : ['—']).map((m) => (
+                        <option key={`nir-${m}`} value={m}>
+                          {memberLabel(m)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={busy || !archive || !ndviRedMember || !ndviNirMember}
+                    onClick={() => void loadArchiveNdviPair(ndviRedMember, ndviNirMember)}
+                  >
+                    {ndviPairLoaded ? 'Reload' : 'Load'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="pair-card">
+                <h3>NDWI</h3>
+                <div className="pair-fields ndwi">
+                    <select
+                      value={ndwiSecondRole}
+                      disabled={busy || !archive}
+                      onChange={(e) => {
+                        const role = e.target.value as 'nir' | 'swir'
+                        setNdwiSecondRole(role)
+                        if (archive) {
+                          const suggested = suggestNdwiMembers(archive.members, role)
+                          if (suggested.green) setNdwiGreenMember(suggested.green)
+                          if (suggested.second) setNdwiSecondMember(suggested.second)
+                        }
+                      }}
+                    >
+                      <option value="nir">Green−NIR</option>
+                      <option value="swir">Green−SWIR (MNDWI)</option>
+                    </select>
+                  </label>
+                  <label>
+                    Green
+                    <select
+                      value={ndwiGreenMember}
+                      disabled={busy || !archive}
+                      onChange={(e) => setNdwiGreenMember(e.target.value)}
+                    >
+                      {(archive?.members?.length ? archive.members : ['—']).map((m) => (
+                        <option key={`green-${m}`} value={m}>
+                          {memberLabel(m)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    {ndwiSecondRole === 'swir' ? 'SWIR' : 'NIR'}
+                    <select
+                      value={ndwiSecondMember}
+                      disabled={busy || !archive}
+                      onChange={(e) => setNdwiSecondMember(e.target.value)}
+                    >
+                      {(archive?.members?.length ? archive.members : ['—']).map((m) => (
+                        <option key={`ndwi2-${m}`} value={m}>
+                          {memberLabel(m)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={busy || !archive || !ndwiGreenMember || !ndwiSecondMember}
+                    onClick={() => void loadArchiveNdwiPair(ndwiGreenMember, ndwiSecondMember)}
+                  >
+                    {ndwiPairLoaded ? 'Reload' : 'Load'}
+                  </button>
+                </div>
+              </div>
+            </div>
+            {!archive && (
+              <p className="hint placeholder">Upload a TAR archive to enable band pairing</p>
+            )}
+          </section>
+
           <section className="panel">
             <h2>Preview</h2>
             <div className="preview-grid preview-grid-3">
