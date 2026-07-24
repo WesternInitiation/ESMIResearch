@@ -227,13 +227,7 @@ export default function CompressionLab() {
     setCompareRows(null)
     setServerOriginalPreview(null)
     setServerCompressedPreview(null)
-    const scaledNote =
-      working.processScale < 1
-        ? ` · processing at ${working.size.width}×${working.size.height}`
-        : ''
-    setStatus(
-      `Loaded ${working.filename} · native ${working.nativeWidth}×${working.nativeHeight}${scaledNote} · ${working.bandOrder.length} bands`,
-    )
+    setStatus('Image ready')
   }
 
   async function onFile(file: File | null) {
@@ -722,18 +716,6 @@ export default function CompressionLab() {
               ))}
             </select>
           </label>
-
-          {image && (
-            <p className="hint">
-              {image.filename}
-              <br />
-              Native {image.nativeWidth}×{image.nativeHeight} · process{' '}
-              {image.size.width}×{image.size.height} · {image.sourceType} ·{' '}
-              {bytesLabel(image.originalBytes)}
-              <br />
-              Bands: {image.bandOrder.join(', ')}
-            </p>
-          )}
 
           <h2>Method</h2>
           <select
