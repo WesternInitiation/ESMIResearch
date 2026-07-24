@@ -1,4 +1,4 @@
-export type NdviMetrics = {
+export type IndexMetrics = {
   rmse: number
   mae: number
   correlation: number
@@ -6,17 +6,40 @@ export type NdviMetrics = {
   bias: number
 }
 
-export function computeNdvi(red: Float64Array, nir: Float64Array): Float64Array {
-  const out = new Float64Array(red.length)
-  for (let i = 0; i < red.length; i++) {
-    const denom = nir[i] + red[i]
-    out[i] = Math.abs(denom) > 1e-8 ? (nir[i] - red[i]) / denom : Number.NaN
+/** @deprecated Use IndexMetrics — kept as alias for existing imports. */
+export type NdviMetrics = IndexMetrics
+
+function normalizedDifference(a: Float64Array, b: Float64Array): Float64Array {
+  const out = new Float64Array(a.length)
+  for (let i = 0; i < a.length; i++) {
+    const denom = a[i] + b[i]
+    out[i] = Math.abs(denom) > 1e-8 ? (a[i] - b[i]) / denom : Number.NaN
     if (!Number.isNaN(out[i])) out[i] = Math.max(-1, Math.min(1, out[i]))
   }
   return out
 }
 
-export function compareNdvi(reference: Float64Array, candidate: Float64Array): NdviMetrics {
+/** NDVI = (NIR - Red) / (NIR + Red) */
+export function computeNdvi(red: Float64Array, nir: Float64Array): Float64Array {
+  return normalizedDifference(nir, red)
+}
+
+/**
+ * NDWI variants:
+ * - mcfeeters: (Green - NIR) / (Green + NIR)
+ * - mndwi: (Green - SWIR) / (Green + SWIR)
+ */
+export function computeNdwi(
+  green: Float64Array,
+  second: Float64Array,
+): Float64Array {
+  return normalizedDifference(green, second)
+}
+
+export function compareIndexMaps(
+  reference: Float64Array,
+  candidate: Float64Array,
+): IndexMetrics {
   const ref: number[] = []
   const cand: number[] = []
   for (let i = 0; i < reference.length; i++) {
@@ -68,4 +91,12 @@ export function compareNdvi(reference: Float64Array, candidate: Float64Array): N
     ssim,
     bias: bias / ref.length,
   }
+}
+
+/** @deprecated Prefer compareIndexMaps */
+export function compareNdvi(
+  reference: Float64Array,
+  candidate: Float64Array,
+): IndexMetrics {
+  return compareIndexMaps(reference, candidate)
 }

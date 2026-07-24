@@ -308,7 +308,7 @@ th {
 
 .ndvi-row {
   display: grid;
-  grid-template-columns: 1fr 1fr auto;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 0.75rem;
   align-items: end;
 }

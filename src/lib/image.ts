@@ -123,9 +123,18 @@ export function isLikelySingleBand(loaded: LoadedImage): boolean {
   return loaded.bandOrder.length === 1
 }
 
-/** Heuristic: Landsat/Sentinel-style names → red vs nir. */
-export function guessNdviRole(filename: string): 'red' | 'nir' | null {
+/** Heuristic: Landsat/Sentinel-style names → spectral role. */
+export function guessBandRole(
+  filename: string,
+): 'red' | 'nir' | 'green' | 'swir' | null {
   const n = filename.toLowerCase()
+  if (
+    /(?:^|[_\-.])(?:sr[_-]?)?b3(?:[_\-.]|$)/.test(n) ||
+    /(?:^|[_\-.])green(?:[_\-.]|$)/.test(n) ||
+    /band[_-]?3/.test(n)
+  ) {
+    return 'green'
+  }
   if (
     /(?:^|[_\-.])(?:sr[_-]?)?b4(?:[_\-.]|$)/.test(n) ||
     /(?:^|[_\-.])red(?:[_\-.]|$)/.test(n) ||
@@ -134,14 +143,30 @@ export function guessNdviRole(filename: string): 'red' | 'nir' | null {
     return 'red'
   }
   if (
-    /(?:^|[_\-.])(?:sr[_-]?)?b5(?:[_\-.]|$)/.test(n) || // Landsat 8/9 NIR
-    /(?:^|[_\-.])(?:sr[_-]?)?b8(?:[_\-.]|$)/.test(n) || // Sentinel-2 NIR approx naming
+    /(?:^|[_\-.])(?:sr[_-]?)?b5(?:[_\-.]|$)/.test(n) ||
+    /(?:^|[_\-.])(?:sr[_-]?)?b8(?:[_\-.]|$)/.test(n) ||
     /(?:^|[_\-.])nir(?:[_\-.]|$)/.test(n) ||
     /band[_-]?5/.test(n) ||
     /band[_-]?8/.test(n)
   ) {
     return 'nir'
   }
+  if (
+    /(?:^|[_\-.])(?:sr[_-]?)?b6(?:[_\-.]|$)/.test(n) ||
+    /(?:^|[_\-.])(?:sr[_-]?)?b7(?:[_\-.]|$)/.test(n) ||
+    /(?:^|[_\-.])swir/.test(n) ||
+    /band[_-]?6/.test(n) ||
+    /band[_-]?7/.test(n)
+  ) {
+    return 'swir'
+  }
+  return null
+}
+
+/** @deprecated Use guessBandRole */
+export function guessNdviRole(filename: string): 'red' | 'nir' | null {
+  const role = guessBandRole(filename)
+  if (role === 'red' || role === 'nir') return role
   return null
 }
 
@@ -164,47 +189,136 @@ function resizeBandNearest(
   return out
 }
 
-/**
- * Build a Red+NIR working image from two sources (typically single-band GeoTIFFs).
- * NIR is resampled to the Red grid if dimensions differ.
- */
-export function pairRedNirImages(
-  redSource: LoadedImage,
-  nirSource: LoadedImage,
-): LoadedImage {
-  const redBand = firstBand(redSource)
-  let nirBand = firstBand(nirSource)
-  const width = redSource.size.width
-  const height = redSource.size.height
+export type NamedBandSource = {
+  name: string
+  image: LoadedImage
+}
 
-  if (
-    nirSource.size.width !== width ||
-    nirSource.size.height !== height
-  ) {
-    nirBand = resizeBandNearest(
-      nirBand,
-      nirSource.size.width,
-      nirSource.size.height,
-      width,
-      height,
-    )
+/**
+ * Build a multi-band working image from named single-band sources.
+ * Later bands are resampled to the first source's grid if needed.
+ */
+export function pairNamedBandImages(
+  sources: NamedBandSource[],
+  label: string,
+): LoadedImage {
+  if (sources.length < 2) {
+    throw new Error('Need at least two band files to pair')
+  }
+  const anchor = sources[0]
+  const width = anchor.image.size.width
+  const height = anchor.image.size.height
+  const bands: BandMap = {}
+  let originalBytes = 0
+  const members: string[] = []
+
+  for (const src of sources) {
+    let band = firstBand(src.image)
+    if (src.image.size.width !== width || src.image.size.height !== height) {
+      band = resizeBandNearest(
+        band,
+        src.image.size.width,
+        src.image.size.height,
+        width,
+        height,
+      )
+    } else {
+      band = new Float64Array(band)
+    }
+    bands[src.name] = band
+    originalBytes += src.image.originalBytes
+    if (src.image.archiveMember) members.push(src.image.archiveMember)
   }
 
-  const bands: BandMap = { red: new Float64Array(redBand), nir: nirBand }
-  const bandOrder = ['red', 'nir']
-  const filename = `NDVI pair · red: ${redSource.filename} · nir: ${nirSource.filename}`
+  const bandOrder = sources.map((s) => s.name)
+  const filename = `${label} · ${sources
+    .map((s) => `${s.name}: ${s.image.filename}`)
+    .join(' · ')}`
   return {
     bands,
     bandOrder,
     size: { width, height },
     sourceType: 'geotiff',
-    originalBytes: redSource.originalBytes + nirSource.originalBytes,
+    originalBytes,
     previewRgba: toPreviewRgba(bands, bandOrder, width, height),
     filename,
-    archiveMember: redSource.archiveMember
-      ? `${redSource.archiveMember} + ${nirSource.archiveMember ?? nirSource.filename}`
-      : undefined,
+    archiveMember: members.length ? members.join(' + ') : undefined,
   }
+}
+
+/** Merge additional named bands into an existing loaded image (same grid). */
+export function mergeNamedBands(
+  base: LoadedImage,
+  additions: NamedBandSource[],
+  label: string,
+): LoadedImage {
+  const width = base.size.width
+  const height = base.size.height
+  const bands: BandMap = { ...base.bands }
+  const bandOrder = [...base.bandOrder]
+  let originalBytes = base.originalBytes
+  const members: string[] = base.archiveMember ? [base.archiveMember] : []
+
+  for (const src of additions) {
+    let band = firstBand(src.image)
+    if (src.image.size.width !== width || src.image.size.height !== height) {
+      band = resizeBandNearest(
+        band,
+        src.image.size.width,
+        src.image.size.height,
+        width,
+        height,
+      )
+    } else {
+      band = new Float64Array(band)
+    }
+    bands[src.name] = band
+    if (!bandOrder.includes(src.name)) bandOrder.push(src.name)
+    originalBytes += src.image.originalBytes
+    if (src.image.archiveMember) members.push(src.image.archiveMember)
+  }
+
+  return {
+    bands,
+    bandOrder,
+    size: { width, height },
+    sourceType: base.sourceType,
+    originalBytes,
+    previewRgba: toPreviewRgba(bands, bandOrder, width, height),
+    filename: `${label} · ${base.filename}`,
+    archiveMember: members.length ? members.join(' + ') : base.archiveMember,
+  }
+}
+
+/**
+ * Build a Red+NIR working image from two sources (typically single-band GeoTIFFs).
+ */
+export function pairRedNirImages(
+  redSource: LoadedImage,
+  nirSource: LoadedImage,
+): LoadedImage {
+  return pairNamedBandImages(
+    [
+      { name: 'red', image: redSource },
+      { name: 'nir', image: nirSource },
+    ],
+    'NDVI pair',
+  )
+}
+
+/** Green + NIR (McFeeters NDWI) or Green + SWIR (MNDWI). */
+export function pairNdwiImages(
+  greenSource: LoadedImage,
+  secondSource: LoadedImage,
+  secondName: 'nir' | 'swir',
+): LoadedImage {
+  return pairNamedBandImages(
+    [
+      { name: 'green', image: greenSource },
+      { name: secondName, image: secondSource },
+    ],
+    secondName === 'swir' ? 'MNDWI pair' : 'NDWI pair',
+  )
 }
 
 /** Suggest Red/NIR member names from a TAR member list (Landsat B4/B5 etc.). */
@@ -212,11 +326,33 @@ export function suggestNdviMembers(members: string[]): { red?: string; nir?: str
   let red: string | undefined
   let nir: string | undefined
   for (const m of members) {
-    const role = guessNdviRole(m)
+    const role = guessBandRole(m)
     if (role === 'red' && !red) red = m
     if (role === 'nir' && !nir) nir = m
   }
   return { red, nir }
+}
+
+/** Suggest Green + NIR/SWIR members for NDWI / MNDWI. */
+export function suggestNdwiMembers(
+  members: string[],
+  prefer: 'nir' | 'swir' = 'nir',
+): { green?: string; second?: string; secondRole: 'nir' | 'swir' } {
+  let green: string | undefined
+  let nir: string | undefined
+  let swir: string | undefined
+  for (const m of members) {
+    const role = guessBandRole(m)
+    if (role === 'green' && !green) green = m
+    if (role === 'nir' && !nir) nir = m
+    if (role === 'swir' && !swir) swir = m
+  }
+  if (prefer === 'swir' && swir) {
+    return { green, second: swir, secondRole: 'swir' }
+  }
+  if (nir) return { green, second: nir, secondRole: 'nir' }
+  if (swir) return { green, second: swir, secondRole: 'swir' }
+  return { green, second: undefined, secondRole: prefer }
 }
 
 export async function loadImageFile(file: File): Promise<LoadedImage> {

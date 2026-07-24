@@ -11,20 +11,7 @@ import {
 } from '@/lib/api'
 import { runCompressionAsync } from '@/lib/compressClient'
 import type { MethodParams } from '@/lib/compression'
-import {
-  bandsToPngBlob,
-  inspectUpload,
-  isLikelySingleBand,
-  loadArchiveMemberImage,
-  loadImageFile,
-  pairRedNirImages,
-  rgbaToDataUrl,
-  suggestNdviMembers,
-  toPreviewRgba,
-  type ArchiveSelection,
-  type LoadedImage,
-} from '@/lib/image'
-import { compareNdvi, computeNdvi, type NdviMetrics } from '@/lib/ndvi'
+import { compareIndexMaps, computeNdvi, computeNdwi, type IndexMetrics } from '@/lib/ndvi'
 import {
   bandsToCompressedArtifactPreview,
   bandsToDecompressedPreview,
@@ -36,6 +23,22 @@ import {
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression } from '@/lib/serverCompress'
 import { MAX_INGEST_BYTES } from '@/lib/archive'
+import {
+  bandsToPngBlob,
+  inspectUpload,
+  isLikelySingleBand,
+  loadArchiveMemberImage,
+  loadImageFile,
+  mergeNamedBands,
+  pairNdwiImages,
+  pairRedNirImages,
+  rgbaToDataUrl,
+  suggestNdviMembers,
+  suggestNdwiMembers,
+  toPreviewRgba,
+  type ArchiveSelection,
+  type LoadedImage,
+} from '@/lib/image'
 import {
   COMPRESSION_METHODS,
   type CompressionMethod,
@@ -112,6 +115,11 @@ export default function CompressionLab() {
   const [archiveMember, setArchiveMember] = useState<string>('')
   const [ndviRedMember, setNdviRedMember] = useState<string>('')
   const [ndviNirMember, setNdviNirMember] = useState<string>('')
+  const [ndwiGreenMember, setNdwiGreenMember] = useState<string>('')
+  const [ndwiSecondMember, setNdwiSecondMember] = useState<string>('')
+  const [ndwiSecondRole, setNdwiSecondRole] = useState<'nir' | 'swir'>('nir')
+  const [ndviPairLoaded, setNdviPairLoaded] = useState(false)
+  const [ndwiPairLoaded, setNdwiPairLoaded] = useState(false)
   const [pairMode, setPairMode] = useState(false)
   const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
   const [maxProcessDim, setMaxProcessDim] = useState<number>(1024)
@@ -131,9 +139,12 @@ export default function CompressionLab() {
   const [status, setStatus] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
+  const [indexKind, setIndexKind] = useState<'ndvi' | 'ndwi'>('ndvi')
   const [redBand, setRedBand] = useState('red')
   const [nirBand, setNirBand] = useState('nir')
-  const [ndvi, setNdvi] = useState<NdviMetrics | null>(null)
+  const [greenBand, setGreenBand] = useState('green')
+  const [ndwiSecondBand, setNdwiSecondBand] = useState('nir')
+  const [indexMetrics, setIndexMetrics] = useState<IndexMetrics | null>(null)
 
   const [compareRows, setCompareRows] = useState<CompareRow[] | null>(null)
   const [supabaseOk, setSupabaseOk] = useState(false)
@@ -273,6 +284,12 @@ export default function CompressionLab() {
     else if (order.length) setRedBand(order[0])
     if (order.includes('nir')) setNirBand('nir')
     else if (order.length > 1) setNirBand(order[Math.min(3, order.length - 1)])
+    if (order.includes('green')) setGreenBand('green')
+    else if (order.includes('green') === false && order.length) {
+      // leave greenBand as-is unless green exists
+    }
+    if (order.includes('swir')) setNdwiSecondBand('swir')
+    else if (order.includes('nir')) setNdwiSecondBand('nir')
   }, [image])
 
   async function applyLoaded(loaded: LoadedImage, file: File | null) {
@@ -280,7 +297,7 @@ export default function CompressionLab() {
     setImage(working)
     setRawFile(file)
     setResult(null)
-    setNdvi(null)
+    setIndexMetrics(null)
     setCompareRows(null)
     clearResultPreviews()
     setPendingRedSingle(null)
@@ -303,15 +320,131 @@ export default function CompressionLab() {
     try {
       const redImg = await loadArchiveMemberImage(archive, redMember)
       const nirImg = await loadArchiveMemberImage(archive, nirMember)
-      const paired = pairRedNirImages(redImg, nirImg)
+      let paired = pairRedNirImages(redImg, nirImg)
+      // Keep any already-loaded NDWI bands (green/swir) if present.
+      if (image && (image.bands.green || image.bands.swir)) {
+        const keep: { name: string; image: LoadedImage }[] = []
+        // Re-load green/swir from members if we know them; otherwise keep raster arrays via synthetic LoadedImage
+        if (image.bands.green) {
+          keep.push({
+            name: 'green',
+            image: {
+              ...image,
+              bands: { green: image.bands.green },
+              bandOrder: ['green'],
+              previewRgba: image.previewRgba,
+              filename: 'green',
+            },
+          })
+        }
+        if (image.bands.swir) {
+          keep.push({
+            name: 'swir',
+            image: {
+              ...image,
+              bands: { swir: image.bands.swir },
+              bandOrder: ['swir'],
+              previewRgba: image.previewRgba,
+              filename: 'swir',
+            },
+          })
+        }
+        if (keep.length) paired = mergeNamedBands(paired, keep, 'NDVI+NDWI stack')
+      }
       setArchiveMember(redMember)
       setNdviRedMember(redMember)
       setNdviNirMember(nirMember)
+      setNdviPairLoaded(true)
       setPairMode(true)
       await applyLoaded(paired, rawFile)
-      setStatus('NDVI pair loaded (Red + NIR). Run compression, then Compare NDVI.')
+      setStatus('NDVI pair loaded (Red + NIR). Optionally load an NDWI pair too, then run compression.')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load NDVI band pair')
+      setStatus(null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function loadArchiveNdwiPair(greenMember: string, secondMember: string) {
+    if (!archive) return
+    if (!greenMember || !secondMember) {
+      setError('Pick both a Green band file and a NIR/SWIR band file')
+      return
+    }
+    if (greenMember === secondMember) {
+      setError('Green and NIR/SWIR must be different single-band files')
+      return
+    }
+    setBusy(true)
+    setError(null)
+    setStatus(`Pairing NDWI bands…`)
+    try {
+      const greenImg = await loadArchiveMemberImage(archive, greenMember)
+      const secondImg = await loadArchiveMemberImage(archive, secondMember)
+      const role = ndwiSecondRole
+      let paired = pairNdwiImages(greenImg, secondImg, role)
+
+      // Merge onto existing NDVI red/nir stack when available.
+      if (image && (image.bands.red || image.bands.nir)) {
+        const keep: { name: string; image: LoadedImage }[] = []
+        if (image.bands.red) {
+          keep.push({
+            name: 'red',
+            image: {
+              ...image,
+              bands: { red: image.bands.red },
+              bandOrder: ['red'],
+              previewRgba: image.previewRgba,
+              filename: 'red',
+            },
+          })
+        }
+        if (image.bands.nir && role !== 'nir') {
+          keep.push({
+            name: 'nir',
+            image: {
+              ...image,
+              bands: { nir: image.bands.nir },
+              bandOrder: ['nir'],
+              previewRgba: image.previewRgba,
+              filename: 'nir',
+            },
+          })
+        }
+        // If NDWI uses NIR and red exists, start from NDVI-like base then add green.
+        if (image.bands.red && image.bands.nir && role === 'nir') {
+          paired = mergeNamedBands(
+            {
+              ...image,
+              bands: { red: image.bands.red, nir: image.bands.nir },
+              bandOrder: ['red', 'nir'],
+            },
+            [
+              { name: 'green', image: greenImg },
+            ],
+            'NDVI+NDWI stack',
+          )
+        } else if (keep.length) {
+          paired = mergeNamedBands(paired, keep, 'NDVI+NDWI stack')
+        }
+      }
+
+      setNdwiGreenMember(greenMember)
+      setNdwiSecondMember(secondMember)
+      setNdwiPairLoaded(true)
+      setPairMode(true)
+      setGreenBand('green')
+      setNdwiSecondBand(role)
+      setIndexKind('ndwi')
+      await applyLoaded(paired, rawFile)
+      setStatus(
+        role === 'swir'
+          ? 'MNDWI pair loaded (Green + SWIR). Run compression, then Compare NDWI.'
+          : 'NDWI pair loaded (Green + NIR). Run compression, then Compare NDWI.',
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load NDWI band pair')
       setStatus(null)
     } finally {
       setBusy(false)
@@ -322,7 +455,7 @@ export default function CompressionLab() {
     if (!file) return
     setError(null)
     setResult(null)
-    setNdvi(null)
+    setIndexMetrics(null)
     setCompareRows(null)
     setSharedView(null)
     setShareToken(null)
@@ -330,6 +463,10 @@ export default function CompressionLab() {
     setArchiveMember('')
     setNdviRedMember('')
     setNdviNirMember('')
+    setNdwiGreenMember('')
+    setNdwiSecondMember('')
+    setNdviPairLoaded(false)
+    setNdwiPairLoaded(false)
     setPairMode(false)
     setPendingRedSingle(null)
     if (file.size > MAX_INGEST_BYTES) {
@@ -348,6 +485,7 @@ export default function CompressionLab() {
         setArchive(inspected.selection)
         setRawFile(file)
         const suggested = suggestNdviMembers(inspected.selection.members)
+        const suggestedNdwi = suggestNdwiMembers(inspected.selection.members, 'nir')
         const first = inspected.selection.members[0]
         setArchiveMember(first)
         setNdviRedMember(suggested.red || first)
@@ -356,6 +494,13 @@ export default function CompressionLab() {
             inspected.selection.members.find((m) => m !== (suggested.red || first)) ||
             first,
         )
+        setNdwiGreenMember(suggestedNdwi.green || first)
+        setNdwiSecondMember(
+          suggestedNdwi.second ||
+            inspected.selection.members.find((m) => m !== (suggestedNdwi.green || first)) ||
+            first,
+        )
+        setNdwiSecondRole(suggestedNdwi.secondRole)
         if (suggested.red && suggested.nir) {
           setStatus(
             `Archive ${file.name}: found likely Red (${suggested.red.split('/').pop()}) and NIR (${suggested.nir.split('/').pop()}). Load NDVI pair or pick one image.`,
@@ -363,19 +508,38 @@ export default function CompressionLab() {
           // Auto-load the Landsat-style pair when both B4/B5-like members exist.
           const redImg = await loadArchiveMemberImage(inspected.selection, suggested.red)
           const nirImg = await loadArchiveMemberImage(inspected.selection, suggested.nir)
-          const paired = pairRedNirImages(redImg, nirImg)
+          let paired = pairRedNirImages(redImg, nirImg)
+          // Also merge green if present for NDWI readiness.
+          if (suggestedNdwi.green) {
+            const greenImg = await loadArchiveMemberImage(
+              inspected.selection,
+              suggestedNdwi.green,
+            )
+            paired = mergeNamedBands(
+              paired,
+              [{ name: 'green', image: greenImg }],
+              'NDVI+NDWI stack',
+            )
+            setNdwiGreenMember(suggestedNdwi.green)
+            setNdwiSecondMember(suggested.nir)
+            setNdwiSecondRole('nir')
+            setNdwiPairLoaded(true)
+          }
           setArchiveMember(suggested.red)
+          setNdviPairLoaded(true)
           setPairMode(true)
           await applyLoaded(paired, file)
           setStatus(
-            'Auto-paired Red+NIR from archive for NDVI. You can change the members below and reload.',
+            suggestedNdwi.green
+              ? 'Auto-paired Red+NIR (+ Green) from archive. Load NDWI pair if you want SWIR/MNDWI instead.'
+              : 'Auto-paired Red+NIR from archive for NDVI. Optionally load an NDWI Green+NIR/SWIR pair below.',
           )
         } else {
           setPairMode(false)
           const loaded = await loadArchiveMemberImage(inspected.selection, first)
           await applyLoaded(loaded, file)
           setStatus(
-            `Archive loaded. For NDVI with single-band TIFs, pick Red + NIR members and click Load NDVI pair.`,
+            `Archive loaded. For NDVI/NDWI with single-band TIFs, pick band members and load a pair.`,
           )
         }
       } else {
@@ -424,6 +588,8 @@ export default function CompressionLab() {
     if (!archive) return
     setArchiveMember(member)
     setPairMode(false)
+    setNdviPairLoaded(false)
+    setNdwiPairLoaded(false)
     setBusy(true)
     setError(null)
     setStatus(`Loading ${member}…`)
@@ -447,14 +613,44 @@ export default function CompressionLab() {
     setError(null)
     setStatus('Re-sampling for processing size…')
     try {
-      if (archive && pairMode && ndviRedMember && ndviNirMember) {
+      if (archive && pairMode && ndviPairLoaded && ndviRedMember && ndviNirMember) {
         const redImg = await loadArchiveMemberImage(archive, ndviRedMember)
         const nirImg = await loadArchiveMemberImage(archive, ndviNirMember)
-        const paired = pairRedNirImages(redImg, nirImg)
+        let paired = pairRedNirImages(redImg, nirImg)
+        if (ndwiPairLoaded && ndwiGreenMember) {
+          const greenImg = await loadArchiveMemberImage(archive, ndwiGreenMember)
+          const additions: { name: string; image: LoadedImage }[] = [
+            { name: 'green', image: greenImg },
+          ]
+          if (ndwiSecondRole === 'swir' && ndwiSecondMember) {
+            const swirImg = await loadArchiveMemberImage(archive, ndwiSecondMember)
+            additions.push({ name: 'swir', image: swirImg })
+          }
+          paired = mergeNamedBands(paired, additions, 'NDVI+NDWI stack')
+        }
         const working = toWorkingImage(paired, next)
         setImage(working)
         setResult(null)
-        setNdvi(null)
+        setIndexMetrics(null)
+        setCompareRows(null)
+        clearResultPreviews()
+        setStatus(
+          `Processing size ${working.size.width}×${working.size.height} (native ${working.nativeWidth}×${working.nativeHeight})`,
+        )
+      } else if (
+        archive &&
+        pairMode &&
+        ndwiPairLoaded &&
+        ndwiGreenMember &&
+        ndwiSecondMember
+      ) {
+        const greenImg = await loadArchiveMemberImage(archive, ndwiGreenMember)
+        const secondImg = await loadArchiveMemberImage(archive, ndwiSecondMember)
+        const paired = pairNdwiImages(greenImg, secondImg, ndwiSecondRole)
+        const working = toWorkingImage(paired, next)
+        setImage(working)
+        setResult(null)
+        setIndexMetrics(null)
         setCompareRows(null)
         clearResultPreviews()
         setStatus(
@@ -465,7 +661,7 @@ export default function CompressionLab() {
         const working = toWorkingImage(loaded, next)
         setImage(working)
         setResult(null)
-        setNdvi(null)
+        setIndexMetrics(null)
         setCompareRows(null)
         clearResultPreviews()
         setStatus(
@@ -476,7 +672,7 @@ export default function CompressionLab() {
         const working = toWorkingImage(loaded, next)
         setImage(working)
         setResult(null)
-        setNdvi(null)
+        setIndexMetrics(null)
         setCompareRows(null)
         clearResultPreviews()
         setStatus(
@@ -499,7 +695,7 @@ export default function CompressionLab() {
   async function onRun() {
     if (!image || !rawFile) return
     setError(null)
-    setNdvi(null)
+    setIndexMetrics(null)
     setBusy(true)
 
     if (engine === 'cloud-run') {
@@ -555,7 +751,7 @@ export default function CompressionLab() {
           metadata: { ...out.metadata, engine: out.engine },
         })
         if (out.ndvi) {
-          setNdvi({
+          setIndexMetrics({
             rmse: out.ndvi.rmse,
             mae: out.ndvi.mae,
             correlation: out.ndvi.correlation,
@@ -651,24 +847,44 @@ export default function CompressionLab() {
     }
   }
 
-  function onNdvi() {
+  function onIndexCompare() {
     if (!image || !result) return
     if (Object.keys(result.bands).length === 0) {
-      setStatus('NDVI for Cloud Run results is computed on the server when Red/NIR exist.')
+      setStatus('Index metrics for Cloud Run results are computed on the server when bands exist.')
       return
     }
-    const redO = image.bands[redBand]
-    const nirO = image.bands[nirBand]
-    const redC = result.bands[redBand]
-    const nirC = result.bands[nirBand]
-    if (!redO || !nirO || !redC || !nirC) {
-      setError(`Need both ${redBand} and ${nirBand} in original and reconstructed bands`)
+    if (indexKind === 'ndvi') {
+      const redO = image.bands[redBand]
+      const nirO = image.bands[nirBand]
+      const redC = result.bands[redBand]
+      const nirC = result.bands[nirBand]
+      if (!redO || !nirO || !redC || !nirC) {
+        setError(`Need both ${redBand} and ${nirBand} in original and reconstructed bands`)
+        return
+      }
+      const ref = computeNdvi(redO, nirO)
+      const cand = computeNdvi(redC, nirC)
+      setIndexMetrics(compareIndexMaps(ref, cand))
+      setStatus('NDVI comparison ready')
       return
     }
-    const ref = computeNdvi(redO, nirO)
-    const cand = computeNdvi(redC, nirC)
-    setNdvi(compareNdvi(ref, cand))
-    setStatus('NDVI comparison ready')
+
+    const greenO = image.bands[greenBand]
+    const secondO = image.bands[ndwiSecondBand]
+    const greenC = result.bands[greenBand]
+    const secondC = result.bands[ndwiSecondBand]
+    if (!greenO || !secondO || !greenC || !secondC) {
+      setError(
+        `Need both ${greenBand} and ${ndwiSecondBand} in original and reconstructed bands for NDWI`,
+      )
+      return
+    }
+    const ref = computeNdwi(greenO, secondO)
+    const cand = computeNdwi(greenC, secondC)
+    setIndexMetrics(compareIndexMaps(ref, cand))
+    setStatus(
+      ndwiSecondBand === 'swir' ? 'MNDWI comparison ready' : 'NDWI comparison ready',
+    )
   }
 
   async function onSave() {
@@ -727,15 +943,15 @@ export default function CompressionLab() {
       setStatus(`Saved. Share link uses ?run=${saved.shareToken}`)
       const runs = await listRecentRuns()
       setRecentRuns(runs)
-      if (ndvi) {
+      if (indexMetrics) {
         await attachNdviToRun(saved.shareToken, {
-          redBand,
-          nirBand,
-          rmse: ndvi.rmse,
-          mae: ndvi.mae,
-          correlation: ndvi.correlation,
-          ssim: ndvi.ssim,
-          bias: ndvi.bias,
+          redBand: indexKind === 'ndvi' ? redBand : greenBand,
+          nirBand: indexKind === 'ndvi' ? nirBand : ndwiSecondBand,
+          rmse: indexMetrics.rmse,
+          mae: indexMetrics.mae,
+          correlation: indexMetrics.correlation,
+          ssim: indexMetrics.ssim,
+          bias: indexMetrics.bias,
         })
       }
     } catch (err) {
@@ -898,7 +1114,69 @@ export default function CompressionLab() {
                 disabled={busy || !ndviRedMember || !ndviNirMember}
                 onClick={() => void loadArchiveNdviPair(ndviRedMember, ndviNirMember)}
               >
-                {pairMode ? 'Reload NDVI pair' : 'Load NDVI pair (Red + NIR)'}
+                {ndviPairLoaded ? 'Reload NDVI pair' : 'Load NDVI pair (Red + NIR)'}
+              </button>
+
+              <h2>NDWI band pair</h2>
+              <p className="hint">
+                McFeeters NDWI uses Green + NIR (B3 + B5). MNDWI uses Green + SWIR (B3 + B6).
+              </p>
+              <label>
+                NDWI formula
+                <select
+                  value={ndwiSecondRole}
+                  disabled={busy}
+                  onChange={(e) => {
+                    const role = e.target.value as 'nir' | 'swir'
+                    setNdwiSecondRole(role)
+                    if (archive) {
+                      const suggested = suggestNdwiMembers(archive.members, role)
+                      if (suggested.green) setNdwiGreenMember(suggested.green)
+                      if (suggested.second) setNdwiSecondMember(suggested.second)
+                    }
+                  }}
+                >
+                  <option value="nir">NDWI (Green − NIR) / (Green + NIR)</option>
+                  <option value="swir">MNDWI (Green − SWIR) / (Green + SWIR)</option>
+                </select>
+              </label>
+              <label>
+                Green band file
+                <select
+                  value={ndwiGreenMember}
+                  disabled={busy}
+                  onChange={(e) => setNdwiGreenMember(e.target.value)}
+                >
+                  {archive.members.map((m) => (
+                    <option key={`green-${m}`} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                {ndwiSecondRole === 'swir' ? 'SWIR band file' : 'NIR band file'}
+                <select
+                  value={ndwiSecondMember}
+                  disabled={busy}
+                  onChange={(e) => setNdwiSecondMember(e.target.value)}
+                >
+                  {archive.members.map((m) => (
+                    <option key={`ndwi2-${m}`} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="secondary"
+                disabled={busy || !ndwiGreenMember || !ndwiSecondMember}
+                onClick={() => void loadArchiveNdwiPair(ndwiGreenMember, ndwiSecondMember)}
+              >
+                {ndwiPairLoaded
+                  ? `Reload ${ndwiSecondRole === 'swir' ? 'MNDWI' : 'NDWI'} pair`
+                  : `Load ${ndwiSecondRole === 'swir' ? 'MNDWI' : 'NDWI'} pair`}
               </button>
             </>
           )}
@@ -1177,50 +1455,95 @@ export default function CompressionLab() {
               <h2>NDVI/NDWI preservation</h2>
               <div className="ndvi-row">
                 <label>
-                  Red band
-                  <select value={redBand} onChange={(e) => setRedBand(e.target.value)}>
-                    {image.bandOrder.map((b) => (
-                      <option key={b} value={b}>
-                        {b}
-                      </option>
-                    ))}
+                  Index
+                  <select
+                    value={indexKind}
+                    onChange={(e) => setIndexKind(e.target.value as 'ndvi' | 'ndwi')}
+                  >
+                    <option value="ndvi">NDVI</option>
+                    <option value="ndwi">
+                      {ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'}
+                    </option>
                   </select>
                 </label>
-                <label>
-                  NIR band
-                  <select value={nirBand} onChange={(e) => setNirBand(e.target.value)}>
-                    {image.bandOrder.map((b) => (
-                      <option key={b} value={b}>
-                        {b}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <button type="button" className="secondary" onClick={onNdvi}>
-                  Compare NDVI
+                {indexKind === 'ndvi' ? (
+                  <>
+                    <label>
+                      Red band
+                      <select value={redBand} onChange={(e) => setRedBand(e.target.value)}>
+                        {image.bandOrder.map((b) => (
+                          <option key={b} value={b}>
+                            {b}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      NIR band
+                      <select value={nirBand} onChange={(e) => setNirBand(e.target.value)}>
+                        {image.bandOrder.map((b) => (
+                          <option key={b} value={b}>
+                            {b}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <label>
+                      Green band
+                      <select
+                        value={greenBand}
+                        onChange={(e) => setGreenBand(e.target.value)}
+                      >
+                        {image.bandOrder.map((b) => (
+                          <option key={b} value={b}>
+                            {b}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      {ndwiSecondBand === 'swir' ? 'SWIR band' : 'NIR band'}
+                      <select
+                        value={ndwiSecondBand}
+                        onChange={(e) => setNdwiSecondBand(e.target.value)}
+                      >
+                        {image.bandOrder.map((b) => (
+                          <option key={b} value={b}>
+                            {b}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </>
+                )}
+                <button type="button" className="secondary" onClick={onIndexCompare}>
+                  Compare {indexKind === 'ndvi' ? 'NDVI' : ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'}
                 </button>
               </div>
-              {ndvi && (
+              {indexMetrics && (
                 <div className="metric-grid">
                   <div>
                     <span>RMSE</span>
-                    <strong>{fmt(ndvi.rmse)}</strong>
+                    <strong>{fmt(indexMetrics.rmse)}</strong>
                   </div>
                   <div>
                     <span>MAE</span>
-                    <strong>{fmt(ndvi.mae)}</strong>
+                    <strong>{fmt(indexMetrics.mae)}</strong>
                   </div>
                   <div>
                     <span>Corr</span>
-                    <strong>{fmt(ndvi.correlation, 3)}</strong>
+                    <strong>{fmt(indexMetrics.correlation, 3)}</strong>
                   </div>
                   <div>
                     <span>SSIM</span>
-                    <strong>{fmt(ndvi.ssim, 3)}</strong>
+                    <strong>{fmt(indexMetrics.ssim, 3)}</strong>
                   </div>
                   <div>
                     <span>Bias</span>
-                    <strong>{fmt(ndvi.bias)}</strong>
+                    <strong>{fmt(indexMetrics.bias)}</strong>
                   </div>
                 </div>
               )}
