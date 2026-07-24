@@ -1259,6 +1259,103 @@ export default function CompressionLab() {
         </aside>
 
         <main className="main-col">
+          <section className="panel">
+            <h2>Preview</h2>
+            <div className="preview-grid preview-grid-3">
+              <figure>
+                <figcaption>Original</figcaption>
+                {originalPreview ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={originalPreview} alt="Original preview" />
+                ) : (
+                  <div className="empty">Waiting for upload</div>
+                )}
+              </figure>
+              <figure>
+                <figcaption>Compressed</figcaption>
+                {compressedArtifactPreview ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
+                ) : (
+                  <div className="empty">Waiting for compression</div>
+                )}
+              </figure>
+              <figure>
+                <figcaption>Decompressed</figcaption>
+                {decompressedPreview ? (
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={decompressedPreview} alt="Decompressed preview" />
+                    <button
+                      type="button"
+                      className="secondary preview-download"
+                      onClick={() =>
+                        downloadDataUrl(
+                          decompressedPreview,
+                          `esmi-decompressed-${Date.now()}.png`,
+                        )
+                      }
+                    >
+                      Download decompressed PNG
+                    </button>
+                  </>
+                ) : (
+                  <div className="empty">Waiting for decompression</div>
+                )}
+              </figure>
+            </div>
+            <div className="residual-block">
+              <figcaption>Compression residual (|original − decompressed|)</figcaption>
+              {residualPreview ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={residualPreview} alt="Compression residual map" />
+              ) : (
+                <div className="empty">Waiting for residual map</div>
+              )}
+            </div>
+          </section>
+
+          <section className="panel">
+            <h2>Band metrics</h2>
+            <p className={`hint ${result ? '' : 'placeholder'}`}>
+              {result
+                ? `Runtime ${result.runtimeSeconds.toFixed(2)}s · Estimate ${bytesLabel(result.compressedBytesEstimate)} · Ratio ${fmt(result.compressionRatio, 3)}`
+                : 'Runtime — · Estimate — · Ratio —'}
+            </p>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Band</th>
+                    <th>RMSE</th>
+                    <th>MAE</th>
+                    <th>PSNR (dB)</th>
+                    <th>SSIM</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result && result.channelReports.length > 0 ? (
+                    result.channelReports.map((r) => (
+                      <tr key={r.band}>
+                        <td>{r.band}</td>
+                        <td>{fmt(r.rmse)}</td>
+                        <td>{fmt(r.mae)}</td>
+                        <td>{fmt(r.psnrDb, 3)}</td>
+                        <td>{fmt(r.ssim, 3)}</td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={5} className="hint placeholder">
+                        Waiting for compression results
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
           <section className="panel pair-panel">
             <h2>Index band pairs</h2>
             <p className="hint pair-hint">
@@ -1371,103 +1468,6 @@ export default function CompressionLab() {
             {!archive && (
               <p className="hint placeholder">Upload a TAR archive to enable band pairing</p>
             )}
-          </section>
-
-          <section className="panel">
-            <h2>Preview</h2>
-            <div className="preview-grid preview-grid-3">
-              <figure>
-                <figcaption>Original</figcaption>
-                {originalPreview ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={originalPreview} alt="Original preview" />
-                ) : (
-                  <div className="empty">Waiting for upload</div>
-                )}
-              </figure>
-              <figure>
-                <figcaption>Compressed</figcaption>
-                {compressedArtifactPreview ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
-                ) : (
-                  <div className="empty">Waiting for compression</div>
-                )}
-              </figure>
-              <figure>
-                <figcaption>Decompressed</figcaption>
-                {decompressedPreview ? (
-                  <>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={decompressedPreview} alt="Decompressed preview" />
-                    <button
-                      type="button"
-                      className="secondary preview-download"
-                      onClick={() =>
-                        downloadDataUrl(
-                          decompressedPreview,
-                          `esmi-decompressed-${Date.now()}.png`,
-                        )
-                      }
-                    >
-                      Download decompressed PNG
-                    </button>
-                  </>
-                ) : (
-                  <div className="empty">Waiting for decompression</div>
-                )}
-              </figure>
-            </div>
-            <div className="residual-block">
-              <figcaption>Compression residual (|original − decompressed|)</figcaption>
-              {residualPreview ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={residualPreview} alt="Compression residual map" />
-              ) : (
-                <div className="empty">Waiting for residual map</div>
-              )}
-            </div>
-          </section>
-
-          <section className="panel">
-            <h2>Band metrics</h2>
-            <p className={`hint ${result ? '' : 'placeholder'}`}>
-              {result
-                ? `Runtime ${result.runtimeSeconds.toFixed(2)}s · Estimate ${bytesLabel(result.compressedBytesEstimate)} · Ratio ${fmt(result.compressionRatio, 3)}`
-                : 'Runtime — · Estimate — · Ratio —'}
-            </p>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Band</th>
-                    <th>RMSE</th>
-                    <th>MAE</th>
-                    <th>PSNR (dB)</th>
-                    <th>SSIM</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {result && result.channelReports.length > 0 ? (
-                    result.channelReports.map((r) => (
-                      <tr key={r.band}>
-                        <td>{r.band}</td>
-                        <td>{fmt(r.rmse)}</td>
-                        <td>{fmt(r.mae)}</td>
-                        <td>{fmt(r.psnrDb, 3)}</td>
-                        <td>{fmt(r.ssim, 3)}</td>
-                      </tr>
-                    ))
-                  ) : (
-                    <tr>
-                      <td colSpan={5} className="hint placeholder">
-                        Waiting for compression results
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
           </section>
 
           <section className="panel">
