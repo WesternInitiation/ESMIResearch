@@ -1,0 +1,306 @@
+"""
+ESMI compression API for Google Cloud Run (free tier friendly).
+
+Endpoints:
+  GET  /health
+  POST /v1/archive/list   — list image members in a TAR / TAR.GZ
+  POST /v1/compress       — run SVD / wavelet / bandwidth / JPEG2000
+
+Build from the repository root:
+  docker build -f cloud_run/Dockerfile .
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+from io import BytesIO
+from typing import Any, Literal
+
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from PIL import Image
+
+from compression.bandwidth import run_bandwidth_compression
+from compression.jpeg2000 import run_jpeg2000_compression
+from compression.svd import run_svd_compression
+from compression.wavelet import run_wavelet_compression
+from image_io import (
+    is_tar_archive,
+    list_archive_images,
+    load_archive_image,
+    load_image,
+    to_display_rgb,
+)
+from ndvi import compare_ndvi, compute_ndvi
+from svd_compression import ChannelCompressionConfig, CompressionConfig
+
+MethodName = Literal[
+    "SVD",
+    "Wavelet transformation",
+    "Bandwidth transformation",
+    "JPEG2000",
+]
+
+app = FastAPI(title="ESMI Compression API", version="1.0.0")
+
+_allowed = os.environ.get("CORS_ORIGINS", "*")
+_origins = [o.strip() for o in _allowed.split(",") if o.strip()] or ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(80 * 1024 * 1024)))
+DEFAULT_MAX_DIM = int(os.environ.get("DEFAULT_MAX_DIM", "1024"))
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "esmi-compress"}
+
+
+def _png_b64(rgb: np.ndarray) -> str:
+    image = Image.fromarray(rgb.astype(np.uint8))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _downsample_bands(
+    bands: dict[str, np.ndarray],
+    max_dim: int,
+) -> tuple[dict[str, np.ndarray], float]:
+    sample = next(iter(bands.values()))
+    height, width = sample.shape[:2]
+    longest = max(height, width)
+    if max_dim <= 0 or longest <= max_dim:
+        return bands, 1.0
+    scale = max_dim / float(longest)
+    new_w = max(1, int(round(width * scale)))
+    new_h = max(1, int(round(height * scale)))
+    out: dict[str, np.ndarray] = {}
+    for name, band in bands.items():
+        image = Image.fromarray(band.astype(np.float32), mode="F")
+        resized = image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
+        out[name] = np.asarray(resized, dtype=band.dtype)
+    return out, scale
+
+
+def _load_from_upload(
+    raw: bytes,
+    filename: str,
+    archive_member: str | None,
+) -> tuple[dict[str, np.ndarray], list[str], str]:
+    if is_tar_archive(filename):
+        if not archive_member:
+            raise HTTPException(
+                status_code=400,
+                detail="archive_member is required for TAR uploads",
+            )
+        loaded = load_archive_image(raw, archive_member)
+        return loaded.bands, loaded.band_order, archive_member
+    loaded = load_image(BytesIO(raw), filename)
+    return loaded.bands, loaded.band_order, filename
+
+
+def _run_method(
+    method: MethodName,
+    bands: dict[str, np.ndarray],
+    *,
+    svd_rank: int,
+    wavelet_keep_fraction: float,
+    wavelet_levels: int,
+    bandwidth_keep_fraction: float,
+    jpeg_rate: float,
+) -> Any:
+    if method == "SVD":
+        config = CompressionConfig(
+            channels={
+                name: ChannelCompressionConfig(rank=max(1, int(svd_rank)))
+                for name in bands
+            },
+            mode="rank",
+            normalize_before_svd=True,
+        )
+        return run_svd_compression(bands, config)
+    if method == "Wavelet transformation":
+        return run_wavelet_compression(
+            bands,
+            wavelet="haar",
+            level=max(1, int(wavelet_levels)),
+            keep_fraction=float(np.clip(wavelet_keep_fraction, 0.001, 1.0)),
+        )
+    if method == "Bandwidth transformation":
+        return run_bandwidth_compression(
+            bands,
+            keep_fraction=float(np.clip(bandwidth_keep_fraction, 0.001, 1.0)),
+        )
+    # JPEG2000 — Pillow may lack OpenJPEG; fall back to JPEG quality proxy.
+    rate = max(1, int(round(float(np.clip(jpeg_rate, 0.05, 1.0)) * 100)))
+    try:
+        return run_jpeg2000_compression(bands, rate=max(1, rate // 10 or 1))
+    except Exception:
+        from compression.base import build_execution_result
+        from time import perf_counter
+
+        start = perf_counter()
+        reconstructed: dict[str, np.ndarray] = {}
+        encoded_total = 0
+        quality = float(np.clip(jpeg_rate, 0.05, 0.95))
+        for name, band in bands.items():
+            band_f = band.astype(np.float64)
+            lo, hi = float(band_f.min()), float(band_f.max())
+            scale = hi - lo or 1.0
+            norm = ((band_f - lo) / scale * 255.0).astype(np.uint8)
+            image = Image.fromarray(norm, mode="L")
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG", quality=int(quality * 100))
+            encoded_total += len(buffer.getvalue())
+            buffer.seek(0)
+            decoded = np.asarray(Image.open(buffer), dtype=np.float64)
+            reconstructed[name] = (decoded / 255.0 * scale + lo).astype(band.dtype)
+        return build_execution_result(
+            method="jpeg2000_jpeg_fallback",
+            bands=bands,
+            reconstructed_bands=reconstructed,
+            compressed_bytes_estimate=encoded_total,
+            runtime_seconds=perf_counter() - start,
+            metadata={"codec": "jpeg-fallback", "quality": quality},
+        )
+
+
+@app.post("/v1/archive/list")
+async def archive_list(file: UploadFile = File(...)) -> JSONResponse:
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload exceeds size limit")
+    filename = file.filename or "upload.tar"
+    if not is_tar_archive(filename):
+        raise HTTPException(status_code=400, detail="File is not a TAR archive")
+    try:
+        members = list_archive_images(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse({"members": members, "filename": filename})
+
+
+@app.post("/v1/compress")
+async def compress(
+    file: UploadFile = File(...),
+    method: str = Form(...),
+    archive_member: str | None = Form(None),
+    max_dim: int = Form(DEFAULT_MAX_DIM),
+    svd_rank: int = Form(32),
+    wavelet_keep_fraction: float = Form(0.08),
+    wavelet_levels: int = Form(3),
+    bandwidth_keep_fraction: float = Form(0.12),
+    jpeg_rate: float = Form(0.45),
+    red_band: str | None = Form(None),
+    nir_band: str | None = Form(None),
+) -> JSONResponse:
+    if method not in (
+        "SVD",
+        "Wavelet transformation",
+        "Bandwidth transformation",
+        "JPEG2000",
+    ):
+        raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty upload")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload exceeds size limit")
+
+    filename = file.filename or "upload.bin"
+    member = (archive_member or "").strip() or None
+    try:
+        bands, band_order, source_name = _load_from_upload(raw, filename, member)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=f"Failed to load image: {exc}") from exc
+
+    native = next(iter(bands.values())).shape
+    native_h, native_w = int(native[0]), int(native[1])
+    bands, scale = _downsample_bands(bands, max(64, int(max_dim)))
+    sample = next(iter(bands.values()))
+    height, width = int(sample.shape[0]), int(sample.shape[1])
+
+    try:
+        result = _run_method(
+            method,  # type: ignore[arg-type]
+            bands,
+            svd_rank=svd_rank,
+            wavelet_keep_fraction=wavelet_keep_fraction,
+            wavelet_levels=wavelet_levels,
+            bandwidth_keep_fraction=bandwidth_keep_fraction,
+            jpeg_rate=jpeg_rate,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
+
+    original_preview = to_display_rgb(bands, band_order)
+    reconstructed_preview = to_display_rgb(result.reconstructed_bands, band_order)
+
+    ndvi_payload: dict[str, float] | None = None
+    red_name = red_band if red_band in bands else ("red" if "red" in bands else None)
+    nir_name = nir_band if nir_band in bands else ("nir" if "nir" in bands else None)
+    if red_name and nir_name:
+        ref = compute_ndvi(bands[red_name], bands[nir_name])
+        cand = compute_ndvi(
+            result.reconstructed_bands[red_name],
+            result.reconstructed_bands[nir_name],
+        )
+        metrics = compare_ndvi(ref, cand)
+        ndvi_payload = {
+            "rmse": metrics.rmse,
+            "mae": metrics.mae,
+            "correlation": metrics.correlation,
+            "ssim": metrics.ssim,
+            "bias": metrics.bias,
+            "valid_pixel_fraction": metrics.valid_pixel_fraction,
+        }
+
+    ratio = (
+        result.compressed_bytes_estimate / result.original_bytes
+        if result.original_bytes > 0
+        else 0.0
+    )
+
+    payload = {
+        "engine": "cloud-run",
+        "method": method,
+        "source": source_name,
+        "runtimeSeconds": result.runtime_seconds,
+        "originalBytes": result.original_bytes,
+        "compressedBytesEstimate": result.compressed_bytes_estimate,
+        "compressionRatio": ratio,
+        "width": width,
+        "height": height,
+        "nativeWidth": native_w,
+        "nativeHeight": native_h,
+        "processScale": scale,
+        "bandOrder": band_order,
+        "channelReports": [
+            {
+                "band": report.name,
+                "rmse": report.rmse,
+                "mae": report.mae,
+                "psnrDb": report.psnr,
+                "ssim": report.ssim,
+            }
+            for report in result.channel_reports
+        ],
+        "metadata": result.metadata,
+        "ndvi": ndvi_payload,
+        "originalPreviewPngBase64": _png_b64(original_preview),
+        "previewPngBase64": _png_b64(reconstructed_preview),
+    }
+    return JSONResponse(payload)

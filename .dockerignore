@@ -1,0 +1,18 @@
+# Keep the Cloud Run image small and free of secrets / local junk.
+.git
+.github
+.next
+.vercel
+.venv
+venv
+node_modules
+**/__pycache__
+**/*.pyc
+.streamlit/secrets.toml
+.env
+.env.local
+*.tif
+*.tiff
+.DS_Store
+tests
+web

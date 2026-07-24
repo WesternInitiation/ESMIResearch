@@ -80,6 +80,10 @@ body {
 
 .header-meta {
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  align-items: end;
 }
 
 .pill {

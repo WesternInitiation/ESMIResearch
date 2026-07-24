@@ -1,13 +1,12 @@
 # ESMIResearch
 
 Satellite image compression research workbench: SVD, wavelet, bandwidth-domain,
-and JPEG-rate methods with NDVI preservation checks and optional Supabase sharing.
+and JPEG2000 methods with NDVI preservation checks and optional Supabase sharing.
 
-**Primary deploy target: Vercel** (Next.js app at the repo root). Compression runs
-in the browser — no Python/GDAL runtime on the server.
+**Primary UI: Vercel** (Next.js at repo root). Compression can run in the
+**browser** (Web Worker) or on **Google Cloud Run** (Python free tier) for heavier jobs.
 
-The Streamlit prototype (`streamlit_app.py`) remains for local research notebooks
-and offline GeoTIFF workflows.
+The Streamlit prototype (`streamlit_app.py`) remains for local research notebooks.
 
 ## Deploy on Vercel
 
@@ -21,19 +20,30 @@ and offline GeoTIFF workflows.
 | `NEXT_PUBLIC_SUPABASE_URL` | `https://YOUR_PROJECT.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | your Supabase **service_role** key (server-only) |
 | `NEXT_PUBLIC_SUPABASE_BUCKET` | `esmi-images` (optional; default) |
+| `NEXT_PUBLIC_COMPRESS_API_URL` | your Cloud Run URL (optional; enables **Cloud Run** engine) |
 
 5. Deploy. Open the assigned `*.vercel.app` URL.
-
-If an older Vercel project still has **Root Directory** set to `web`, clear it
-(set to `.`) and redeploy — that folder no longer exists.
 
 Local preview:
 
 ```bash
-cp .env.example .env.local   # fill in Supabase values
+cp .env.example .env.local   # fill in values
 npm install
 npm run dev
 ```
+
+## Google Cloud Run (free tier) — optional backend
+
+Heavy compression (larger GeoTIFF/TAR, real Python JPEG2000 when available) can run
+on Cloud Run. Idle services scale to zero, so light research use is typically **$0**
+within Google’s free allowance.
+
+1. Follow [`cloud_run/README.md`](cloud_run/README.md) (or run `./cloud_run/deploy.sh YOUR_PROJECT_ID`).
+2. Copy the service URL into Vercel as `NEXT_PUBLIC_COMPRESS_API_URL`.
+3. In the lab UI, set **Engine → Cloud Run** and click **Run on Cloud Run**.
+
+The browser talks to Cloud Run directly (CORS enabled) so large uploads are not
+blocked by Vercel’s serverless body size limit.
 
 ## Supabase setup
 
@@ -42,26 +52,13 @@ npm run dev
 3. Create a **private** Storage bucket named `esmi-images`.
 4. Put the project URL + service role key in Vercel env vars (or `.env.local`).
 
-The Next.js API routes (`/api/runs`, etc.) use the service role on the server so
-the key is never shipped to the browser. After a compression run you can **Save
-run to Supabase** and share with `?run=<share_token>`.
+## Features
 
-## Features (Vercel)
-
-- Upload GeoTIFF (via `geotiff.js`), PNG, JPEG, or **TAR / TAR.GZ** archives
-- Pick an image member inside an archive, then run any compression method
-- Methods: SVD, Haar wavelet, FFT bandwidth keep, JPEG quality stand-in for JPEG2000
-- Processing is downsampled (default max edge 384px) and run in a **Web Worker** so the UI stays responsive
-- Per-band RMSE / MAE / PSNR / SSIM
-- NDVI preservation compare (choose Red / NIR bands)
-- Compare all methods table
+- Upload GeoTIFF, PNG, JPEG, or **TAR / TAR.GZ** archives
+- Engines: **Browser** (Web Worker) or **Cloud Run** (Python)
+- Methods: SVD, wavelet, bandwidth, JPEG2000
+- Per-band RMSE / MAE / PSNR / SSIM + optional NDVI
 - Optional Supabase save + shared run links
-
-Notes:
-
-- True JPEG2000 isn't widely available in browsers; the JPEG2000 option uses a
-  quality-controlled JPEG encode/decode while keeping the same lab workflow.
-- Raise **Max processing size** for sharper demos; lower it (256–384) for faster runs.
 
 ## Streamlit prototype (local / research)
 
@@ -73,16 +70,13 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 streamlit run streamlit_app.py
 ```
 
-Streamlit Community Cloud is no longer the intended host. Prefer Vercel for demos;
-keep Streamlit for local deep research with native GeoTIFF write-back.
-
 ## Project layout
 
 | Path | Role |
 |------|------|
 | `src/` | Next.js app — Vercel entrypoint |
-| `src/lib/compression/` | TypeScript SVD / wavelet / bandwidth / JPEG |
-| `src/app/api/` | Supabase save/list/load API routes |
-| `streamlit_app.py` | Streamlit UI (research / local) |
+| `src/lib/compression/` | TypeScript browser compression |
+| `cloud_run/` | FastAPI worker for Google Cloud Run |
 | `compression/` | Python compression implementations |
+| `streamlit_app.py` | Streamlit UI (research / local) |
 | `supabase_schema/` | SQL migrations |

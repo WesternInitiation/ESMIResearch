@@ -23,6 +23,7 @@ import {
 } from '@/lib/image'
 import { compareNdvi, computeNdvi, type NdviMetrics } from '@/lib/ndvi'
 import { downsampleBands } from '@/lib/resize'
+import { fetchCloudRunStatus, runServerCompression } from '@/lib/serverCompress'
 import {
   COMPRESSION_METHODS,
   type CompressionMethod,
@@ -63,7 +64,10 @@ const DEFAULT_PARAMS: MethodParams = {
   jpegRate: 0.45,
 }
 
-const PROCESS_DIM_OPTIONS = [256, 384, 512, 768] as const
+const PROCESS_DIM_OPTIONS_BROWSER = [256, 384, 512, 768] as const
+const PROCESS_DIM_OPTIONS_SERVER = [512, 768, 1024, 1536, 2048] as const
+
+type Engine = 'browser' | 'cloud-run'
 
 function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
   const resized = downsampleBands(
@@ -95,6 +99,13 @@ export default function CompressionLab() {
   const [archive, setArchive] = useState<ArchiveSelection | null>(null)
   const [archiveMember, setArchiveMember] = useState<string>('')
   const [maxProcessDim, setMaxProcessDim] = useState<number>(384)
+  const [engine, setEngine] = useState<Engine>('browser')
+  const [cloudRunOk, setCloudRunOk] = useState(false)
+  const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
+  const [serverOriginalPreview, setServerOriginalPreview] = useState<string | null>(null)
+  const [serverCompressedPreview, setServerCompressedPreview] = useState<string | null>(
+    null,
+  )
   const [method, setMethod] = useState<CompressionMethod>('SVD')
   const [params, setParams] = useState<MethodParams>(DEFAULT_PARAMS)
   const [result, setResult] = useState<CompressionResult | null>(null)
@@ -122,16 +133,18 @@ export default function CompressionLab() {
   } | null>(null)
 
   const originalPreview = useMemo(() => {
+    if (serverOriginalPreview) return serverOriginalPreview
     if (!image) return null
     return rgbaToDataUrl(
       image.previewRgba,
       image.size.width,
       image.size.height,
     )
-  }, [image])
+  }, [image, serverOriginalPreview])
 
   const compressedPreview = useMemo(() => {
-    if (!result) return null
+    if (serverCompressedPreview) return serverCompressedPreview
+    if (!result || Object.keys(result.bands).length === 0) return null
     const rgba = toPreviewRgba(
       result.bands,
       result.bandOrder,
@@ -139,7 +152,7 @@ export default function CompressionLab() {
       result.height,
     )
     return rgbaToDataUrl(rgba, result.width, result.height)
-  }, [result])
+  }, [result, serverCompressedPreview])
 
   useEffect(() => {
     void (async () => {
@@ -152,6 +165,19 @@ export default function CompressionLab() {
         }
       } catch {
         setSupabaseOk(false)
+      }
+    })()
+  }, [])
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const status = await fetchCloudRunStatus()
+        setCloudRunConfigured(status.urlConfigured)
+        setCloudRunOk(status.configured)
+      } catch {
+        setCloudRunConfigured(false)
+        setCloudRunOk(false)
       }
     })()
   }, [])
@@ -198,6 +224,8 @@ export default function CompressionLab() {
     setResult(null)
     setNdvi(null)
     setCompareRows(null)
+    setServerOriginalPreview(null)
+    setServerCompressedPreview(null)
     const scaledNote =
       working.processScale < 1
         ? ` · processing at ${working.size.width}×${working.size.height}`
@@ -303,11 +331,69 @@ export default function CompressionLab() {
   }
 
   async function onRun() {
-    if (!image) return
+    if (!image || !rawFile) return
     setError(null)
     setNdvi(null)
     setBusy(true)
-    setStatus(`Running ${method} off the main thread…`)
+
+    if (engine === 'cloud-run') {
+      setStatus('Sending job to Cloud Run (cold start may take ~15s)…')
+      try {
+        const out = await runServerCompression({
+          file: rawFile,
+          filename: rawFile.name,
+          method,
+          archiveMember: archive ? archiveMember : null,
+          maxDim: maxProcessDim,
+          svdRank: params.svdRank,
+          waveletKeepFraction: params.waveletKeepFraction,
+          waveletLevels: params.waveletLevels,
+          bandwidthKeepFraction: params.bandwidthKeepFraction,
+          jpegRate: params.jpegRate,
+          redBand,
+          nirBand,
+        })
+        setServerOriginalPreview(
+          `data:image/png;base64,${out.originalPreviewPngBase64}`,
+        )
+        setServerCompressedPreview(`data:image/png;base64,${out.previewPngBase64}`)
+        setResult({
+          method: out.method,
+          bands: {},
+          bandOrder: out.bandOrder,
+          width: out.width,
+          height: out.height,
+          runtimeSeconds: out.runtimeSeconds,
+          originalBytes: out.originalBytes,
+          compressedBytesEstimate: out.compressedBytesEstimate,
+          compressionRatio: out.compressionRatio,
+          channelReports: out.channelReports,
+          metadata: { ...out.metadata, engine: out.engine },
+        })
+        if (out.ndvi) {
+          setNdvi({
+            rmse: out.ndvi.rmse,
+            mae: out.ndvi.mae,
+            correlation: out.ndvi.correlation,
+            ssim: out.ndvi.ssim,
+            bias: out.ndvi.bias,
+          })
+        }
+        setStatus(
+          `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · ${out.width}×${out.height} (native ${out.nativeWidth}×${out.nativeHeight})`,
+        )
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Cloud Run compression failed')
+        setStatus(null)
+      } finally {
+        setBusy(false)
+      }
+      return
+    }
+
+    setServerOriginalPreview(null)
+    setServerCompressedPreview(null)
+    setStatus(`Running ${method} in browser worker…`)
     try {
       const out = await runCompressionAsync({
         method,
@@ -333,8 +419,14 @@ export default function CompressionLab() {
 
   async function onCompareAll() {
     if (!image) return
+    if (engine === 'cloud-run') {
+      setError('Compare-all on Cloud Run is not enabled yet — switch to Browser engine.')
+      return
+    }
     setError(null)
     setBusy(true)
+    setServerOriginalPreview(null)
+    setServerCompressedPreview(null)
     setStatus('Comparing all methods…')
     try {
       const rows: CompareRow[] = []
@@ -378,6 +470,10 @@ export default function CompressionLab() {
 
   function onNdvi() {
     if (!image || !result) return
+    if (Object.keys(result.bands).length === 0) {
+      setStatus('NDVI for Cloud Run results is computed on the server when Red/NIR exist.')
+      return
+    }
     const redO = image.bands[redBand]
     const nirO = image.bands[nirBand]
     const redC = result.bands[redBand]
@@ -398,12 +494,18 @@ export default function CompressionLab() {
     setError(null)
     setStatus('Saving to Supabase…')
     try {
-      const compressedBlob = await bandsToPngBlob(
-        result.bands,
-        result.bandOrder,
-        result.width,
-        result.height,
-      )
+      let compressedBlob: Blob
+      if (serverCompressedPreview) {
+        const res = await fetch(serverCompressedPreview)
+        compressedBlob = await res.blob()
+      } else {
+        compressedBlob = await bandsToPngBlob(
+          result.bands,
+          result.bandOrder,
+          result.width,
+          result.height,
+        )
+      }
       const saved = await saveCompressionRun({
         method: result.method,
         sourceFilename: image.filename,
@@ -413,6 +515,7 @@ export default function CompressionLab() {
           metadata: result.metadata,
           archiveMember: image.archiveMember ?? null,
           maxProcessDim,
+          engine,
           processSize: image.size,
           nativeSize: { width: image.nativeWidth, height: image.nativeHeight },
         },
@@ -467,14 +570,21 @@ export default function CompressionLab() {
           <p className="eyebrow">Earth Sensing · Matrix Imaging</p>
           <h1>ESMI Research</h1>
           <p className="lede">
-            Browser-side satellite compression lab — SVD, wavelet, bandwidth, and
-            JPEG-rate methods with NDVI checks. Supports TAR archives; heavy work
-            runs in a Web Worker so the page stays responsive.
+            Browser-side satellite compression lab with optional Google Cloud Run
+            backend for heavier jobs — SVD, wavelet, bandwidth, and JPEG2000, plus
+            TAR archives and NDVI checks.
           </p>
         </div>
         <div className="header-meta">
           <span className={`pill ${supabaseOk ? 'ok' : 'warn'}`}>
             {supabaseOk ? 'Supabase connected' : 'Supabase offline'}
+          </span>
+          <span className={`pill ${cloudRunOk ? 'ok' : 'warn'}`}>
+            {cloudRunOk
+              ? 'Cloud Run online'
+              : cloudRunConfigured
+                ? 'Cloud Run offline'
+                : 'Cloud Run unset'}
           </span>
         </div>
       </header>
@@ -554,6 +664,31 @@ export default function CompressionLab() {
             </label>
           )}
 
+          <h2>Engine</h2>
+          <select
+            value={engine}
+            onChange={(e) => {
+              const next = e.target.value as Engine
+              setEngine(next)
+              if (next === 'cloud-run' && maxProcessDim < 512) {
+                void onMaxDimChange(1024)
+              } else if (next === 'browser' && maxProcessDim > 768) {
+                void onMaxDimChange(384)
+              }
+            }}
+          >
+            <option value="browser">Browser (Web Worker)</option>
+            <option value="cloud-run" disabled={!cloudRunConfigured}>
+              Cloud Run {cloudRunOk ? '(online)' : cloudRunConfigured ? '(unreachable)' : '(not configured)'}
+            </option>
+          </select>
+          {!cloudRunConfigured && (
+            <p className="hint">
+              Set <code>COMPRESS_API_URL</code> on Vercel to enable Cloud Run. See{' '}
+              <code>cloud_run/README.md</code>.
+            </p>
+          )}
+
           <label>
             Max processing size (faster ← → sharper)
             <select
@@ -561,7 +696,10 @@ export default function CompressionLab() {
               disabled={busy}
               onChange={(e) => void onMaxDimChange(Number(e.target.value))}
             >
-              {PROCESS_DIM_OPTIONS.map((d) => (
+              {(engine === 'cloud-run'
+                ? PROCESS_DIM_OPTIONS_SERVER
+                : PROCESS_DIM_OPTIONS_BROWSER
+              ).map((d) => (
                 <option key={d} value={d}>
                   {d}px
                 </option>
@@ -682,13 +820,17 @@ export default function CompressionLab() {
           )}
 
           <div className="actions">
-            <button type="button" disabled={!image || busy} onClick={() => void onRun()}>
-              {busy ? 'Working…' : 'Run compression'}
+            <button type="button" disabled={!image || !rawFile || busy} onClick={() => void onRun()}>
+              {busy
+                ? 'Working…'
+                : engine === 'cloud-run'
+                  ? 'Run on Cloud Run'
+                  : 'Run compression'}
             </button>
             <button
               type="button"
               className="secondary"
-              disabled={!image || busy}
+              disabled={!image || busy || engine === 'cloud-run'}
               onClick={() => void onCompareAll()}
             >
               Compare all methods
