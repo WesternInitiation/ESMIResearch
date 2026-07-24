@@ -28,11 +28,11 @@ gcloud run deploy esmi-compress \
   --region "${REGION}" \
   --platform managed \
   --allow-unauthenticated \
-  --memory 1Gi \
+  --memory 2Gi \
   --cpu 1 \
-  --timeout 300 \
+  --timeout 600 \
   --max-instances 3 \
-  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024"
+  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648"
 
 URL="$(gcloud run services describe esmi-compress --region "${REGION}" --format='value(status.url)')"
 echo ""

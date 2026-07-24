@@ -24,6 +24,7 @@ import {
 import { compareNdvi, computeNdvi, type NdviMetrics } from '@/lib/ndvi'
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression } from '@/lib/serverCompress'
+import { MAX_INGEST_BYTES } from '@/lib/archive'
 import {
   COMPRESSION_METHODS,
   type CompressionMethod,
@@ -245,6 +246,14 @@ export default function CompressionLab() {
     setShareToken(null)
     setArchive(null)
     setArchiveMember('')
+    if (file.size > MAX_INGEST_BYTES) {
+      setError(
+        `File is ${(file.size / (1024 * 1024 * 1024)).toFixed(2)} GiB — ingest limit is ~2 GiB.`,
+      )
+      setStatus(null)
+      setImage(null)
+      return
+    }
     setBusy(true)
     setStatus('Loading…')
     try {
@@ -337,6 +346,13 @@ export default function CompressionLab() {
     setBusy(true)
 
     if (engine === 'cloud-run') {
+      if (rawFile.size > 30 * 1024 * 1024) {
+        setError(
+          'Cloud Run direct uploads are limited to ~30 MB by Google. Switch Engine → Browser for files up to ~2 GiB.',
+        )
+        setBusy(false)
+        return
+      }
       setStatus('Sending job to Cloud Run (cold start may take ~15s)…')
       try {
         const out = await runServerCompression({
@@ -639,7 +655,7 @@ export default function CompressionLab() {
         <aside className="panel controls">
           <h2>Source</h2>
           <label className="file">
-            <span>Upload GeoTIFF / PNG / JPEG / TAR / TAR.GZ</span>
+            <span>Upload GeoTIFF / PNG / JPEG / TAR / TAR.GZ (up to ~2 GiB)</span>
             <input
               type="file"
               accept=".tif,.tiff,.geotiff,.png,.jpg,.jpeg,.webp,.tar,.tar.gz,.tgz"

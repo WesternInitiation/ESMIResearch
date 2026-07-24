@@ -2,7 +2,9 @@ import { gunzipSync } from 'fflate'
 
 const IMAGE_EXT = /\.(tif|tiff|geotiff|png|jpe?g|webp)$/i
 const MAX_MEMBERS = 5000
-const MAX_EXPANDED_BYTES = 512 * 1024 * 1024
+/** Soft cap for expanded TAR contents / member payloads (~2 GiB). */
+export const MAX_INGEST_BYTES = 2 * 1024 * 1024 * 1024
+const MAX_EXPANDED_BYTES = MAX_INGEST_BYTES
 
 export function isTarArchive(filename: string): boolean {
   const name = filename.toLowerCase()
@@ -113,6 +115,9 @@ export function extractArchiveMember(
     match = entry
   }
   if (!match) throw new Error('The selected archive image is missing.')
+  if (match.size > MAX_INGEST_BYTES) {
+    throw new Error('The selected archive image is larger than the ~2 GiB ingest limit.')
+  }
   const slice = data.subarray(match.offset, match.offset + match.size)
   const copy = new Uint8Array(slice.byteLength)
   copy.set(slice)

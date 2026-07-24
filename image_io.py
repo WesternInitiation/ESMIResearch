@@ -41,10 +41,11 @@ class LoadedImage:
 
 SUPPORTED_IMAGE_SUFFIXES = (".tif", ".tiff", ".geotiff", ".png", ".jpg", ".jpeg", ".webp")
 SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
-MAX_ARCHIVE_IMAGE_BYTES = 1024 * 1024 * 1024
-MAX_ARCHIVE_EXPANDED_BYTES = 1024 * 1024 * 1024
+# Soft caps for in-memory ingest (TAR members / decoded rasters). ~2 GiB.
+MAX_ARCHIVE_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 2_048
-MAX_DECODED_IMAGE_BYTES = 1024 * 1024 * 1024
+MAX_DECODED_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def is_tar_archive(filename: str) -> bool:

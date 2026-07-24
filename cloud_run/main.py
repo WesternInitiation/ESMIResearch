@@ -56,7 +56,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(80 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
+# Cloud Run HTTP request bodies are capped by the platform at ~32 MiB.
+# Larger jobs should use the Browser engine (or a future object-storage URL flow).
+CLOUD_RUN_HTTP_MAX_BYTES = int(
+    os.environ.get("CLOUD_RUN_HTTP_MAX_BYTES", str(30 * 1024 * 1024))
+)
 DEFAULT_MAX_DIM = int(os.environ.get("DEFAULT_MAX_DIM", "1024"))
 
 
@@ -179,7 +184,15 @@ def _run_method(
 async def archive_list(file: UploadFile = File(...)) -> JSONResponse:
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Upload exceeds size limit")
+        raise HTTPException(status_code=413, detail="Upload exceeds size limit (~2 GiB)")
+    if len(raw) > CLOUD_RUN_HTTP_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Cloud Run direct uploads are limited to ~30 MB by the platform. "
+                "Use Engine → Browser for files up to ~2 GiB, or split the archive."
+            ),
+        )
     filename = file.filename or "upload.tar"
     if not is_tar_archive(filename):
         raise HTTPException(status_code=400, detail="File is not a TAR archive")
@@ -216,7 +229,15 @@ async def compress(
     if not raw:
         raise HTTPException(status_code=400, detail="Empty upload")
     if len(raw) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Upload exceeds size limit")
+        raise HTTPException(status_code=413, detail="Upload exceeds size limit (~2 GiB)")
+    if len(raw) > CLOUD_RUN_HTTP_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Cloud Run direct uploads are limited to ~30 MB by the platform. "
+                "Use Engine → Browser for files up to ~2 GiB, or split the archive."
+            ),
+        )
 
     filename = file.filename or "upload.bin"
     member = (archive_member or "").strip() or None

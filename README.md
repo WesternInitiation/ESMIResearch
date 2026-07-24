@@ -54,8 +54,8 @@ blocked by Vercel’s serverless body size limit.
 
 ## Features
 
-- Upload GeoTIFF, PNG, JPEG, or **TAR / TAR.GZ** archives
-- Engines: **Browser** (Web Worker) or **Cloud Run** (Python)
+- Upload GeoTIFF, PNG, JPEG, or **TAR / TAR.GZ** archives (**up to ~2 GiB** in the browser / Streamlit)
+- Engines: **Browser** (Web Worker, large files) or **Cloud Run** (Python; direct HTTP uploads ~30 MB max due to platform limits)
 - Methods: SVD, wavelet, bandwidth, JPEG2000
 - Per-band RMSE / MAE / PSNR / SSIM + optional NDVI
 - Optional Supabase save + shared run links
