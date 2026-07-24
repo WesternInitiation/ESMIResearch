@@ -371,6 +371,19 @@ th {
   font-size: 0.8rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+  vertical-align: top;
+}
+
+.th-blurb {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.68rem;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  line-height: 1.25;
+  color: color-mix(in oklab, var(--muted) 88%, transparent);
+  max-width: 9.5rem;
 }
 
 .ndvi-row {
@@ -398,6 +411,12 @@ th {
   font-size: 0.78rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.metric-grid .th-blurb {
+  margin-top: 0.15rem;
+  font-style: normal;
+  max-width: none;
 }
 
 .metric-grid strong {

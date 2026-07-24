@@ -1014,11 +1014,26 @@ export default function CompressionLab() {
               <table>
                 <thead>
                   <tr>
-                    <th>Band</th>
-                    <th>RMSE</th>
-                    <th>MAE</th>
-                    <th>PSNR</th>
-                    <th>SSIM</th>
+                    <th>
+                      Band
+                      <span className="th-blurb">Spectral channel</span>
+                    </th>
+                    <th title="Root Mean Square Error — average size of pixel differences (lower is better)">
+                      RMSE
+                      <span className="th-blurb">Root mean square error</span>
+                    </th>
+                    <th title="Mean Absolute Error — average absolute pixel difference (lower is better)">
+                      MAE
+                      <span className="th-blurb">Mean absolute error</span>
+                    </th>
+                    <th title="Peak Signal-to-Noise Ratio in decibels — higher means closer to the original">
+                      PSNR (dB)
+                      <span className="th-blurb">Peak signal-to-noise ratio</span>
+                    </th>
+                    <th title="Structural Similarity Index — how alike structure/texture look (1 is identical)">
+                      SSIM
+                      <span className="th-blurb">Structural similarity</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1326,11 +1341,26 @@ export default function CompressionLab() {
               <table>
                 <thead>
                   <tr>
-                    <th>Band</th>
-                    <th>RMSE</th>
-                    <th>MAE</th>
-                    <th>PSNR (dB)</th>
-                    <th>SSIM</th>
+                    <th>
+                      Band
+                      <span className="th-blurb">Spectral channel</span>
+                    </th>
+                    <th title="Root Mean Square Error — average size of pixel differences (lower is better)">
+                      RMSE
+                      <span className="th-blurb">Root mean square error</span>
+                    </th>
+                    <th title="Mean Absolute Error — average absolute pixel difference (lower is better)">
+                      MAE
+                      <span className="th-blurb">Mean absolute error</span>
+                    </th>
+                    <th title="Peak Signal-to-Noise Ratio in decibels — higher means closer to the original">
+                      PSNR (dB)
+                      <span className="th-blurb">Peak signal-to-noise ratio</span>
+                    </th>
+                    <th title="Structural Similarity Index — how alike structure/texture look (1 is identical)">
+                      SSIM
+                      <span className="th-blurb">Structural similarity</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1563,32 +1593,47 @@ export default function CompressionLab() {
               </button>
             </div>
             <div className="metric-grid">
-              <div>
-                <span>RMSE</span>
+              <div title="Root Mean Square Error — average size of index differences (lower is better)">
+                <span>
+                  RMSE
+                  <em className="th-blurb">Root mean square error</em>
+                </span>
                 <strong className={indexMetrics ? undefined : 'placeholder'}>
                   {indexMetrics ? fmt(indexMetrics.rmse) : '—'}
                 </strong>
               </div>
-              <div>
-                <span>MAE</span>
+              <div title="Mean Absolute Error — average absolute index difference (lower is better)">
+                <span>
+                  MAE
+                  <em className="th-blurb">Mean absolute error</em>
+                </span>
                 <strong className={indexMetrics ? undefined : 'placeholder'}>
                   {indexMetrics ? fmt(indexMetrics.mae) : '—'}
                 </strong>
               </div>
-              <div>
-                <span>Corr</span>
+              <div title="Pearson correlation between original and reconstructed index maps">
+                <span>
+                  Corr
+                  <em className="th-blurb">Pearson correlation</em>
+                </span>
                 <strong className={indexMetrics ? undefined : 'placeholder'}>
                   {indexMetrics ? fmt(indexMetrics.correlation, 3) : '—'}
                 </strong>
               </div>
-              <div>
-                <span>SSIM</span>
+              <div title="Structural Similarity Index — how alike structure/texture look (1 is identical)">
+                <span>
+                  SSIM
+                  <em className="th-blurb">Structural similarity</em>
+                </span>
                 <strong className={indexMetrics ? undefined : 'placeholder'}>
                   {indexMetrics ? fmt(indexMetrics.ssim, 3) : '—'}
                 </strong>
               </div>
-              <div>
-                <span>Bias</span>
+              <div title="Mean signed difference (reconstructed − original); near zero is ideal">
+                <span>
+                  Bias
+                  <em className="th-blurb">Mean signed difference</em>
+                </span>
                 <strong className={indexMetrics ? undefined : 'placeholder'}>
                   {indexMetrics ? fmt(indexMetrics.bias) : '—'}
                 </strong>
