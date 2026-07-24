@@ -22,7 +22,7 @@ import {
 } from '@/lib/preview'
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression } from '@/lib/serverCompress'
-import { MAX_INGEST_BYTES } from '@/lib/archive'
+import { MAX_INGEST_BYTES, extractArchiveMember } from '@/lib/archive'
 import {
   bandsToPngBlob,
   inspectUpload,
@@ -703,20 +703,60 @@ export default function CompressionLab() {
     setBusy(true)
 
     if (engine === 'cloud-run') {
-      if (rawFile.size > 30 * 1024 * 1024) {
-        setError(
-          'Cloud Run direct uploads are limited to ~30 MB by Google. Switch Engine → Browser for files up to ~2 GiB.',
-        )
-        setBusy(false)
-        return
-      }
-      setStatus('Sending job to Cloud Run (cold start may take ~15s)…')
       try {
+        // Prefer the selected TAR member only — never upload the whole archive.
+        let uploadFile: Blob = rawFile
+        let uploadName = rawFile.name
+        let usedMember: string | null = null
+
+        if (archive) {
+          const memberPath =
+            archiveMember && !archiveMember.includes(' + ')
+              ? archiveMember
+              : image.archiveMember && !image.archiveMember.includes(' + ')
+                ? image.archiveMember
+                : ''
+          if (!memberPath) {
+            setError(
+              'Pick a single archive image to send to Cloud Run (or use Browser for multi-band TAR pairs).',
+            )
+            setBusy(false)
+            return
+          }
+          setStatus(`Extracting ${memberPath.split('/').pop()} from archive…`)
+          const { bytes, memberFilename } = extractArchiveMember(
+            archive.buffer,
+            archive.archiveName,
+            memberPath,
+          )
+          uploadFile = new File([new Uint8Array(bytes)], memberFilename, {
+            type: 'application/octet-stream',
+          })
+          uploadName = memberFilename
+          usedMember = memberPath
+        }
+
+        // Path B goes through Vercel (~4.5 MB). Direct Cloud Run HTTP/1 is ~32 MB.
+        const uploadLimit = 4.5 * 1024 * 1024
+        if (uploadFile.size > uploadLimit) {
+          setError(
+            `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB — Cloud Run via Vercel is limited to ~4.5 MB. Switch Engine → Browser for larger files (up to ~2 GiB).`,
+          )
+          setBusy(false)
+          return
+        }
+
+        setStatus(
+          usedMember
+            ? `Sending ${uploadName} to Cloud Run (cold start may take ~15s)…`
+            : 'Sending job to Cloud Run (cold start may take ~15s)…',
+        )
         const out = await runServerCompression({
-          file: rawFile,
-          filename: rawFile.name,
+          file: uploadFile,
+          filename: uploadName,
           method,
-          archiveMember: archive ? archiveMember : null,
+          // Member already extracted client-side — do not re-send the TAR.
+          archiveMember: null,
           maxDim: maxProcessDim,
           svdRank: params.svdRank,
           waveletKeepFraction: params.waveletKeepFraction,
@@ -752,7 +792,11 @@ export default function CompressionLab() {
           compressedBytesEstimate: out.compressedBytesEstimate,
           compressionRatio: out.compressionRatio,
           channelReports: out.channelReports,
-          metadata: { ...out.metadata, engine: out.engine },
+          metadata: {
+            ...out.metadata,
+            engine: out.engine,
+            ...(usedMember ? { archiveMemberUploaded: usedMember } : {}),
+          },
         })
         if (out.ndvi) {
           setIndexMetrics({
@@ -1120,8 +1164,8 @@ export default function CompressionLab() {
           )}
           {cloudRunConfigured && cloudRunOk && (
             <p className="hint">
-              Cloud Run goes through Vercel (~4.5&nbsp;MB upload cap). Use Browser engine for
-              large TAR/GeoTIFF files.
+              Cloud Run uploads the selected image only (TAR members are extracted in-browser).
+              Via Vercel the body cap is ~4.5&nbsp;MB — use Browser for large files.
             </p>
           )}
 
