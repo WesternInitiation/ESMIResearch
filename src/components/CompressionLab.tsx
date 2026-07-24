@@ -65,8 +65,8 @@ const DEFAULT_PARAMS: MethodParams = {
   jpegRate: 0.45,
 }
 
-const PROCESS_DIM_OPTIONS_BROWSER = [256, 384, 512, 768] as const
-const PROCESS_DIM_OPTIONS_SERVER = [512, 768, 1024, 1536, 2048] as const
+const PROCESS_DIM_OPTIONS_BROWSER = [512, 768, 1024, 1536, 2048, 3072, 4096] as const
+const PROCESS_DIM_OPTIONS_SERVER = [1024, 1536, 2048, 3072, 4096, 6144, 8192] as const
 
 type Engine = 'browser' | 'cloud-run'
 
@@ -99,7 +99,7 @@ export default function CompressionLab() {
   const [rawFile, setRawFile] = useState<File | null>(null)
   const [archive, setArchive] = useState<ArchiveSelection | null>(null)
   const [archiveMember, setArchiveMember] = useState<string>('')
-  const [maxProcessDim, setMaxProcessDim] = useState<number>(384)
+  const [maxProcessDim, setMaxProcessDim] = useState<number>(1024)
   const [engine, setEngine] = useState<Engine>('browser')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
@@ -680,10 +680,10 @@ export default function CompressionLab() {
             onChange={(e) => {
               const next = e.target.value as Engine
               setEngine(next)
-              if (next === 'cloud-run' && maxProcessDim < 512) {
+              if (next === 'cloud-run' && maxProcessDim < 1024) {
+                void onMaxDimChange(2048)
+              } else if (next === 'browser' && maxProcessDim > 4096) {
                 void onMaxDimChange(1024)
-              } else if (next === 'browser' && maxProcessDim > 768) {
-                void onMaxDimChange(384)
               }
             }}
           >
