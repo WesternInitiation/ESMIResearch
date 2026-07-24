@@ -135,25 +135,65 @@ gcloud run deploy esmi-compress \
 
 ## Step 4 — Connect Vercel to Cloud Run
 
-1. Open your project on [vercel.com](https://vercel.com).
-2. Go to **Settings → Environment Variables**.
-3. Add:
+### Path A — Public service (`allUsers` allowed)
+
+Only if this works:
+
+```bash
+gcloud run services add-iam-policy-binding esmi-compress \
+  --region=us-central1 \
+  --member="allUsers" \
+  --role="roles/run.invoker"
+```
+
+Then on Vercel set `COMPRESS_API_URL` to your service URL and redeploy.
+
+### Path B — Private service (school/org policy blocks `allUsers`)
+
+Many university GCP orgs reject `allUsers`. Use a **service account** instead.
+The browser talks to Vercel `/api/compress`; Vercel calls Cloud Run with an ID token.
+
+1. Create a service account (Windows Cloud SDK / Cloud Shell):
+
+```bash
+gcloud iam service-accounts create esmi-vercel \
+  --display-name="ESMI Vercel proxy"
+```
+
+2. Allow it to invoke Cloud Run:
+
+```bash
+gcloud run services add-iam-policy-binding esmi-compress \
+  --region=us-central1 \
+  --member="serviceAccount:esmi-vercel@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/run.invoker"
+```
+
+Replace `YOUR_PROJECT_ID` (example: `esmi-research`).
+
+3. Create a JSON key and download it:
+
+```bash
+gcloud iam service-accounts keys create esmi-vercel-key.json \
+  --iam-account=esmi-vercel@YOUR_PROJECT_ID.iam.gserviceaccount.com
+```
+
+4. On [vercel.com](https://vercel.com) → your project → **Settings → Environment Variables**, add:
 
 | Name | Value | Environments |
 |------|--------|----------------|
-| `NEXT_PUBLIC_COMPRESS_API_URL` | `https://esmi-compress-xxxxx-uc.a.run.app` | Production, Preview, Development |
+| `COMPRESS_API_URL` | `https://esmi-compress-xxxxx-uc.a.run.app` | Production, Preview, Development |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | **entire contents** of `esmi-vercel-key.json` (one line / pasted JSON) | Production, Preview, Development |
 
-Use **your** URL from Step 3 (no trailing slash).
+Remove `NEXT_PUBLIC_COMPRESS_API_URL` if you added it earlier (not needed for Path B).
 
-Optional (same URL): `COMPRESS_API_URL` — only needed for the Next.js
-`/api/compress` proxy; the UI prefers the public URL for large uploads.
+5. **Redeploy** (**Deployments → ⋯ → Redeploy**).
 
-4. **Redeploy** so the new env var is baked into the client bundle:
-   - **Deployments** → latest deployment → **⋯ → Redeploy**  
-   - or push a new commit to `main`
+6. Delete the local key file when done (`del esmi-vercel-key.json` on Windows) and
+   never commit it to git.
 
-`NEXT_PUBLIC_…` variables are embedded at **build** time. Changing them without
-redeploying will not update the live site.
+**Upload size:** Path B is limited by Vercel’s serverless body size (~4.5&nbsp;MB).
+Use **Engine → Browser** for large archives.
 
 ---
 
@@ -161,9 +201,10 @@ redeploying will not update the live site.
 
 1. Open your Vercel site.
 2. Confirm the header pill says **Cloud Run online** (green).  
-   If it says **unset**, the env var wasn’t set or you didn’t redeploy.  
-   If it says **offline**, the URL is wrong or the service failed health checks.
-3. Upload an image or TAR archive.
+   If it says **unset**, `COMPRESS_API_URL` wasn’t set or you didn’t redeploy.  
+   If it says **offline**, the URL is wrong, the SA lacks Invoker, or
+   `GOOGLE_SERVICE_ACCOUNT_JSON` is missing/invalid.
+3. Upload a **small** image (under ~4&nbsp;MB for Cloud Run via Vercel).
 4. Set **Engine → Cloud Run**.
 5. Optionally raise **Max processing size** (512–2048px).
 6. Click **Run on Cloud Run**.
@@ -203,9 +244,10 @@ npm run dev
 |---------|-------------|
 | `Permission denied` on deploy | Re-run `gcloud auth login`; confirm project ID; check IAM for Cloud Build |
 | Build fails on Dockerfile | Run deploy from **repo root**, not from inside `cloud_run/` |
-| Vercel pill: Cloud Run unset | Set `NEXT_PUBLIC_COMPRESS_API_URL` and **redeploy** |
-| Vercel pill: offline | Open `YOUR_URL/health` in a browser; fix Cloud Run service / region |
-| CORS errors in browser console | Redeploy Cloud Run with `CORS_ORIGINS=*` (deploy script already sets this) |
+| Vercel pill: Cloud Run unset | Set `COMPRESS_API_URL` (+ SA JSON for private) and **redeploy** |
+| Vercel pill: offline / unreachable | Check SA has `roles/run.invoker`; verify `GOOGLE_SERVICE_ACCOUNT_JSON` is valid full JSON |
+| `allUsers` IAM fails (org policy) | Use Path B (service account) instead of public access |
+| CORS errors in browser console | Path B avoids browser→Cloud Run; use `/api/compress` proxy |
 | Timeout on huge files | Lower max processing size, or raise Cloud Run `--timeout` / memory |
 | Unexpected charges | Set a budget alert; keep `--max-instances 3`; delete unused projects |
 

@@ -1114,8 +1114,14 @@ export default function CompressionLab() {
           </select>
           {!cloudRunConfigured && (
             <p className="hint">
-              Set <code>COMPRESS_API_URL</code> on Vercel to enable Cloud Run. See{' '}
-              <code>cloud_run/README.md</code>.
+              Set <code>COMPRESS_API_URL</code> + <code>GOOGLE_SERVICE_ACCOUNT_JSON</code> on
+              Vercel (private Cloud Run). See <code>cloud_run/README.md</code>.
+            </p>
+          )}
+          {cloudRunConfigured && cloudRunOk && (
+            <p className="hint">
+              Cloud Run goes through Vercel (~4.5&nbsp;MB upload cap). Use Browser engine for
+              large TAR/GeoTIFF files.
             </p>
           )}
 

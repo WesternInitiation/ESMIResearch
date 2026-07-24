@@ -32,26 +32,15 @@ export type ServerCompressResponse = {
   previewPngBase64: string
 }
 
-function publicApiBase(): string | null {
-  const url = process.env.NEXT_PUBLIC_COMPRESS_API_URL?.trim()
-  if (!url) return null
-  return url.replace(/\/$/, '')
-}
-
+/**
+ * Cloud Run is reached only via the Next.js /api/compress proxy so private
+ * services (org policy blocking allUsers) can authenticate with a service account.
+ * Note: Vercel serverless request bodies are capped (~4.5MB on hobby).
+ */
 export async function fetchCloudRunStatus(): Promise<{
   configured: boolean
   urlConfigured: boolean
 }> {
-  const direct = publicApiBase()
-  if (direct) {
-    try {
-      const res = await fetch(`${direct}/health`, { cache: 'no-store' })
-      return { configured: res.ok, urlConfigured: true }
-    } catch {
-      return { configured: false, urlConfigured: true }
-    }
-  }
-
   const res = await fetch('/api/compress', { cache: 'no-store' })
   if (!res.ok) return { configured: false, urlConfigured: false }
   const data = (await res.json()) as {
@@ -91,12 +80,7 @@ export async function runServerCompression(input: {
   if (input.redBand) form.set('red_band', input.redBand)
   if (input.nirBand) form.set('nir_band', input.nirBand)
 
-  // Prefer calling Cloud Run directly from the browser so large TAR/GeoTIFF
-  // uploads are not capped by Vercel serverless body limits (~4.5MB).
-  const direct = publicApiBase()
-  const endpoint = direct ? `${direct}/v1/compress` : '/api/compress'
-
-  const res = await fetch(endpoint, { method: 'POST', body: form })
+  const res = await fetch('/api/compress', { method: 'POST', body: form })
   const data = await res.json()
   if (!res.ok) {
     const detail = data.detail
