@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { cloudRunAuthHeaders } from '@/lib/cloudRunAuth'
-import { gcsUploadsConfigured } from '@/lib/gcs'
+import { getGcsConfigStatus } from '@/lib/gcs'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -11,13 +11,24 @@ function apiBase(): string | null {
   return url.replace(/\/$/, '')
 }
 
+function gcsFields() {
+  const gcs = getGcsConfigStatus()
+  return {
+    gcsUploads: gcs.configured,
+    gcsBucketConfigured: gcs.bucketConfigured,
+    gcsAuthConfigured: gcs.authConfigured,
+    gcsAuthValid: gcs.authValid,
+    gcsBucket: gcs.bucket,
+  }
+}
+
 export async function GET() {
   const base = apiBase()
   if (!base) {
     return NextResponse.json({
       configured: false,
       urlConfigured: false,
-      gcsUploads: gcsUploadsConfigured(),
+      ...gcsFields(),
     })
   }
   try {
@@ -30,8 +41,8 @@ export async function GET() {
       health: body,
       urlConfigured: true,
       authConfigured: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim()),
-      gcsUploads: gcsUploadsConfigured(),
       upstreamStatus: res.status,
+      ...gcsFields(),
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Health check failed'
@@ -39,8 +50,8 @@ export async function GET() {
       configured: false,
       urlConfigured: true,
       authConfigured: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim()),
-      gcsUploads: gcsUploadsConfigured(),
       error: message,
+      ...gcsFields(),
     })
   }
 }

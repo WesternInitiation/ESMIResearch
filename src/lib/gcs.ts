@@ -20,8 +20,39 @@ export function gcsUploadBucket(): string | null {
   return name || null
 }
 
+export type GcsConfigStatus = {
+  configured: boolean
+  bucketConfigured: boolean
+  authConfigured: boolean
+  authValid: boolean
+  bucket: string | null
+}
+
+/** Safe status probe — never throws (invalid JSON → authValid false). */
+export function getGcsConfigStatus(): GcsConfigStatus {
+  const bucket = gcsUploadBucket()
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON?.trim() || ''
+  const authConfigured = Boolean(raw)
+  let authValid = false
+  if (authConfigured) {
+    try {
+      JSON.parse(raw)
+      authValid = true
+    } catch {
+      authValid = false
+    }
+  }
+  return {
+    configured: Boolean(bucket && authConfigured && authValid),
+    bucketConfigured: Boolean(bucket),
+    authConfigured,
+    authValid,
+    bucket,
+  }
+}
+
 export function gcsUploadsConfigured(): boolean {
-  return Boolean(gcsUploadBucket() && serviceAccountCredentials())
+  return getGcsConfigStatus().configured
 }
 
 function storageClient(): Storage {

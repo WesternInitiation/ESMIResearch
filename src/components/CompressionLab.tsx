@@ -136,6 +136,7 @@ export default function CompressionLab() {
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
   const [gcsUploads, setGcsUploads] = useState(false)
+  const [gcsStatusHint, setGcsStatusHint] = useState<string>('not configured yet')
   const [serverOriginalPreview, setServerOriginalPreview] = useState<string | null>(null)
   const [compressedArtifactPreview, setCompressedArtifactPreview] = useState<string | null>(
     null,
@@ -255,10 +256,24 @@ export default function CompressionLab() {
         setCloudRunConfigured(status.urlConfigured)
         setCloudRunOk(status.configured)
         setGcsUploads(status.gcsUploads)
+        if (status.gcsUploads) {
+          setGcsStatusHint(`ready (${status.gcsBucket})`)
+        } else if (!status.gcsBucketConfigured && !status.gcsAuthConfigured) {
+          setGcsStatusHint('missing GCS_UPLOAD_BUCKET and GOOGLE_SERVICE_ACCOUNT_JSON')
+        } else if (!status.gcsBucketConfigured) {
+          setGcsStatusHint('missing GCS_UPLOAD_BUCKET on this Vercel deployment')
+        } else if (!status.gcsAuthConfigured) {
+          setGcsStatusHint('missing GOOGLE_SERVICE_ACCOUNT_JSON on this Vercel deployment')
+        } else if (!status.gcsAuthValid) {
+          setGcsStatusHint('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON')
+        } else {
+          setGcsStatusHint('not configured yet')
+        }
       } catch {
         setCloudRunConfigured(false)
         setCloudRunOk(false)
         setGcsUploads(false)
+        setGcsStatusHint('status check failed')
       }
     })()
   }, [])
@@ -1182,7 +1197,9 @@ export default function CompressionLab() {
               Large Cloud Run jobs (80–100+&nbsp;MB) upload via GCS when{' '}
               <code>GCS_UPLOAD_BUCKET</code> is set. NDVI/NDWI compare stays local; multi-band TAR
               pairs auto-use the browser. Compare-all requires Engine → Browser.
-              {gcsUploads ? ' GCS uploads: ready.' : ' GCS uploads: not configured yet.'}
+              {gcsUploads
+                ? ` GCS uploads: ${gcsStatusHint}.`
+                : ` GCS uploads: ${gcsStatusHint}.`}
             </p>
           )}
 

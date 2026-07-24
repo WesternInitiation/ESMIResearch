@@ -44,18 +44,40 @@ export async function fetchCloudRunStatus(): Promise<{
   configured: boolean
   urlConfigured: boolean
   gcsUploads: boolean
+  gcsBucketConfigured: boolean
+  gcsAuthConfigured: boolean
+  gcsAuthValid: boolean
+  gcsBucket: string | null
 }> {
   const res = await fetch('/api/compress', { cache: 'no-store' })
-  if (!res.ok) return { configured: false, urlConfigured: false, gcsUploads: false }
+  if (!res.ok) {
+    return {
+      configured: false,
+      urlConfigured: false,
+      gcsUploads: false,
+      gcsBucketConfigured: false,
+      gcsAuthConfigured: false,
+      gcsAuthValid: false,
+      gcsBucket: null,
+    }
+  }
   const data = (await res.json()) as {
     configured?: boolean
     urlConfigured?: boolean
     gcsUploads?: boolean
+    gcsBucketConfigured?: boolean
+    gcsAuthConfigured?: boolean
+    gcsAuthValid?: boolean
+    gcsBucket?: string | null
   }
   return {
     configured: Boolean(data.configured),
     urlConfigured: Boolean(data.urlConfigured),
     gcsUploads: Boolean(data.gcsUploads),
+    gcsBucketConfigured: Boolean(data.gcsBucketConfigured),
+    gcsAuthConfigured: Boolean(data.gcsAuthConfigured),
+    gcsAuthValid: data.gcsAuthValid !== false,
+    gcsBucket: data.gcsBucket ?? null,
   }
 }
 
