@@ -12,28 +12,33 @@ function compressBandSvd(
   height: number,
   options: SvdOptions,
 ): { reconstructed: Float64Array; rankUsed: number; energyRetained: number } {
-  const matrixData: number[][] = []
-  for (let y = 0; y < height; y++) {
-    const row: number[] = []
-    for (let x = 0; x < width; x++) row.push(band[y * width + x])
-    matrixData.push(row)
-  }
-
   let offset = 0
   let scale = 1
+  const matrixData: number[][] = new Array(height)
   if (options.normalize !== false) {
     let min = Infinity
     let max = -Infinity
-    for (const v of band) {
+    for (let i = 0; i < band.length; i++) {
+      const v = band[i]
       if (v < min) min = v
       if (v > max) max = v
     }
     offset = min
     scale = max - min || 1
     for (let y = 0; y < height; y++) {
+      const row = new Array(width)
+      const rowBase = y * width
       for (let x = 0; x < width; x++) {
-        matrixData[y][x] = (matrixData[y][x] - offset) / scale
+        row[x] = (band[rowBase + x] - offset) / scale
       }
+      matrixData[y] = row
+    }
+  } else {
+    for (let y = 0; y < height; y++) {
+      const row = new Array(width)
+      const rowBase = y * width
+      for (let x = 0; x < width; x++) row[x] = band[rowBase + x]
+      matrixData[y] = row
     }
   }
 
@@ -41,34 +46,21 @@ function compressBandSvd(
   const svd = new SVD(matrix, { autoTranspose: true })
   const singularValues = svd.diagonal
   const totalEnergy = singularValues.reduce((s, v) => s + v * v, 0)
-  const maxRank = Math.min(options.rank, singularValues.length)
+  const maxRank = Math.max(1, Math.min(options.rank, singularValues.length))
   let energy = 0
   for (let i = 0; i < maxRank; i++) energy += singularValues[i] * singularValues[i]
   const energyRetained = totalEnergy > 0 ? energy / totalEnergy : 0
 
-  const U = svd.leftSingularVectors
-  const V = svd.rightSingularVectors
-  const s = singularValues
-  const reconstructedMatrix = Matrix.zeros(height, width)
-  for (let k = 0; k < maxRank; k++) {
-    const uk = U.getColumn(k)
-    const vk = V.getColumn(k)
-    const sk = s[k]
-    for (let i = 0; i < height; i++) {
-      for (let j = 0; j < width; j++) {
-        reconstructedMatrix.set(
-          i,
-          j,
-          reconstructedMatrix.get(i, j) + sk * uk[i] * vk[j],
-        )
-      }
-    }
-  }
+  const U = svd.leftSingularVectors.subMatrix(0, height - 1, 0, maxRank - 1)
+  const V = svd.rightSingularVectors.subMatrix(0, width - 1, 0, maxRank - 1)
+  const S = Matrix.diag(singularValues.slice(0, maxRank))
+  const reconstructedMatrix = U.mmul(S).mmul(V.transpose())
 
   const out = new Float64Array(width * height)
   let bmin = Infinity
   let bmax = -Infinity
-  for (const v of band) {
+  for (let i = 0; i < band.length; i++) {
+    const v = band[i]
     if (v < bmin) bmin = v
     if (v > bmax) bmax = v
   }

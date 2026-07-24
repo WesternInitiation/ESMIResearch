@@ -1,4 +1,9 @@
 import { fromArrayBuffer } from 'geotiff'
+import {
+  extractArchiveMember,
+  isTarArchive,
+  listArchiveImages,
+} from './archive'
 import type { BandMap, ImageSize } from './types'
 
 export type LoadedImage = {
@@ -9,6 +14,13 @@ export type LoadedImage = {
   originalBytes: number
   previewRgba: Uint8ClampedArray
   filename: string
+  archiveMember?: string
+}
+
+export type ArchiveSelection = {
+  buffer: ArrayBuffer
+  archiveName: string
+  members: string[]
 }
 
 function normalizeBandNames(count: number): string[] {
@@ -19,10 +31,15 @@ function normalizeBandNames(count: number): string[] {
 }
 
 function percentileStretch(channel: Float64Array): Uint8ClampedArray {
-  const copy = Float64Array.from(channel)
-  copy.sort()
-  const lo = copy[Math.floor(copy.length * 0.02)]
-  const hi = copy[Math.floor(copy.length * 0.98)]
+  // Sample for speed on large rasters instead of sorting every pixel.
+  const n = channel.length
+  const sampleCount = Math.min(n, 20000)
+  const step = Math.max(1, Math.floor(n / sampleCount))
+  const sample: number[] = []
+  for (let i = 0; i < n; i += step) sample.push(channel[i])
+  sample.sort((a, b) => a - b)
+  const lo = sample[Math.floor(sample.length * 0.02)] ?? 0
+  const hi = sample[Math.floor(sample.length * 0.98)] ?? 1
   const out = new Uint8ClampedArray(channel.length)
   const scale = hi > lo ? 255 / (hi - lo) : 1
   for (let i = 0; i < channel.length; i++) {
@@ -66,13 +83,48 @@ export function toPreviewRgba(
   return rgba
 }
 
+export async function inspectUpload(
+  file: File,
+): Promise<{ kind: 'image'; file: File } | { kind: 'archive'; selection: ArchiveSelection }> {
+  const buffer = await file.arrayBuffer()
+  if (isTarArchive(file.name)) {
+    const members = listArchiveImages(buffer, file.name)
+    return {
+      kind: 'archive',
+      selection: { buffer, archiveName: file.name, members },
+    }
+  }
+  return { kind: 'image', file }
+}
+
+export async function loadArchiveMemberImage(
+  selection: ArchiveSelection,
+  memberName: string,
+): Promise<LoadedImage> {
+  const { bytes, memberFilename } = extractArchiveMember(
+    selection.buffer,
+    selection.archiveName,
+    memberName,
+  )
+  const loaded = await loadImageBuffer(bytes, memberFilename, bytes.byteLength)
+  return { ...loaded, archiveMember: memberName, filename: `${selection.archiveName} → ${memberFilename}` }
+}
+
 export async function loadImageFile(file: File): Promise<LoadedImage> {
   const buffer = await file.arrayBuffer()
-  const name = file.name.toLowerCase()
+  return loadImageBuffer(buffer, file.name, file.size)
+}
+
+export async function loadImageBuffer(
+  buffer: ArrayBuffer,
+  filename: string,
+  originalBytes: number,
+): Promise<LoadedImage> {
+  const name = filename.toLowerCase()
   if (name.endsWith('.tif') || name.endsWith('.tiff') || name.endsWith('.geotiff')) {
-    return loadGeoTiff(buffer, file.name, file.size)
+    return loadGeoTiff(buffer, filename, originalBytes)
   }
-  return loadRasterViaCanvas(buffer, file.name, file.size)
+  return loadRasterViaCanvas(buffer, filename, originalBytes)
 }
 
 async function loadGeoTiff(
@@ -133,6 +185,7 @@ async function loadRasterViaCanvas(
     green[p] = data[i + 1]
     blue[p] = data[i + 2]
   }
+  bitmap.close?.()
   const bands: BandMap = { red, green, blue }
   const bandOrder = ['red', 'green', 'blue']
   return {

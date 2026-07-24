@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState, useTransition } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   attachNdviToRun,
   fetchSupabaseStatus,
@@ -9,15 +9,20 @@ import {
   saveCompressionRun,
   type SharedRunSummary,
 } from '@/lib/api'
-import { runCompression, type MethodParams } from '@/lib/compression'
+import { runCompressionAsync } from '@/lib/compressClient'
+import type { MethodParams } from '@/lib/compression'
 import {
   bandsToPngBlob,
+  inspectUpload,
+  loadArchiveMemberImage,
   loadImageFile,
   rgbaToDataUrl,
   toPreviewRgba,
+  type ArchiveSelection,
   type LoadedImage,
 } from '@/lib/image'
 import { compareNdvi, computeNdvi, type NdviMetrics } from '@/lib/ndvi'
+import { downsampleBands } from '@/lib/resize'
 import {
   COMPRESSION_METHODS,
   type CompressionMethod,
@@ -33,6 +38,12 @@ type CompareRow = {
   meanSsim: number
 }
 
+type WorkingImage = LoadedImage & {
+  nativeWidth: number
+  nativeHeight: number
+  processScale: number
+}
+
 function fmt(n: number, digits = 4): string {
   if (!Number.isFinite(n)) return '—'
   return n.toPrecision(digits)
@@ -45,22 +56,50 @@ function bytesLabel(n: number): string {
 }
 
 const DEFAULT_PARAMS: MethodParams = {
-  svdRank: 32,
+  svdRank: 24,
   waveletKeepFraction: 0.08,
   waveletLevels: 3,
   bandwidthKeepFraction: 0.12,
   jpegRate: 0.45,
 }
 
+const PROCESS_DIM_OPTIONS = [256, 384, 512, 768] as const
+
+function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
+  const resized = downsampleBands(
+    loaded.bands,
+    loaded.bandOrder,
+    loaded.size.width,
+    loaded.size.height,
+    maxDim,
+  )
+  return {
+    ...loaded,
+    bands: resized.bands,
+    size: { width: resized.width, height: resized.height },
+    previewRgba: toPreviewRgba(
+      resized.bands,
+      loaded.bandOrder,
+      resized.width,
+      resized.height,
+    ),
+    nativeWidth: loaded.size.width,
+    nativeHeight: loaded.size.height,
+    processScale: resized.scale,
+  }
+}
+
 export default function CompressionLab() {
-  const [image, setImage] = useState<LoadedImage | null>(null)
+  const [image, setImage] = useState<WorkingImage | null>(null)
   const [rawFile, setRawFile] = useState<File | null>(null)
+  const [archive, setArchive] = useState<ArchiveSelection | null>(null)
+  const [archiveMember, setArchiveMember] = useState<string>('')
+  const [maxProcessDim, setMaxProcessDim] = useState<number>(384)
   const [method, setMethod] = useState<CompressionMethod>('SVD')
   const [params, setParams] = useState<MethodParams>(DEFAULT_PARAMS)
   const [result, setResult] = useState<CompressionResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState<string | null>(null)
-  const [pending, startTransition] = useTransition()
   const [busy, setBusy] = useState(false)
 
   const [redBand, setRedBand] = useState('red')
@@ -152,6 +191,22 @@ export default function CompressionLab() {
     else if (order.length > 1) setNirBand(order[Math.min(3, order.length - 1)])
   }, [image])
 
+  async function applyLoaded(loaded: LoadedImage, file: File | null) {
+    const working = toWorkingImage(loaded, maxProcessDim)
+    setImage(working)
+    setRawFile(file)
+    setResult(null)
+    setNdvi(null)
+    setCompareRows(null)
+    const scaledNote =
+      working.processScale < 1
+        ? ` · processing at ${working.size.width}×${working.size.height}`
+        : ''
+    setStatus(
+      `Loaded ${working.filename} · native ${working.nativeWidth}×${working.nativeHeight}${scaledNote} · ${working.bandOrder.length} bands`,
+    )
+  }
+
   async function onFile(file: File | null) {
     if (!file) return
     setError(null)
@@ -160,101 +215,165 @@ export default function CompressionLab() {
     setCompareRows(null)
     setSharedView(null)
     setShareToken(null)
+    setArchive(null)
+    setArchiveMember('')
     setBusy(true)
-    setStatus('Loading image…')
+    setStatus('Loading…')
     try {
-      const loaded = await loadImageFile(file)
-      setImage(loaded)
-      setRawFile(file)
-      setStatus(
-        `Loaded ${loaded.filename} · ${loaded.size.width}×${loaded.size.height} · ${loaded.bandOrder.length} bands`,
-      )
+      const inspected = await inspectUpload(file)
+      if (inspected.kind === 'archive') {
+        setArchive(inspected.selection)
+        const first = inspected.selection.members[0]
+        setArchiveMember(first)
+        setStatus(
+          `Archive ${file.name}: ${inspected.selection.members.length} image(s). Select one to load.`,
+        )
+        const loaded = await loadArchiveMemberImage(inspected.selection, first)
+        await applyLoaded(loaded, file)
+      } else {
+        const loaded = await loadImageFile(file)
+        await applyLoaded(loaded, file)
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load image')
+      setError(err instanceof Error ? err.message : 'Failed to load file')
+      setStatus(null)
+      setImage(null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onArchiveMemberChange(member: string) {
+    if (!archive) return
+    setArchiveMember(member)
+    setBusy(true)
+    setError(null)
+    setStatus(`Loading ${member}…`)
+    try {
+      const loaded = await loadArchiveMemberImage(archive, member)
+      await applyLoaded(loaded, rawFile)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load archive member')
       setStatus(null)
     } finally {
       setBusy(false)
     }
   }
 
-  function onRun() {
+  async function onMaxDimChange(next: number) {
+    setMaxProcessDim(next)
+    if (!image) return
+    // Re-derive from current working bands is lossy if already downsampled.
+    // Prefer reloading from file/archive when possible.
+    setBusy(true)
+    setError(null)
+    setStatus('Re-sampling for processing size…')
+    try {
+      if (archive && archiveMember) {
+        const loaded = await loadArchiveMemberImage(archive, archiveMember)
+        const working = toWorkingImage(loaded, next)
+        setImage(working)
+        setResult(null)
+        setNdvi(null)
+        setCompareRows(null)
+        setStatus(
+          `Processing size ${working.size.width}×${working.size.height} (native ${working.nativeWidth}×${working.nativeHeight})`,
+        )
+      } else if (rawFile && !archive) {
+        const loaded = await loadImageFile(rawFile)
+        const working = toWorkingImage(loaded, next)
+        setImage(working)
+        setResult(null)
+        setNdvi(null)
+        setCompareRows(null)
+        setStatus(
+          `Processing size ${working.size.width}×${working.size.height} (native ${working.nativeWidth}×${working.nativeHeight})`,
+        )
+      } else {
+        const working = toWorkingImage(image, next)
+        setImage(working)
+        setResult(null)
+        setStatus(`Processing size ${working.size.width}×${working.size.height}`)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to resample')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function onRun() {
     if (!image) return
     setError(null)
     setNdvi(null)
     setBusy(true)
-    setStatus(`Running ${method}…`)
-    startTransition(() => {
-      void (async () => {
-        try {
-          const out = await runCompression(
-            method,
-            image.bands,
-            image.bandOrder,
-            image.size.width,
-            image.size.height,
-            image.originalBytes,
-            params,
-          )
-          setResult(out)
-          setStatus(
-            `Done in ${out.runtimeSeconds.toFixed(2)}s · ratio ${fmt(out.compressionRatio, 3)}`,
-          )
-        } catch (err) {
-          setError(err instanceof Error ? err.message : 'Compression failed')
-          setStatus(null)
-        } finally {
-          setBusy(false)
-        }
-      })()
-    })
+    setStatus(`Running ${method} off the main thread…`)
+    try {
+      const out = await runCompressionAsync({
+        method,
+        bands: image.bands,
+        bandOrder: image.bandOrder,
+        width: image.size.width,
+        height: image.size.height,
+        originalBytes: image.originalBytes,
+        params,
+        onProgress: (message) => setStatus(message),
+      })
+      setResult(out)
+      setStatus(
+        `Done in ${out.runtimeSeconds.toFixed(2)}s · ratio ${fmt(out.compressionRatio, 3)} · ${out.width}×${out.height}`,
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Compression failed')
+      setStatus(null)
+    } finally {
+      setBusy(false)
+    }
   }
 
-  function onCompareAll() {
+  async function onCompareAll() {
     if (!image) return
     setError(null)
     setBusy(true)
     setStatus('Comparing all methods…')
-    startTransition(() => {
-      void (async () => {
-        try {
-          const rows: CompareRow[] = []
-          for (const m of COMPRESSION_METHODS) {
-            const out = await runCompression(
-              m,
-              image.bands,
-              image.bandOrder,
-              image.size.width,
-              image.size.height,
-              image.originalBytes,
-              params,
-            )
-            const meanRmse =
-              out.channelReports.reduce((s, r) => s + r.rmse, 0) /
-              Math.max(out.channelReports.length, 1)
-            const meanPsnr =
-              out.channelReports.reduce((s, r) => s + r.psnrDb, 0) /
-              Math.max(out.channelReports.length, 1)
-            const meanSsim =
-              out.channelReports.reduce((s, r) => s + r.ssim, 0) /
-              Math.max(out.channelReports.length, 1)
-            rows.push({
-              method: m,
-              runtimeSeconds: out.runtimeSeconds,
-              compressionRatio: out.compressionRatio,
-              meanRmse,
-              meanPsnr,
-              meanSsim,
-            })
-          }
-          setCompareRows(rows)
-          setStatus('Comparison complete')
-        } catch (err) {
-          setError(err instanceof Error ? err.message : 'Comparison failed')
-        } finally {
-          setBusy(false)
-        }
-      })()
-    })
+    try {
+      const rows: CompareRow[] = []
+      for (const m of COMPRESSION_METHODS) {
+        setStatus(`Comparing: ${m}…`)
+        const out = await runCompressionAsync({
+          method: m,
+          bands: image.bands,
+          bandOrder: image.bandOrder,
+          width: image.size.width,
+          height: image.size.height,
+          originalBytes: image.originalBytes,
+          params,
+        })
+        const meanRmse =
+          out.channelReports.reduce((s, r) => s + r.rmse, 0) /
+          Math.max(out.channelReports.length, 1)
+        const meanPsnr =
+          out.channelReports.reduce((s, r) => s + r.psnrDb, 0) /
+          Math.max(out.channelReports.length, 1)
+        const meanSsim =
+          out.channelReports.reduce((s, r) => s + r.ssim, 0) /
+          Math.max(out.channelReports.length, 1)
+        rows.push({
+          method: m,
+          runtimeSeconds: out.runtimeSeconds,
+          compressionRatio: out.compressionRatio,
+          meanRmse,
+          meanPsnr,
+          meanSsim,
+        })
+      }
+      setCompareRows(rows)
+      setStatus('Comparison complete')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Comparison failed')
+    } finally {
+      setBusy(false)
+    }
   }
 
   function onNdvi() {
@@ -288,7 +407,15 @@ export default function CompressionLab() {
       const saved = await saveCompressionRun({
         method: result.method,
         sourceFilename: image.filename,
-        params: { ...params, method: result.method, metadata: result.metadata },
+        params: {
+          ...params,
+          method: result.method,
+          metadata: result.metadata,
+          archiveMember: image.archiveMember ?? null,
+          maxProcessDim,
+          processSize: image.size,
+          nativeSize: { width: image.nativeWidth, height: image.nativeHeight },
+        },
         runtimeSeconds: result.runtimeSeconds,
         originalBytes: result.originalBytes,
         compressedBytesEstimate: result.compressedBytesEstimate,
@@ -301,9 +428,11 @@ export default function CompressionLab() {
           ssim: r.ssim,
         })),
         originalFile: rawFile,
-        originalFilename: image.filename,
+        originalFilename: image.archiveMember
+          ? `${rawFile.name}__${image.archiveMember.replace(/\//g, '_')}`
+          : image.filename,
         compressedFile: compressedBlob,
-        compressedFilename: `${image.filename.replace(/\.[^.]+$/, '')}-compressed.png`,
+        compressedFilename: `compressed-${Date.now()}.png`,
       })
       setShareToken(saved.shareToken)
       const url = new URL(window.location.href)
@@ -339,7 +468,8 @@ export default function CompressionLab() {
           <h1>ESMI Research</h1>
           <p className="lede">
             Browser-side satellite compression lab — SVD, wavelet, bandwidth, and
-            JPEG-rate methods with NDVI checks. Deployed on Vercel.
+            JPEG-rate methods with NDVI checks. Supports TAR archives; heavy work
+            runs in a Web Worker so the page stays responsive.
           </p>
         </div>
         <div className="header-meta">
@@ -399,17 +529,51 @@ export default function CompressionLab() {
         <aside className="panel controls">
           <h2>Source</h2>
           <label className="file">
-            <span>Upload GeoTIFF / PNG / JPEG</span>
+            <span>Upload GeoTIFF / PNG / JPEG / TAR / TAR.GZ</span>
             <input
               type="file"
-              accept=".tif,.tiff,.geotiff,.png,.jpg,.jpeg,.webp"
+              accept=".tif,.tiff,.geotiff,.png,.jpg,.jpeg,.webp,.tar,.tar.gz,.tgz"
               onChange={(e) => void onFile(e.target.files?.[0] ?? null)}
             />
           </label>
+
+          {archive && (
+            <label>
+              Image inside archive
+              <select
+                value={archiveMember}
+                disabled={busy}
+                onChange={(e) => void onArchiveMemberChange(e.target.value)}
+              >
+                {archive.members.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          <label>
+            Max processing size (faster ← → sharper)
+            <select
+              value={maxProcessDim}
+              disabled={busy}
+              onChange={(e) => void onMaxDimChange(Number(e.target.value))}
+            >
+              {PROCESS_DIM_OPTIONS.map((d) => (
+                <option key={d} value={d}>
+                  {d}px
+                </option>
+              ))}
+            </select>
+          </label>
+
           {image && (
             <p className="hint">
               {image.filename}
               <br />
+              Native {image.nativeWidth}×{image.nativeHeight} · process{' '}
               {image.size.width}×{image.size.height} · {image.sourceType} ·{' '}
               {bytesLabel(image.originalBytes)}
               <br />
@@ -435,7 +599,7 @@ export default function CompressionLab() {
               <input
                 type="range"
                 min={1}
-                max={128}
+                max={64}
                 value={params.svdRank}
                 onChange={(e) =>
                   setParams((p) => ({ ...p, svdRank: Number(e.target.value) }))
@@ -518,14 +682,14 @@ export default function CompressionLab() {
           )}
 
           <div className="actions">
-            <button type="button" disabled={!image || busy || pending} onClick={onRun}>
-              Run compression
+            <button type="button" disabled={!image || busy} onClick={() => void onRun()}>
+              {busy ? 'Working…' : 'Run compression'}
             </button>
             <button
               type="button"
               className="secondary"
-              disabled={!image || busy || pending}
-              onClick={onCompareAll}
+              disabled={!image || busy}
+              onClick={() => void onCompareAll()}
             >
               Compare all methods
             </button>
@@ -559,7 +723,7 @@ export default function CompressionLab() {
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={originalPreview} alt="Original preview" />
                 ) : (
-                  <div className="empty">Upload an image to begin</div>
+                  <div className="empty">Upload an image or TAR archive to begin</div>
                 )}
               </figure>
               <figure>

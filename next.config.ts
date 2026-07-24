@@ -1,7 +1,7 @@
 import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
-  // geotiff / compression run entirely in the browser; keep server bundle lean.
+  // geotiff / compression run in the browser (and a Web Worker).
   serverExternalPackages: [],
 }
 

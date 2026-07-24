@@ -48,8 +48,10 @@ run to Supabase** and share with `?run=<share_token>`.
 
 ## Features (Vercel)
 
-- Upload GeoTIFF (via `geotiff.js`), PNG, or JPEG
+- Upload GeoTIFF (via `geotiff.js`), PNG, JPEG, or **TAR / TAR.GZ** archives
+- Pick an image member inside an archive, then run any compression method
 - Methods: SVD, Haar wavelet, FFT bandwidth keep, JPEG quality stand-in for JPEG2000
+- Processing is downsampled (default max edge 384px) and run in a **Web Worker** so the UI stays responsive
 - Per-band RMSE / MAE / PSNR / SSIM
 - NDVI preservation compare (choose Red / NIR bands)
 - Compare all methods table
@@ -59,7 +61,7 @@ Notes:
 
 - True JPEG2000 isn't widely available in browsers; the JPEG2000 option uses a
   quality-controlled JPEG encode/decode while keeping the same lab workflow.
-- Large GeoTIFFs are heavy in-browser (especially SVD). Prefer modest scenes for demos.
+- Raise **Max processing size** for sharper demos; lower it (256–384) for faster runs.
 
 ## Streamlit prototype (local / research)
 
