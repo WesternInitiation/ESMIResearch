@@ -1559,6 +1559,9 @@ export default function CompressionLab() {
 
           <section className="panel">
             <h2>NDVI/NDWI preservation</h2>
+            <p className="hint">
+              Index comparison always runs in the browser against local compression bands.
+            </p>
             <div className="ndvi-row">
               <label>
                 Index
@@ -1700,6 +1703,7 @@ export default function CompressionLab() {
 
           <section className="panel">
             <h2>Method comparison</h2>
+            <p className="hint">Always runs locally in the browser worker (all four methods).</p>
             <div className="table-wrap">
               <table>
                 <thead>
