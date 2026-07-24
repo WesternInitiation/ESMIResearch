@@ -62,17 +62,11 @@ In the Vercel project → Settings → Environment Variables:
 
 | Name | Value |
 |------|-------|
-| `COMPRESS_API_URL` | `https://esmi-compress-xxxxx-uc.a.run.app` |
+| `NEXT_PUBLIC_COMPRESS_API_URL` | `https://esmi-compress-xxxxx-uc.a.run.app` |
+| `COMPRESS_API_URL` | same URL (optional; used by `/api/compress` proxy) |
 
-Redeploy Vercel. The lab UI gets a **Cloud Run** engine option that proxies
-through `/api/compress` (so the browser never needs CORS gymnastics).
-
-Local Next.js:
-
-```bash
-# .env.local
-COMPRESS_API_URL=http://127.0.0.1:8080
-```
+Redeploy Vercel. The lab UI gets a **Cloud Run** engine option. The browser
+calls Cloud Run directly so large TAR/GeoTIFF uploads are not capped by Vercel.
 
 ## Local test of the API
 
