@@ -14,9 +14,12 @@ import type { MethodParams } from '@/lib/compression'
 import {
   bandsToPngBlob,
   inspectUpload,
+  isLikelySingleBand,
   loadArchiveMemberImage,
   loadImageFile,
+  pairRedNirImages,
   rgbaToDataUrl,
+  suggestNdviMembers,
   toPreviewRgba,
   type ArchiveSelection,
   type LoadedImage,
@@ -107,6 +110,10 @@ export default function CompressionLab() {
   const [rawFile, setRawFile] = useState<File | null>(null)
   const [archive, setArchive] = useState<ArchiveSelection | null>(null)
   const [archiveMember, setArchiveMember] = useState<string>('')
+  const [ndviRedMember, setNdviRedMember] = useState<string>('')
+  const [ndviNirMember, setNdviNirMember] = useState<string>('')
+  const [pairMode, setPairMode] = useState(false)
+  const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
   const [maxProcessDim, setMaxProcessDim] = useState<number>(1024)
   const [engine, setEngine] = useState<Engine>('browser')
   const [cloudRunOk, setCloudRunOk] = useState(false)
@@ -276,7 +283,39 @@ export default function CompressionLab() {
     setNdvi(null)
     setCompareRows(null)
     clearResultPreviews()
+    setPendingRedSingle(null)
     setStatus('Image ready')
+  }
+
+  async function loadArchiveNdviPair(redMember: string, nirMember: string) {
+    if (!archive) return
+    if (!redMember || !nirMember) {
+      setError('Pick both a Red band file and a NIR band file')
+      return
+    }
+    if (redMember === nirMember) {
+      setError('Red and NIR must be different single-band files')
+      return
+    }
+    setBusy(true)
+    setError(null)
+    setStatus(`Pairing NDVI bands…`)
+    try {
+      const redImg = await loadArchiveMemberImage(archive, redMember)
+      const nirImg = await loadArchiveMemberImage(archive, nirMember)
+      const paired = pairRedNirImages(redImg, nirImg)
+      setArchiveMember(redMember)
+      setNdviRedMember(redMember)
+      setNdviNirMember(nirMember)
+      setPairMode(true)
+      await applyLoaded(paired, rawFile)
+      setStatus('NDVI pair loaded (Red + NIR). Run compression, then Compare NDVI.')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load NDVI band pair')
+      setStatus(null)
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function onFile(file: File | null) {
@@ -289,6 +328,10 @@ export default function CompressionLab() {
     setShareToken(null)
     setArchive(null)
     setArchiveMember('')
+    setNdviRedMember('')
+    setNdviNirMember('')
+    setPairMode(false)
+    setPendingRedSingle(null)
     if (file.size > MAX_INGEST_BYTES) {
       setError(
         `File is ${(file.size / (1024 * 1024 * 1024)).toFixed(2)} GiB — ingest limit is ~2 GiB.`,
@@ -303,16 +346,51 @@ export default function CompressionLab() {
       const inspected = await inspectUpload(file)
       if (inspected.kind === 'archive') {
         setArchive(inspected.selection)
+        setRawFile(file)
+        const suggested = suggestNdviMembers(inspected.selection.members)
         const first = inspected.selection.members[0]
         setArchiveMember(first)
-        setStatus(
-          `Archive ${file.name}: ${inspected.selection.members.length} image(s). Select one to load.`,
+        setNdviRedMember(suggested.red || first)
+        setNdviNirMember(
+          suggested.nir ||
+            inspected.selection.members.find((m) => m !== (suggested.red || first)) ||
+            first,
         )
-        const loaded = await loadArchiveMemberImage(inspected.selection, first)
-        await applyLoaded(loaded, file)
+        if (suggested.red && suggested.nir) {
+          setStatus(
+            `Archive ${file.name}: found likely Red (${suggested.red.split('/').pop()}) and NIR (${suggested.nir.split('/').pop()}). Load NDVI pair or pick one image.`,
+          )
+          // Auto-load the Landsat-style pair when both B4/B5-like members exist.
+          const redImg = await loadArchiveMemberImage(inspected.selection, suggested.red)
+          const nirImg = await loadArchiveMemberImage(inspected.selection, suggested.nir)
+          const paired = pairRedNirImages(redImg, nirImg)
+          setArchiveMember(suggested.red)
+          setPairMode(true)
+          await applyLoaded(paired, file)
+          setStatus(
+            'Auto-paired Red+NIR from archive for NDVI. You can change the members below and reload.',
+          )
+        } else {
+          setPairMode(false)
+          const loaded = await loadArchiveMemberImage(inspected.selection, first)
+          await applyLoaded(loaded, file)
+          setStatus(
+            `Archive loaded. For NDVI with single-band TIFs, pick Red + NIR members and click Load NDVI pair.`,
+          )
+        }
       } else {
         const loaded = await loadImageFile(file)
-        await applyLoaded(loaded, file)
+        if (isLikelySingleBand(loaded) && !loaded.bands.red && !loaded.bands.nir) {
+          // Hold as Red candidate; ask for a second single-band NIR upload.
+          setPendingRedSingle(loaded)
+          setRawFile(file)
+          setImage(null)
+          setStatus(
+            `Loaded single-band ${file.name} as Red candidate. Upload a second single-band TIF for NIR to enable NDVI.`,
+          )
+        } else {
+          await applyLoaded(loaded, file)
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load file')
@@ -323,9 +401,29 @@ export default function CompressionLab() {
     }
   }
 
+  async function onNirPairFile(file: File | null) {
+    if (!file || !pendingRedSingle) return
+    setBusy(true)
+    setError(null)
+    setStatus('Pairing Red + NIR single-band files…')
+    try {
+      const nirLoaded = await loadImageFile(file)
+      const paired = pairRedNirImages(pendingRedSingle, nirLoaded)
+      setPairMode(true)
+      await applyLoaded(paired, rawFile)
+      setStatus('NDVI pair ready from two single-band uploads. Run compression, then Compare NDVI.')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to pair Red/NIR files')
+      setStatus(null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function onArchiveMemberChange(member: string) {
     if (!archive) return
     setArchiveMember(member)
+    setPairMode(false)
     setBusy(true)
     setError(null)
     setStatus(`Loading ${member}…`)
@@ -349,7 +447,20 @@ export default function CompressionLab() {
     setError(null)
     setStatus('Re-sampling for processing size…')
     try {
-      if (archive && archiveMember) {
+      if (archive && pairMode && ndviRedMember && ndviNirMember) {
+        const redImg = await loadArchiveMemberImage(archive, ndviRedMember)
+        const nirImg = await loadArchiveMemberImage(archive, ndviNirMember)
+        const paired = pairRedNirImages(redImg, nirImg)
+        const working = toWorkingImage(paired, next)
+        setImage(working)
+        setResult(null)
+        setNdvi(null)
+        setCompareRows(null)
+        clearResultPreviews()
+        setStatus(
+          `Processing size ${working.size.width}×${working.size.height} (native ${working.nativeWidth}×${working.nativeHeight})`,
+        )
+      } else if (archive && archiveMember) {
         const loaded = await loadArchiveMemberImage(archive, archiveMember)
         const working = toWorkingImage(loaded, next)
         setImage(working)
@@ -719,21 +830,77 @@ export default function CompressionLab() {
             />
           </label>
 
-          {archive && (
-            <label>
-              Image inside archive
-              <select
-                value={archiveMember}
+          {pendingRedSingle && (
+            <label className="file">
+              <span>Upload NIR single-band TIF (pairs with Red above)</span>
+              <input
+                type="file"
+                accept=".tif,.tiff,.geotiff"
                 disabled={busy}
-                onChange={(e) => void onArchiveMemberChange(e.target.value)}
-              >
-                {archive.members.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
+                onChange={(e) => void onNirPairFile(e.target.files?.[0] ?? null)}
+              />
             </label>
+          )}
+
+          {archive && (
+            <>
+              <label>
+                Single image inside archive
+                <select
+                  value={archiveMember}
+                  disabled={busy}
+                  onChange={(e) => void onArchiveMemberChange(e.target.value)}
+                >
+                  {archive.members.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <h2>NDVI band pair</h2>
+              <p className="hint">
+                For single-band Landsat/Sentinel TIFs, pick Red (e.g. B4) and NIR (e.g. B5),
+                then load the pair.
+              </p>
+              <label>
+                Red band file
+                <select
+                  value={ndviRedMember}
+                  disabled={busy}
+                  onChange={(e) => setNdviRedMember(e.target.value)}
+                >
+                  {archive.members.map((m) => (
+                    <option key={`red-${m}`} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                NIR band file
+                <select
+                  value={ndviNirMember}
+                  disabled={busy}
+                  onChange={(e) => setNdviNirMember(e.target.value)}
+                >
+                  {archive.members.map((m) => (
+                    <option key={`nir-${m}`} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="secondary"
+                disabled={busy || !ndviRedMember || !ndviNirMember}
+                onClick={() => void loadArchiveNdviPair(ndviRedMember, ndviNirMember)}
+              >
+                {pairMode ? 'Reload NDVI pair' : 'Load NDVI pair (Red + NIR)'}
+              </button>
+            </>
           )}
 
           <h2>Engine</h2>
