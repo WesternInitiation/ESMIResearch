@@ -1,88 +1,105 @@
-/** Client helper: fetch signed demo object from /api/demo and return a File. */
+/** Client helpers for lazy demo loading from GCS (list first, download one member). */
 
-export type DemoListing = {
-  bucket: string
-  primary: {
-    name: string
-    size: number
-    contentType: string
-    downloadUrl: string
-  }
-  objects: Array<{ name: string; size: number }>
-}
+export type DemoCatalogResponse =
+  | {
+      kind: 'archive'
+      bucket: string
+      objectName: string
+      archiveName: string
+      members: string[]
+    }
+  | {
+      kind: 'objects'
+      bucket: string
+      members: string[]
+      objects: Array<{ name: string; size: number }>
+    }
 
-function failedFetchMessage(stage: 'list' | 'download', err: unknown): string {
+function networkError(stage: string, err: unknown): Error {
   const raw = err instanceof Error ? err.message : String(err)
   if (/failed to fetch|networkerror|load failed/i.test(raw)) {
-    if (stage === 'list') {
-      return (
-        'Could not reach /api/demo (network). Confirm the latest Vercel deploy is live, then open /api/demo in a new tab.'
+    if (stage === 'download') {
+      return new Error(
+        'Browser blocked the staged demo download (CORS). Ensure GCS_UPLOAD_BUCKET has CORS GET for origin * (see cloud_run/setup_gcs.sh).',
       )
     }
-    return (
-      'Browser blocked the GCS download (usually CORS). On the demo bucket run CORS allow GET/HEAD/OPTIONS for origin *, ' +
-      'and grant objectViewer to esmi-vercel@esmi-research.iam.gserviceaccount.com.'
+    return new Error(
+      `Could not reach the demo API (${stage}). Confirm the latest Vercel deploy is live.`,
     )
   }
-  return raw || 'Request failed'
+  return new Error(raw || `Demo ${stage} failed`)
 }
 
-export async function fetchDemoFileFromGcs(
+export async function fetchDemoCatalog(
   onProgress?: (message: string) => void,
-): Promise<File> {
-  onProgress?.('Requesting demo data from Cloud Storage…')
-
+): Promise<DemoCatalogResponse> {
+  onProgress?.('Listing demo files in Cloud Storage…')
   let res: Response
   try {
     res = await fetch('/api/demo', { cache: 'no-store' })
   } catch (err) {
-    throw new Error(failedFetchMessage('list', err))
+    throw networkError('list', err)
   }
-
-  let data: {
-    error?: string
-    primary?: DemoListing['primary'] | null
-    bucket?: string
-  }
-  try {
-    data = await res.json()
-  } catch {
-    throw new Error(
-      `Demo API returned non-JSON (HTTP ${res.status}). Redeploy Vercel so /api/demo exists.`,
-    )
-  }
-
+  const data = await res.json()
   if (!res.ok) {
-    throw new Error(data.error || `Could not list demo bucket (HTTP ${res.status})`)
+    throw new Error(data.error || `Demo list failed (HTTP ${res.status})`)
   }
-  const primary = data.primary
-  if (!primary?.downloadUrl) {
-    throw new Error('Demo bucket returned no downloadable object')
+  if (!data.kind || !Array.isArray(data.members) || !data.members.length) {
+    throw new Error('Demo catalog is empty')
+  }
+  return data as DemoCatalogResponse
+}
+
+export async function fetchDemoMemberFile(input: {
+  kind: 'archive' | 'objects'
+  objectName?: string
+  member: string
+  onProgress?: (message: string) => void
+}): Promise<File> {
+  const label = input.member.split('/').pop() || input.member
+  input.onProgress?.(`Preparing ${label} from demo storage…`)
+
+  let res: Response
+  try {
+    res = await fetch('/api/demo/member', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: input.kind,
+        objectName: input.objectName,
+        member: input.member,
+      }),
+    })
+  } catch (err) {
+    throw networkError('prepare', err)
   }
 
-  const baseName = primary.name.split('/').pop() || primary.name
-  onProgress?.(
-    `Downloading ${baseName}${
-      primary.size > 0 ? ` (${(primary.size / (1024 * 1024)).toFixed(1)} MB)` : ''
+  const data = await res.json()
+  if (!res.ok) {
+    throw new Error(data.error || `Demo prepare failed (HTTP ${res.status})`)
+  }
+  if (!data.downloadUrl) {
+    throw new Error('Demo prepare returned no download URL')
+  }
+
+  input.onProgress?.(
+    `Downloading ${data.filename || label}${
+      data.size ? ` (${(Number(data.size) / (1024 * 1024)).toFixed(1)} MB)` : ''
     }…`,
   )
 
   let fileRes: Response
   try {
-    fileRes = await fetch(primary.downloadUrl)
+    fileRes = await fetch(data.downloadUrl as string)
   } catch (err) {
-    throw new Error(failedFetchMessage('download', err))
+    throw networkError('download', err)
   }
-
   if (!fileRes.ok) {
-    throw new Error(
-      `Demo download failed (HTTP ${fileRes.status}). Check objectViewer IAM on gs://esmi-research-demo-data for esmi-vercel.`,
-    )
+    throw new Error(`Demo member download failed (HTTP ${fileRes.status})`)
   }
   const blob = await fileRes.blob()
-  const type =
-    primary.contentType && primary.contentType !== 'application/octet-stream'
-      ? primary.contentType
-      : blob.type || 'application/octet-stream'
-  return new File([blob], baseName, { type })
+  const filename = (data.filename as string) || label
+  return new File([blob], filename, {
+    type: blob.type || 'application/octet-stream',
+  })
 }

@@ -18,7 +18,7 @@ import {
   residualPreviewRgba,
   rgbaToPngDataUrl,
 } from '@/lib/preview'
-import { fetchDemoFileFromGcs } from '@/lib/demoData'
+import { fetchDemoCatalog, fetchDemoMemberFile } from '@/lib/demoData'
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression, VERCEL_PROXY_UPLOAD_BYTES } from '@/lib/serverCompress'
 import { MAX_INGEST_BYTES, extractArchiveMember } from '@/lib/archive'
@@ -600,17 +600,40 @@ export default function CompressionLab() {
   }
 
   async function onArchiveMemberChange(member: string) {
-    if (!archive) return
+    if (!archive || !member) return
     setArchiveMember(member)
     setPairMode(false)
     setNdviPairLoaded(false)
     setNdwiPairLoaded(false)
     setBusy(true)
     setError(null)
-    setStatus(`Loading ${member}…`)
+    setStatus(
+      archive.demoRemote
+        ? `Downloading ${member.split('/').pop() || member} from demo storage…`
+        : `Loading ${member}…`,
+    )
     try {
-      const loaded = await loadArchiveMemberImage(archive, member)
-      await applyLoaded(loaded, rawFile)
+      if (archive.demoRemote) {
+        const file = await fetchDemoMemberFile({
+          kind: archive.demoRemote.kind,
+          objectName: archive.demoRemote.objectName,
+          member,
+          onProgress: (message) => setStatus(message),
+        })
+        const loaded = await loadImageFile(file)
+        const memberFilename = member.split('/').pop() || member
+        await applyLoaded(
+          {
+            ...loaded,
+            archiveMember: member,
+            filename: `${archive.archiveName} → ${memberFilename}`,
+          },
+          file,
+        )
+      } else {
+        const loaded = await loadArchiveMemberImage(archive, member)
+        await applyLoaded(loaded, rawFile)
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load archive member')
       setStatus(null)
@@ -740,17 +763,29 @@ export default function CompressionLab() {
             setBusy(false)
             return
           }
-          setStatus(`Extracting ${memberPath.split('/').pop()} from archive…`)
-          const { bytes, memberFilename } = extractArchiveMember(
-            archive.buffer,
-            archive.archiveName,
-            memberPath,
-          )
-          uploadFile = new File([new Uint8Array(bytes)], memberFilename, {
-            type: 'application/octet-stream',
-          })
-          uploadName = memberFilename
-          usedMember = memberPath
+          if (archive.demoRemote) {
+            // rawFile is already the selected demo member download.
+            uploadFile = rawFile
+            uploadName = rawFile.name
+            usedMember = memberPath
+          } else {
+            if (!archive.buffer) {
+              setError('Archive bytes are missing')
+              setBusy(false)
+              return
+            }
+            setStatus(`Extracting ${memberPath.split('/').pop()} from archive…`)
+            const { bytes, memberFilename } = extractArchiveMember(
+              archive.buffer,
+              archive.archiveName,
+              memberPath,
+            )
+            uploadFile = new File([new Uint8Array(bytes)], memberFilename, {
+              type: 'application/octet-stream',
+            })
+            uploadName = memberFilename
+            usedMember = memberPath
+          }
         }
 
         // Small files go through Vercel multipart; larger ones use GCS signed PUT.
@@ -956,14 +991,61 @@ export default function CompressionLab() {
   async function onLoadDemo() {
     setBusy(true)
     setError(null)
-    setStatus('Loading demo data from Cloud Storage…')
+    setStatus('Listing demo files in Cloud Storage…')
     try {
-      const file = await fetchDemoFileFromGcs((message) => setStatus(message))
-      // Reuse the normal upload pipeline (TAR member pairing, GeoTIFF, etc.).
-      await onFile(file)
+      setImage(null)
+      setRawFile(null)
+      setResult(null)
+      setIndexMetrics(null)
+      setCompareRows(null)
+      setSharedView(null)
+      setShareToken(null)
+      setPendingRedSingle(null)
+      setPairMode(false)
+      setNdviPairLoaded(false)
+      setNdwiPairLoaded(false)
+      clearResultPreviews()
+
+      const catalog = await fetchDemoCatalog((message) => setStatus(message))
+      const members = catalog.members
+      const suggested = suggestNdviMembers(members)
+      const suggestedNdwi = suggestNdwiMembers(members, 'nir')
+
+      if (catalog.kind === 'archive') {
+        setArchive({
+          archiveName: catalog.archiveName,
+          members,
+          demoRemote: { kind: 'archive', objectName: catalog.objectName },
+        })
+      } else {
+        setArchive({
+          archiveName: `gs://${catalog.bucket}`,
+          members,
+          demoRemote: { kind: 'objects' },
+        })
+      }
+
+      // Same dropdown UX as a dropped TAR — do not download until the user picks.
+      setArchiveMember('')
+      setNdviRedMember(suggested.red || '')
+      setNdviNirMember(
+        suggested.nir || members.find((m) => m !== suggested.red) || '',
+      )
+      setNdwiGreenMember(suggestedNdwi.green || '')
+      setNdwiSecondMember(
+        suggestedNdwi.second ||
+          members.find((m) => m !== suggestedNdwi.green) ||
+          '',
+      )
+      setNdwiSecondRole(suggestedNdwi.secondRole)
+      setStatus(
+        `Demo ready (${members.length} images). Pick one from the dropdown — only that file is downloaded.`,
+      )
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load demo data')
+      setError(err instanceof Error ? err.message : 'Failed to load demo catalog')
       setStatus(null)
+      setArchive(null)
+    } finally {
       setBusy(false)
     }
   }
@@ -1081,12 +1163,19 @@ export default function CompressionLab() {
 
           {archive && (
             <label>
-              Single image inside archive
+              {archive.demoRemote
+                ? 'Demo image (downloaded on select)'
+                : 'Single image inside archive'}
               <select
                 value={archiveMember}
                 disabled={busy}
                 onChange={(e) => void onArchiveMemberChange(e.target.value)}
               >
+                {archive.demoRemote && (
+                  <option value="" disabled>
+                    Select an image…
+                  </option>
+                )}
                 {archive.members.map((m) => (
                   <option key={m} value={m}>
                     {memberLabel(m)}

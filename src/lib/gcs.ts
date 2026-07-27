@@ -15,6 +15,15 @@ function serviceAccountCredentials(): Record<string, unknown> | null {
   }
 }
 
+/** Exported for demo catalog / member extract routes. */
+export function serviceAccountCredentialsForDemo(): Record<string, unknown> | null {
+  return serviceAccountCredentials()
+}
+
+export function storageClientForDemo(): Storage {
+  return storageClient()
+}
+
 export function gcsUploadBucket(): string | null {
   const name = process.env.GCS_UPLOAD_BUCKET?.trim()
   return name || null

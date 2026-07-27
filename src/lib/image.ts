@@ -18,9 +18,15 @@ export type LoadedImage = {
 }
 
 export type ArchiveSelection = {
-  buffer: ArrayBuffer
+  /** Present for locally uploaded archives; empty/omitted for GCS demo catalogs. */
+  buffer?: ArrayBuffer
   archiveName: string
   members: string[]
+  /** Lazy demo archive/objects — members are fetched on demand via /api/demo/member. */
+  demoRemote?: {
+    kind: 'archive' | 'objects'
+    objectName?: string
+  }
 }
 
 function normalizeBandNames(count: number): string[] {
@@ -101,6 +107,24 @@ export async function loadArchiveMemberImage(
   selection: ArchiveSelection,
   memberName: string,
 ): Promise<LoadedImage> {
+  if (selection.demoRemote) {
+    const { fetchDemoMemberFile } = await import('@/lib/demoData')
+    const file = await fetchDemoMemberFile({
+      kind: selection.demoRemote.kind,
+      objectName: selection.demoRemote.objectName,
+      member: memberName,
+    })
+    const loaded = await loadImageFile(file)
+    const memberFilename = memberName.split('/').pop() || memberName
+    return {
+      ...loaded,
+      archiveMember: memberName,
+      filename: `${selection.archiveName} → ${memberFilename}`,
+    }
+  }
+  if (!selection.buffer) {
+    throw new Error('Archive bytes are missing')
+  }
   const { bytes, memberFilename } = extractArchiveMember(
     selection.buffer,
     selection.archiveName,
