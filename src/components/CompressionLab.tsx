@@ -256,6 +256,10 @@ export default function CompressionLab() {
         setCloudRunConfigured(status.urlConfigured)
         setCloudRunOk(status.configured)
         setGcsUploads(status.gcsUploads)
+        // Keep Cloud Run as default when configured; otherwise fall back to Browser.
+        if (!status.urlConfigured) {
+          setEngine('browser')
+        }
         if (status.gcsUploads) {
           setGcsStatusHint(`ready (${status.gcsBucket})`)
         } else if (!status.gcsBucketConfigured && !status.gcsAuthConfigured) {
@@ -274,6 +278,7 @@ export default function CompressionLab() {
         setCloudRunOk(false)
         setGcsUploads(false)
         setGcsStatusHint('status check failed')
+        setEngine('browser')
       }
     })()
   }, [])
