@@ -543,6 +543,27 @@ export async function prepareDemoMember(input: {
   const [meta] = await storage.bucket(bucketName).file(objectName).getMetadata()
   const archiveSize = Number(meta.size || 0)
   if (archiveSize > LARGE_ARCHIVE_BYTES) {
+    // Last resort: walk headers to find this member's byte range, then Range-GET it.
+    try {
+      const scanned = await buildManifestViaGcsRangeScan(
+        bucketName,
+        objectName,
+        archiveSize,
+      )
+      const found = scanned.entries.find((e) => e.name === member)
+      if (found) {
+        const buf = await downloadGcsRange(
+          bucketName,
+          objectName,
+          found.offset,
+          found.offset + found.size - 1,
+        )
+        const filename = member.split('/').pop() || member
+        return stageBytesAndSign({ bytes: buf, filename })
+      }
+    } catch {
+      // fall through to Cloud Run
+    }
     return extractViaCloudRun({
       bucket: bucketName,
       archive: objectName,
