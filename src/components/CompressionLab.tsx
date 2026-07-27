@@ -895,36 +895,107 @@ export default function CompressionLab() {
 
   async function onCompareAll() {
     if (!image) return
-    if (engine === 'cloud-run') {
-      setError('Compare-all on Cloud Run is not enabled yet — switch to Browser engine.')
-      return
-    }
     setError(null)
     setBusy(true)
     clearResultPreviews()
-    setStatus('Comparing all methods…')
+
+    const useCloudRun =
+      engine === 'cloud-run' && !isMultiMemberStack(image) && Boolean(rawFile)
+
+    if (engine === 'cloud-run' && isMultiMemberStack(image)) {
+      setStatus(
+        'Multi-band stack — comparing all methods locally so the full pair is used…',
+      )
+    } else if (useCloudRun) {
+      setStatus('Comparing all methods on Cloud Run…')
+    } else {
+      setStatus('Comparing all methods in browser…')
+    }
+
     try {
+      let cloudUpload: { file: Blob; filename: string } | null = null
+      if (useCloudRun && rawFile) {
+        let uploadFile: Blob = rawFile
+        let uploadName = rawFile.name
+        if (archive) {
+          const memberPath =
+            archiveMember && !archiveMember.includes(' + ')
+              ? archiveMember
+              : image.archiveMember && !image.archiveMember.includes(' + ')
+                ? image.archiveMember
+                : ''
+          if (!memberPath) {
+            throw new Error('Pick a single archive image before comparing on Cloud Run')
+          }
+          if (archive.demoRemote) {
+            uploadFile = rawFile
+            uploadName = rawFile.name
+          } else {
+            if (!archive.buffer) {
+              throw new Error('Archive bytes are missing')
+            }
+            setStatus(`Extracting ${memberPath.split('/').pop()} for Cloud Run compare…`)
+            const { bytes, memberFilename } = extractArchiveMember(
+              archive.buffer,
+              archive.archiveName,
+              memberPath,
+            )
+            uploadFile = new File([new Uint8Array(bytes)], memberFilename, {
+              type: 'application/octet-stream',
+            })
+            uploadName = memberFilename
+          }
+        }
+        if (uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES && !gcsUploads) {
+          throw new Error(
+            `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB. ` +
+              `Set GCS_UPLOAD_BUCKET for large Cloud Run jobs, or switch Engine → Browser.`,
+          )
+        }
+        cloudUpload = { file: uploadFile, filename: uploadName }
+      }
+
       const rows: CompareRow[] = []
       for (const m of COMPRESSION_METHODS) {
-        setStatus(`Comparing: ${m}…`)
-        const out = await runCompressionAsync({
-          method: m,
-          bands: image.bands,
-          bandOrder: image.bandOrder,
-          width: image.size.width,
-          height: image.size.height,
-          originalBytes: image.originalBytes,
-          params,
-        })
+        setStatus(
+          useCloudRun
+            ? `Cloud Run comparing: ${m}…`
+            : `Comparing: ${m}…`,
+        )
+        const out = useCloudRun && cloudUpload
+          ? await runServerCompression({
+              file: cloudUpload.file,
+              filename: cloudUpload.filename,
+              method: m,
+              archiveMember: null,
+              maxDim: maxProcessDim,
+              svdRank: params.svdRank,
+              waveletKeepFraction: params.waveletKeepFraction,
+              waveletLevels: params.waveletLevels,
+              bandwidthKeepFraction: params.bandwidthKeepFraction,
+              jpegRate: params.jpegRate,
+              redBand,
+              nirBand,
+              gcsUploads,
+              onProgress: (message) => setStatus(`${m}: ${message}`),
+            })
+          : await runCompressionAsync({
+              method: m,
+              bands: image.bands,
+              bandOrder: image.bandOrder,
+              width: image.size.width,
+              height: image.size.height,
+              originalBytes: image.originalBytes,
+              params,
+            })
+
+        const reports = out.channelReports
         const meanRmse =
-          out.channelReports.reduce((s, r) => s + r.rmse, 0) /
-          Math.max(out.channelReports.length, 1)
+          reports.reduce((s, r) => s + r.rmse, 0) / Math.max(reports.length, 1)
         const meanPsnr =
-          out.channelReports.reduce((s, r) => s + r.psnrDb, 0) /
-          Math.max(out.channelReports.length, 1)
+          reports.reduce((s, r) => s + r.psnrDb, 0) / Math.max(reports.length, 1)
         const meanSsim =
-          out.channelReports.reduce((s, r) => s + r.ssim, 0) /
-          Math.max(out.channelReports.length, 1)
+          reports.reduce((s, r) => s + r.ssim, 0) / Math.max(reports.length, 1)
         rows.push({
           method: m,
           runtimeSeconds: out.runtimeSeconds,
@@ -935,7 +1006,11 @@ export default function CompressionLab() {
         })
       }
       setCompareRows(rows)
-      setStatus('Comparison complete')
+      setStatus(
+        useCloudRun
+          ? 'Cloud Run comparison complete'
+          : 'Comparison complete',
+      )
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Comparison failed')
     } finally {
@@ -1339,12 +1414,12 @@ export default function CompressionLab() {
             <button
               type="button"
               className="secondary"
-              disabled={!image || busy || engine === 'cloud-run'}
+              disabled={!image || busy || (engine === 'cloud-run' && !rawFile)}
               onClick={() => void onCompareAll()}
               title={
                 engine === 'cloud-run'
-                  ? 'Switch Engine → Browser to compare all methods'
-                  : undefined
+                  ? 'Runs all four methods on Cloud Run'
+                  : 'Runs all four methods in the browser worker'
               }
             >
               Compare all methods
@@ -1744,7 +1819,7 @@ export default function CompressionLab() {
           <section className="panel">
             <h2>Method comparison</h2>
             <p className="hint">
-              Requires Engine → Browser. Runs all four methods in the Web Worker.
+              Runs all four methods on the selected engine (Browser or Cloud Run).
             </p>
             <div className="table-wrap">
               <table>
