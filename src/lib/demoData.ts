@@ -11,16 +11,51 @@ export type DemoListing = {
   objects: Array<{ name: string; size: number }>
 }
 
+function failedFetchMessage(stage: 'list' | 'download', err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err)
+  if (/failed to fetch|networkerror|load failed/i.test(raw)) {
+    if (stage === 'list') {
+      return (
+        'Could not reach /api/demo (network). Confirm the latest Vercel deploy is live, then open /api/demo in a new tab.'
+      )
+    }
+    return (
+      'Browser blocked the GCS download (usually CORS). On the demo bucket run CORS allow GET/HEAD/OPTIONS for origin *, ' +
+      'and grant objectViewer to esmi-vercel@esmi-research.iam.gserviceaccount.com.'
+    )
+  }
+  return raw || 'Request failed'
+}
+
 export async function fetchDemoFileFromGcs(
   onProgress?: (message: string) => void,
 ): Promise<File> {
   onProgress?.('Requesting demo data from Cloud Storage…')
-  const res = await fetch('/api/demo', { cache: 'no-store' })
-  const data = await res.json()
-  if (!res.ok) {
-    throw new Error(data.error || 'Could not list demo bucket')
+
+  let res: Response
+  try {
+    res = await fetch('/api/demo', { cache: 'no-store' })
+  } catch (err) {
+    throw new Error(failedFetchMessage('list', err))
   }
-  const primary = data.primary as DemoListing['primary'] | null
+
+  let data: {
+    error?: string
+    primary?: DemoListing['primary'] | null
+    bucket?: string
+  }
+  try {
+    data = await res.json()
+  } catch {
+    throw new Error(
+      `Demo API returned non-JSON (HTTP ${res.status}). Redeploy Vercel so /api/demo exists.`,
+    )
+  }
+
+  if (!res.ok) {
+    throw new Error(data.error || `Could not list demo bucket (HTTP ${res.status})`)
+  }
+  const primary = data.primary
   if (!primary?.downloadUrl) {
     throw new Error('Demo bucket returned no downloadable object')
   }
@@ -32,10 +67,16 @@ export async function fetchDemoFileFromGcs(
     }…`,
   )
 
-  const fileRes = await fetch(primary.downloadUrl)
+  let fileRes: Response
+  try {
+    fileRes = await fetch(primary.downloadUrl)
+  } catch (err) {
+    throw new Error(failedFetchMessage('download', err))
+  }
+
   if (!fileRes.ok) {
     throw new Error(
-      `Demo download failed (${fileRes.status}). Check bucket IAM / signed URL access.`,
+      `Demo download failed (HTTP ${fileRes.status}). Check objectViewer IAM on gs://esmi-research-demo-data for esmi-vercel.`,
     )
   }
   const blob = await fileRes.blob()
