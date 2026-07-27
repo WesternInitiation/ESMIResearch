@@ -4,6 +4,7 @@ import {
   isTarArchive,
   listArchiveImages,
 } from '@/lib/archive'
+import { cloudRunAuthHeaders } from '@/lib/cloudRunAuth'
 import {
   gcsDemoBucket,
   gcsUploadBucket,
@@ -13,11 +14,16 @@ import {
 
 const DEMO_IMAGE_EXT = /\.(tif|tiff|geotiff|png|jpe?g|webp|tar\.gz|tgz|tar)$/i
 const DEMO_ARCHIVE_EXT = /\.(tar\.gz|tgz|tar)$/i
+/** Archives larger than this must use manifest.json or Cloud Run listing. */
+const LARGE_ARCHIVE_BYTES = 40 * 1024 * 1024
+
+type ManifestEntry = { name: string; offset: number; size: number }
 
 type ArchiveCache = {
   buffer: ArrayBuffer
   archiveName: string
   members: string[]
+  entries?: ManifestEntry[]
   loadedAt: number
 }
 
@@ -25,13 +31,61 @@ type ArchiveCache = {
 const archiveCache = new Map<string, ArchiveCache>()
 const CACHE_TTL_MS = 30 * 60 * 1000
 
+/** Manifest parsed from demo bucket (kept for ranged extracts). */
+let manifestCache:
+  | {
+      bucket: string
+      objectName: string
+      archiveName: string
+      members: string[]
+      entries: ManifestEntry[]
+      loadedAt: number
+    }
+  | null = null
+
 function cacheKey(bucket: string, objectName: string): string {
   return `${bucket}/${objectName}`
+}
+
+function compressApiBase(): string | null {
+  const url = process.env.COMPRESS_API_URL?.trim()
+  return url ? url.replace(/\/$/, '') : null
+}
+
+function parseManifestEntries(raw: unknown): ManifestEntry[] {
+  if (!Array.isArray(raw)) return []
+  const out: ManifestEntry[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const name = typeof rec.name === 'string' ? rec.name : ''
+    const offset = Number(rec.offset)
+    const size = Number(rec.size)
+    if (!name || !Number.isFinite(offset) || !Number.isFinite(size) || size <= 0) {
+      continue
+    }
+    out.push({ name, offset: Math.floor(offset), size: Math.floor(size) })
+  }
+  return out
 }
 
 async function downloadGcsObject(bucketName: string, objectName: string): Promise<Buffer> {
   const storage = storageClientForDemo()
   const [buf] = await storage.bucket(bucketName).file(objectName).download()
+  return buf
+}
+
+async function downloadGcsRange(
+  bucketName: string,
+  objectName: string,
+  start: number,
+  endInclusive: number,
+): Promise<Buffer> {
+  const storage = storageClientForDemo()
+  const [buf] = await storage.bucket(bucketName).file(objectName).download({
+    start,
+    end: endInclusive,
+  })
   return buf
 }
 
@@ -64,6 +118,7 @@ export type DemoCatalog =
       objectName: string
       archiveName: string
       members: string[]
+      entries?: ManifestEntry[]
     }
   | {
       kind: 'objects'
@@ -71,6 +126,108 @@ export type DemoCatalog =
       members: string[]
       objects: Array<{ name: string; size: number }>
     }
+
+async function buildManifestViaCloudRun(
+  bucketName: string,
+  archiveName: string,
+): Promise<{ members: string[]; entries: ManifestEntry[] } | null> {
+  const base = compressApiBase()
+  if (!base) return null
+
+  const form = new FormData()
+  form.set('bucket', bucketName)
+  form.set('archive', archiveName)
+  form.set('write_manifest', '1')
+
+  const headers = await cloudRunAuthHeaders(base)
+  const res = await fetch(`${base}/v1/demo/build-manifest`, {
+    method: 'POST',
+    headers,
+    body: form,
+  })
+  const text = await res.text()
+  if (!res.ok) {
+    throw new Error(
+      `Cloud Run build-manifest failed (${res.status}): ${text.slice(0, 400)}`,
+    )
+  }
+  let parsed: {
+    members?: string[]
+    entries?: unknown
+  }
+  try {
+    parsed = JSON.parse(text) as { members?: string[]; entries?: unknown }
+  } catch {
+    throw new Error('Cloud Run build-manifest returned non-JSON')
+  }
+  const members = Array.isArray(parsed.members)
+    ? parsed.members.filter((m) => typeof m === 'string')
+    : []
+  if (!members.length) return null
+  return { members, entries: parseManifestEntries(parsed.entries) }
+}
+
+async function extractViaCloudRun(input: {
+  bucket: string
+  archive: string
+  member: string
+  offset?: number
+  size?: number
+}): Promise<{ downloadUrl: string; filename: string; size: number }> {
+  const base = compressApiBase()
+  const staging = gcsUploadBucket()
+  if (!base) {
+    throw new Error(
+      'COMPRESS_API_URL is required to extract members from large demo archives without a ranged manifest.',
+    )
+  }
+  if (!staging) {
+    throw new Error('GCS_UPLOAD_BUCKET is required to stage demo extracts.')
+  }
+
+  const form = new FormData()
+  form.set('bucket', input.bucket)
+  form.set('archive', input.archive)
+  form.set('member', input.member)
+  form.set('staging_bucket', staging)
+  if (input.offset != null && input.size != null) {
+    form.set('offset', String(input.offset))
+    form.set('size', String(input.size))
+  }
+
+  const headers = await cloudRunAuthHeaders(base)
+  const res = await fetch(`${base}/v1/demo/extract`, {
+    method: 'POST',
+    headers,
+    body: form,
+  })
+  const text = await res.text()
+  if (!res.ok) {
+    throw new Error(`Cloud Run demo extract failed (${res.status}): ${text.slice(0, 400)}`)
+  }
+  const parsed = JSON.parse(text) as {
+    objectName?: string
+    bucket?: string
+    filename?: string
+    size?: number
+  }
+  if (!parsed.objectName || !parsed.bucket) {
+    throw new Error('Cloud Run demo extract response missing objectName/bucket')
+  }
+  const storage = storageClientForDemo()
+  const file = storage.bucket(parsed.bucket).file(parsed.objectName)
+  const expires = Date.now() + 60 * 60 * 1000
+  const [downloadUrl] = await file.getSignedUrl({
+    version: 'v4',
+    action: 'read',
+    expires,
+  })
+  return {
+    downloadUrl,
+    filename: parsed.filename || input.member.split('/').pop() || 'member.bin',
+    size: Number(parsed.size || 0),
+  }
+}
 
 export async function buildDemoCatalog(): Promise<DemoCatalog> {
   if (!serviceAccountCredentialsForDemo()) {
@@ -109,19 +266,31 @@ export async function buildDemoCatalog(): Promise<DemoCatalog> {
         archiveName?: string
         members?: string[]
         kind?: string
+        entries?: unknown
       }
       const members = Array.isArray(parsed.members)
         ? parsed.members.filter((m) => typeof m === 'string')
         : []
       const objectName = parsed.archive || parsed.objectName
+      const entries = parseManifestEntries(parsed.entries)
       if (members.length && objectName) {
+        const archiveName =
+          parsed.archiveName || objectName.split('/').pop() || objectName
+        manifestCache = {
+          bucket: bucketName,
+          objectName,
+          archiveName,
+          members: [...members].sort(),
+          entries,
+          loadedAt: Date.now(),
+        }
         return {
           kind: 'archive',
           bucket: bucketName,
           objectName,
-          archiveName:
-            parsed.archiveName || objectName.split('/').pop() || objectName,
-          members: [...members].sort(),
+          archiveName,
+          members: manifestCache.members,
+          entries: entries.length ? entries : undefined,
         }
       }
       if (members.length && parsed.kind === 'objects') {
@@ -146,12 +315,45 @@ export async function buildDemoCatalog(): Promise<DemoCatalog> {
   const archives = candidates.filter((c) => DEMO_ARCHIVE_EXT.test(c.name))
   if (archives.length) {
     const preferred = [...archives].sort((a, b) => b.size - a.size)[0]
-    // Large archives often time out on Vercel if we download them just to list.
-    if (preferred.size > 40 * 1024 * 1024) {
+    // Large archives: build/write manifest via Cloud Run (or fail with instructions).
+    if (preferred.size > LARGE_ARCHIVE_BYTES) {
+      try {
+        const built = await buildManifestViaCloudRun(bucketName, preferred.name)
+        if (built?.members.length) {
+          const archiveName = preferred.name.split('/').pop() || preferred.name
+          manifestCache = {
+            bucket: bucketName,
+            objectName: preferred.name,
+            archiveName,
+            members: [...built.members].sort(),
+            entries: built.entries,
+            loadedAt: Date.now(),
+          }
+          return {
+            kind: 'archive',
+            bucket: bucketName,
+            objectName: preferred.name,
+            archiveName,
+            members: manifestCache.members,
+            entries: built.entries.length ? built.entries : undefined,
+          }
+        }
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err)
+        throw new Error(
+          `Demo archive ${preferred.name} is ${(preferred.size / (1024 * 1024)).toFixed(0)} MB. ` +
+            `Add a manifest.json in gs://${bucketName} with { "archive": "${preferred.name}", "members": ["path/to/B4.tif", ...] } ` +
+            `so listing does not download the whole TAR on Vercel. ` +
+            `From Cloud Shell (repo root): ./cloud_run/write_demo_manifest.sh ` +
+            `— or redeploy Cloud Run (adds /v1/demo/build-manifest) and retry. ` +
+            `(Cloud Run fallback: ${detail})`,
+        )
+      }
       throw new Error(
         `Demo archive ${preferred.name} is ${(preferred.size / (1024 * 1024)).toFixed(0)} MB. ` +
           `Add a manifest.json in gs://${bucketName} with { "archive": "${preferred.name}", "members": ["path/to/B4.tif", ...] } ` +
-          `so listing does not download the whole TAR on Vercel.`,
+          `so listing does not download the whole TAR on Vercel. ` +
+          `Quick fix: ./cloud_run/write_demo_manifest.sh`,
       )
     }
     const cached = await getCachedArchive(bucketName, preferred.name)
@@ -210,6 +412,20 @@ function safeName(filename: string): string {
   return filename.replace(/[^\w.\-()+ ]+/g, '_').slice(0, 180) || 'member.bin'
 }
 
+function lookupManifestEntry(
+  objectName: string,
+  member: string,
+): ManifestEntry | null {
+  if (
+    manifestCache &&
+    manifestCache.objectName === objectName &&
+    Date.now() - manifestCache.loadedAt < CACHE_TTL_MS
+  ) {
+    return manifestCache.entries.find((e) => e.name === member) || null
+  }
+  return null
+}
+
 export async function prepareDemoMember(input: {
   kind: 'archive' | 'objects'
   objectName?: string
@@ -229,6 +445,42 @@ export async function prepareDemoMember(input: {
   if (!objectName || !isTarArchive(objectName)) {
     throw new Error('objectName must be a TAR archive for archive demos')
   }
+
+  // Prefer ranged GET using manifest offsets (no full TAR download).
+  let entry = lookupManifestEntry(objectName, member)
+  if (!entry && manifestCache?.objectName !== objectName) {
+    // Rebuild catalog once so manifestCache is warm (cheap when manifest.json exists).
+    try {
+      await buildDemoCatalog()
+      entry = lookupManifestEntry(objectName, member)
+    } catch {
+      // continue
+    }
+  }
+
+  if (entry) {
+    const buf = await downloadGcsRange(
+      bucketName,
+      objectName,
+      entry.offset,
+      entry.offset + entry.size - 1,
+    )
+    const filename = member.split('/').pop() || member
+    return stageBytesAndSign({ bytes: buf, filename })
+  }
+
+  // Large archives without offsets: extract on Cloud Run (streams TAR once).
+  const storage = storageClientForDemo()
+  const [meta] = await storage.bucket(bucketName).file(objectName).getMetadata()
+  const archiveSize = Number(meta.size || 0)
+  if (archiveSize > LARGE_ARCHIVE_BYTES) {
+    return extractViaCloudRun({
+      bucket: bucketName,
+      archive: objectName,
+      member,
+    })
+  }
+
   const cached = await getCachedArchive(bucketName, objectName)
   const { bytes, memberFilename } = extractArchiveMember(
     cached.buffer,

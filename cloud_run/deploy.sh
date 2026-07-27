@@ -33,7 +33,7 @@ gcloud run deploy esmi-compress \
   --cpu 1 \
   --timeout 600 \
   --max-instances 3 \
-  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,GCS_UPLOAD_BUCKET=${GCS_BUCKET}"
+  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,GCS_UPLOAD_BUCKET=${GCS_BUCKET},GCS_DEMO_BUCKET=esmi-research-demo-data"
 
 URL="$(gcloud run services describe esmi-compress --region "${REGION}" --format='value(status.url)')"
 echo ""

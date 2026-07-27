@@ -36,8 +36,20 @@ echo "Setting CORS on gs://${BUCKET}…"
 gcloud storage buckets update "gs://${BUCKET}" --cors-file="${TMP_CORS}"
 rm -f "${TMP_CORS}"
 
+# Cloud Run needs objectViewer (+ create) to scan/write the demo TAR manifest.
+PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
+if [[ -n "${PROJECT_NUMBER}" ]]; then
+  RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+  echo "Granting objectAdmin to Cloud Run runtime SA ${RUN_SA} on gs://${BUCKET}…"
+  gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+    --member="serviceAccount:${RUN_SA}" \
+    --role="roles/storage.objectAdmin" || true
+fi
+
 echo ""
-echo "Done. Redeploy Vercel if needed, then click Load demo data."
+echo "Done. For large TARs, build the listing index once:"
+echo "  ./cloud_run/write_demo_manifest.sh ${PROJECT_ID} ${BUCKET}"
+echo "Then redeploy Vercel if needed and click Load demo data."
 echo "Quick checks:"
 echo "  gcloud storage ls gs://${BUCKET}"
 echo "  Open https://YOUR-SITE.vercel.app/api/demo"

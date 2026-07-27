@@ -53,31 +53,56 @@ def is_tar_archive(filename: str) -> bool:
     return filename.lower().endswith(SUPPORTED_ARCHIVE_SUFFIXES)
 
 
-def list_archive_images(archive_bytes: bytes) -> list[str]:
-    """List supported regular image files in a TAR archive without extracting it."""
-    candidates: list[str] = []
-    seen_candidates: set[str] = set()
+def _tar_stream_mode(filename: str) -> str:
+    lower = filename.lower()
+    if lower.endswith(".tar.gz") or lower.endswith(".tgz"):
+        return "r|gz"
+    return "r|"
+
+
+def scan_archive_image_entries(
+    fileobj: BinaryIO,
+    *,
+    filename: str = "archive.tar",
+) -> list[dict[str, Any]]:
+    """
+    Stream-scan a TAR for image members.
+
+    Returns dicts with name / offset (data start) / size so callers can later
+    fetch a single member with an HTTP Range / GCS ranged download without
+    re-reading the whole archive. Offsets are only valid for uncompressed .tar
+    (not .tar.gz / .tgz).
+    """
+    mode = _tar_stream_mode(filename)
+    compressed = mode != "r|"
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
     expanded_bytes = 0
     try:
-        with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as archive:
+        with tarfile.open(fileobj=fileobj, mode=mode) as archive:
             for member_count, member in enumerate(archive, start=1):
                 if member_count > MAX_ARCHIVE_MEMBERS:
                     raise ValueError("The TAR archive contains too many members.")
-                expanded_bytes += member.size
+                expanded_bytes += max(int(member.size or 0), 0)
                 if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
                     raise ValueError("The expanded TAR archive is too large to process.")
                 if not member.isfile():
                     continue
                 if not member.name.lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
                     continue
-                if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
+                size = int(member.size or 0)
+                if size <= 0 or size > MAX_ARCHIVE_IMAGE_BYTES:
                     raise ValueError("An image in the TAR archive is too large to process.")
-                if member.name in seen_candidates:
+                if member.name in seen:
                     raise ValueError(
                         "The TAR archive contains duplicate image paths and is ambiguous."
                     )
-                seen_candidates.add(member.name)
-                candidates.append(member.name)
+                seen.add(member.name)
+                entry: dict[str, Any] = {"name": member.name, "size": size}
+                # offset_data is reliable for uncompressed streaming TARs.
+                if not compressed and getattr(member, "offset_data", None) is not None:
+                    entry["offset"] = int(member.offset_data)
+                candidates.append(entry)
     except (tarfile.TarError, OSError) as exc:
         raise ValueError("The uploaded file is not a readable TAR archive.") from exc
 
@@ -87,6 +112,12 @@ def list_archive_images(archive_bytes: bytes) -> list[str]:
             "(GeoTIFF, PNG, JPEG, or WebP)."
         )
     return candidates
+
+
+def list_archive_images(archive_bytes: bytes) -> list[str]:
+    """List supported regular image files in a TAR archive without extracting it."""
+    entries = scan_archive_image_entries(BytesIO(archive_bytes), filename="archive.tar")
+    return sorted(entry["name"] for entry in entries)
 
 
 def load_archive_image(

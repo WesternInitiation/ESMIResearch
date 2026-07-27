@@ -13,7 +13,9 @@ Build from the repository root:
 from __future__ import annotations
 
 import base64
+import json
 import os
+import tarfile
 from io import BytesIO
 from typing import Any, Literal
 
@@ -32,6 +34,7 @@ from image_io import (
     list_archive_images,
     load_archive_image,
     load_image,
+    scan_archive_image_entries,
     to_display_rgb,
 )
 from ndvi import compare_ndvi, compute_ndvi
@@ -223,6 +226,201 @@ def _run_method(
             runtime_seconds=perf_counter() - start,
             metadata={"codec": "jpeg-fallback", "quality": quality},
         )
+
+
+def _demo_bucket_default() -> str:
+    return (
+        os.environ.get("GCS_DEMO_BUCKET", "").strip()
+        or "esmi-research-demo-data"
+    )
+
+
+def _staging_bucket_default() -> str | None:
+    name = os.environ.get("GCS_UPLOAD_BUCKET", "").strip()
+    return name or None
+
+
+def _build_demo_manifest(archive: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    members = sorted(e["name"] for e in entries)
+    payload: dict[str, Any] = {"archive": archive, "members": members}
+    ranged = [
+        {"name": e["name"], "offset": e["offset"], "size": e["size"]}
+        for e in entries
+        if "offset" in e
+    ]
+    if ranged:
+        payload["entries"] = sorted(ranged, key=lambda e: e["name"])
+    return payload
+
+
+@app.post("/v1/demo/build-manifest")
+async def demo_build_manifest(
+    bucket: str | None = Form(None),
+    archive: str | None = Form(None),
+    write_manifest: str = Form("1"),
+) -> JSONResponse:
+    """
+    Stream-scan a large demo TAR in GCS, return members (+ offsets), and
+    optionally write manifest.json so Vercel never downloads the full TAR.
+    """
+    from google.cloud import storage
+
+    bucket_name = (bucket or "").strip() or _demo_bucket_default()
+    archive_name = (archive or "").strip()
+    if not archive_name:
+        raise HTTPException(status_code=400, detail="archive is required")
+    if not is_tar_archive(archive_name):
+        raise HTTPException(status_code=400, detail="archive must be a TAR")
+
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(archive_name)
+    if not blob.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"GCS object not found: gs://{bucket_name}/{archive_name}",
+        )
+
+    try:
+        with blob.open("rb") as handle:
+            entries = scan_archive_image_entries(handle, filename=archive_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to scan archive: {exc}",
+        ) from exc
+
+    manifest = _build_demo_manifest(archive_name, entries)
+    wrote = False
+    if write_manifest.strip() not in ("0", "false", "False", "no"):
+        try:
+            out = client.bucket(bucket_name).blob("manifest.json")
+            out.upload_from_string(
+                json.dumps(manifest, indent=2) + "\n",
+                content_type="application/json",
+            )
+            wrote = True
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Scanned OK but failed to write manifest.json: {exc}",
+            ) from exc
+
+    return JSONResponse(
+        {
+            **manifest,
+            "bucket": bucket_name,
+            "manifestWritten": wrote,
+        }
+    )
+
+
+@app.post("/v1/demo/extract")
+async def demo_extract(
+    bucket: str | None = Form(None),
+    archive: str | None = Form(None),
+    member: str | None = Form(None),
+    staging_bucket: str | None = Form(None),
+    offset: int | None = Form(None),
+    size: int | None = Form(None),
+) -> JSONResponse:
+    """
+    Extract one image member from a demo TAR in GCS and stage it to the upload
+    bucket. Prefer offset+size (from manifest entries) for a ranged download.
+    """
+    import time
+    import uuid
+
+    from google.cloud import storage
+
+    bucket_name = (bucket or "").strip() or _demo_bucket_default()
+    archive_name = (archive or "").strip()
+    member_name = (member or "").strip()
+    staging = (staging_bucket or "").strip() or _staging_bucket_default()
+    if not archive_name or not is_tar_archive(archive_name):
+        raise HTTPException(status_code=400, detail="archive must be a TAR")
+    if not member_name:
+        raise HTTPException(status_code=400, detail="member is required")
+    if not staging:
+        raise HTTPException(
+            status_code=400,
+            detail="staging_bucket / GCS_UPLOAD_BUCKET is required",
+        )
+
+    client = storage.Client()
+    src = client.bucket(bucket_name).blob(archive_name)
+    if not src.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"GCS object not found: gs://{bucket_name}/{archive_name}",
+        )
+
+    filename = member_name.rsplit("/", 1)[-1] or "member.bin"
+    raw: bytes | None = None
+
+    if offset is not None and size is not None and int(size) > 0:
+        start = int(offset)
+        end = start + int(size) - 1
+        if end < start:
+            raise HTTPException(status_code=400, detail="Invalid offset/size")
+        try:
+            raw = src.download_as_bytes(start=start, end=end)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Ranged download failed: {exc}",
+            ) from exc
+    else:
+        try:
+            with src.open("rb") as handle:
+                with tarfile.open(
+                    fileobj=handle,
+                    mode="r|gz"
+                    if archive_name.lower().endswith((".tar.gz", ".tgz"))
+                    else "r|",
+                ) as tf:
+                    for info in tf:
+                        if not info.isfile() or info.name != member_name:
+                            continue
+                        extracted = tf.extractfile(info)
+                        if extracted is None:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Could not read archive member",
+                            )
+                        raw = extracted.read()
+                        break
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Stream extract failed: {exc}",
+            ) from exc
+
+    if raw is None:
+        raise HTTPException(status_code=404, detail="Archive member not found")
+
+    object_name = f"demo-extracts/{int(time.time())}-{uuid.uuid4().hex}/{filename}"
+    dest = client.bucket(staging).blob(object_name)
+    try:
+        dest.upload_from_string(raw, content_type="application/octet-stream")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to stage extract: {exc}",
+        ) from exc
+
+    return JSONResponse(
+        {
+            "gcsUri": f"gs://{staging}/{object_name}",
+            "bucket": staging,
+            "objectName": object_name,
+            "filename": filename,
+            "size": len(raw),
+        }
+    )
 
 
 @app.post("/v1/archive/list")
