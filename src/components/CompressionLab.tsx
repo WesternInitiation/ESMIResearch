@@ -2,11 +2,9 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import {
-  attachNdviToRun,
   fetchSupabaseStatus,
   listRecentRuns,
   loadRunByShareToken,
-  saveCompressionRun,
   type SharedRunSummary,
 } from '@/lib/api'
 import { runCompressionAsync } from '@/lib/compressClient'
@@ -20,11 +18,11 @@ import {
   residualPreviewRgba,
   rgbaToPngDataUrl,
 } from '@/lib/preview'
+import { fetchDemoFileFromGcs } from '@/lib/demoData'
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression, VERCEL_PROXY_UPLOAD_BYTES } from '@/lib/serverCompress'
 import { MAX_INGEST_BYTES, extractArchiveMember } from '@/lib/archive'
 import {
-  bandsToPngBlob,
   inspectUpload,
   isLikelySingleBand,
   loadArchiveMemberImage,
@@ -955,77 +953,17 @@ export default function CompressionLab() {
     )
   }
 
-  async function onSave() {
-    if (!image || !result || !rawFile) return
+  async function onLoadDemo() {
     setBusy(true)
     setError(null)
-    setStatus('Saving to Supabase…')
+    setStatus('Loading demo data from Cloud Storage…')
     try {
-      let compressedBlob: Blob
-      if (decompressedPreview) {
-        const res = await fetch(decompressedPreview)
-        compressedBlob = await res.blob()
-      } else {
-        compressedBlob = await bandsToPngBlob(
-          result.bands,
-          result.bandOrder,
-          result.width,
-          result.height,
-        )
-      }
-      const saved = await saveCompressionRun({
-        method: result.method,
-        sourceFilename: image.filename,
-        params: {
-          ...params,
-          method: result.method,
-          metadata: result.metadata,
-          archiveMember: image.archiveMember ?? null,
-          maxProcessDim,
-          engine,
-          processSize: image.size,
-          nativeSize: { width: image.nativeWidth, height: image.nativeHeight },
-        },
-        runtimeSeconds: result.runtimeSeconds,
-        originalBytes: result.originalBytes,
-        compressedBytesEstimate: result.compressedBytesEstimate,
-        compressionRatio: result.compressionRatio,
-        bandMetrics: result.channelReports.map((r) => ({
-          band: r.band,
-          rmse: r.rmse,
-          mae: r.mae,
-          psnr_db: r.psnrDb,
-          ssim: r.ssim,
-        })),
-        originalFile: rawFile,
-        originalFilename: image.archiveMember
-          ? `${rawFile.name}__${image.archiveMember.replace(/\//g, '_')}`
-          : image.filename,
-        compressedFile: compressedBlob,
-        compressedFilename: `compressed-${Date.now()}.png`,
-      })
-      setShareToken(saved.shareToken)
-      const url = new URL(window.location.href)
-      url.searchParams.set('run', saved.shareToken)
-      window.history.replaceState({}, '', url.toString())
-      setStatus(`Saved. Share link uses ?run=${saved.shareToken}`)
-      const runs = await listRecentRuns()
-      setRecentRuns(runs)
-      if (indexMetrics) {
-        await attachNdviToRun(saved.shareToken, {
-          redBand: indexKind === 'ndvi' ? redBand : greenBand,
-          nirBand: indexKind === 'ndvi' ? nirBand : ndwiSecondBand,
-          rmse: indexMetrics.rmse,
-          mae: indexMetrics.mae,
-          correlation: indexMetrics.correlation,
-          ssim: indexMetrics.ssim,
-          bias: indexMetrics.bias,
-        })
-      }
+      const file = await fetchDemoFileFromGcs((message) => setStatus(message))
+      // Reuse the normal upload pipeline (TAR member pairing, GeoTIFF, etc.).
+      await onFile(file)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Save failed')
+      setError(err instanceof Error ? err.message : 'Failed to load demo data')
       setStatus(null)
-    } finally {
       setBusy(false)
     }
   }
@@ -1325,10 +1263,11 @@ export default function CompressionLab() {
             <button
               type="button"
               className="secondary"
-              disabled={!result || !supabaseOk || busy}
-              onClick={() => void onSave()}
+              disabled={busy}
+              onClick={() => void onLoadDemo()}
+              title="Load a built-in Red/Green/NIR demo scene"
             >
-              Save run to Supabase
+              Load demo data
             </button>
           </div>
 

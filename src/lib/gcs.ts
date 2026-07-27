@@ -20,6 +20,25 @@ export function gcsUploadBucket(): string | null {
   return name || null
 }
 
+/** Demo assets bucket (defaults to esmi-research-demo-data). */
+export function gcsDemoBucket(): string {
+  return (
+    process.env.GCS_DEMO_BUCKET?.trim() ||
+    'esmi-research-demo-data'
+  )
+}
+
+const DEMO_IMAGE_EXT = /\.(tif|tiff|geotiff|png|jpe?g|webp|tar\.gz|tgz|tar)$/i
+const DEMO_ARCHIVE_EXT = /\.(tar\.gz|tgz|tar)$/i
+
+export type DemoObjectInfo = {
+  name: string
+  size: number
+  contentType: string
+  downloadUrl: string
+  expiresAt: string
+}
+
 export type GcsConfigStatus = {
   configured: boolean
   bucketConfigured: boolean
@@ -70,6 +89,65 @@ function storageClient(): Storage {
 function safeObjectName(filename: string): string {
   const base = filename.split(/[/\\]/).pop() || 'upload.bin'
   return base.replace(/[^\w.\-()+ ]+/g, '_').slice(0, 180) || 'upload.bin'
+}
+
+export async function listDemoObjectsWithSignedUrls(): Promise<{
+  bucket: string
+  objects: DemoObjectInfo[]
+  primary: DemoObjectInfo | null
+}> {
+  const credentials = serviceAccountCredentials()
+  if (!credentials) {
+    throw new Error(
+      'GOOGLE_SERVICE_ACCOUNT_JSON is required to read demo data from GCS',
+    )
+  }
+  const bucketName = gcsDemoBucket()
+  const storage = storageClient()
+  const bucket = storage.bucket(bucketName)
+  const [files] = await bucket.getFiles({ autoPaginate: true, maxResults: 200 })
+
+  const candidates = files
+    .filter((f) => !f.name.endsWith('/'))
+    .filter((f) => DEMO_IMAGE_EXT.test(f.name))
+    .map((f) => ({
+      file: f,
+      name: f.name,
+      size: Number(f.metadata.size || 0),
+      contentType: String(f.metadata.contentType || 'application/octet-stream'),
+    }))
+
+  if (!candidates.length) {
+    return { bucket: bucketName, objects: [], primary: null }
+  }
+
+  // Prefer a TAR archive when present; otherwise the largest image.
+  const archives = candidates.filter((c) => DEMO_ARCHIVE_EXT.test(c.name))
+  const preferred =
+    archives.sort((a, b) => b.size - a.size)[0] ||
+    [...candidates].sort((a, b) => b.size - a.size)[0]
+
+  const expires = Date.now() + 60 * 60 * 1000
+  const objects: DemoObjectInfo[] = []
+  for (const c of candidates) {
+    const [downloadUrl] = await c.file.getSignedUrl({
+      version: 'v4',
+      action: 'read',
+      expires,
+    })
+    objects.push({
+      name: c.name,
+      size: c.size,
+      contentType: c.contentType,
+      downloadUrl,
+      expiresAt: new Date(expires).toISOString(),
+    })
+  }
+
+  const primary =
+    objects.find((o) => o.name === preferred.name) || objects[0] || null
+
+  return { bucket: bucketName, objects, primary }
 }
 
 export async function createGcsSignedUpload(input: {
