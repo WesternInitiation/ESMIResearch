@@ -96,6 +96,91 @@ export function listArchiveImages(buffer: ArrayBuffer, filename: string): string
   return names.sort()
 }
 
+export type TarImageEntry = { name: string; offset: number; size: number }
+
+/**
+ * Walk an uncompressed .tar via ranged reads (512-byte headers only).
+ * Used for huge GCS demo archives so Vercel never downloads the whole object.
+ */
+export async function scanUncompressedTarImageEntries(
+  archiveByteLength: number,
+  readRange: (start: number, endInclusive: number) => Promise<Uint8Array>,
+): Promise<TarImageEntry[]> {
+  const entries: TarImageEntry[] = []
+  const seen = new Set<string>()
+  let offset = 0
+  let members = 0
+  let pendingLongName: string | null = null
+
+  while (offset + 512 <= archiveByteLength) {
+    const header = await readRange(offset, offset + 511)
+    if (header.byteLength < 512) break
+    const isEmpty = header.every((b) => b === 0)
+    if (isEmpty) break
+
+    members += 1
+    if (members > MAX_MEMBERS) {
+      throw new Error('The TAR archive contains too many members.')
+    }
+
+    const name = readCString(header, 0, 100)
+    const size = parseOctal(header, 124, 12)
+    const typeFlag = String.fromCharCode(header[156] || 48)
+    const prefix = readCString(header, 345, 155)
+    let fullName = (prefix ? `${prefix}/${name}` : name).replace(/^\.\//, '')
+    const dataOffset = offset + 512
+    const padded = Math.ceil(Math.max(size, 0) / 512) * 512
+
+    // GNU long-name / pax path: next header uses this name.
+    if (typeFlag === 'L' || typeFlag === 'x' || typeFlag === 'g') {
+      if (size > 0 && size < 64 * 1024 && dataOffset + size - 1 < archiveByteLength) {
+        const raw = await readRange(dataOffset, dataOffset + size - 1)
+        const text = new TextDecoder().decode(raw).replace(/\0/g, '').trim()
+        if (typeFlag === 'L') {
+          pendingLongName = text
+        } else {
+          // Pax: look for path=… line
+          const pathLine = text.split('\n').find((l) => / path=/.test(l) || l.includes(' path='))
+          const m = text.match(/(?:^|\n)\d+ path=(.+?)(?:\n|$)/)
+          if (m?.[1]) pendingLongName = m[1].replace(/\0/g, '').trim()
+          else if (pathLine) {
+            const idx = pathLine.indexOf('path=')
+            if (idx >= 0) pendingLongName = pathLine.slice(idx + 5).trim()
+          }
+        }
+      }
+      offset = dataOffset + padded
+      continue
+    }
+
+    if (pendingLongName) {
+      fullName = pendingLongName.replace(/^\.\//, '')
+      pendingLongName = null
+    }
+
+    const isFile = typeFlag === '0' || typeFlag === '\0'
+    if (isFile && IMAGE_EXT.test(fullName) && size > 0) {
+      if (seen.has(fullName)) {
+        throw new Error('The TAR archive contains duplicate image paths and is ambiguous.')
+      }
+      if (size > MAX_INGEST_BYTES) {
+        throw new Error('An image in the TAR archive is too large to process.')
+      }
+      seen.add(fullName)
+      entries.push({ name: fullName, offset: dataOffset, size })
+    }
+
+    offset = dataOffset + padded
+  }
+
+  if (!entries.length) {
+    throw new Error(
+      'The TAR archive does not contain a supported image (.tif, .tiff, .png, .jpg, .jpeg, .webp).',
+    )
+  }
+  return entries.sort((a, b) => a.name.localeCompare(b.name))
+}
+
 export function extractArchiveMember(
   buffer: ArrayBuffer,
   filename: string,

@@ -3,6 +3,8 @@ import {
   extractArchiveMember,
   isTarArchive,
   listArchiveImages,
+  scanUncompressedTarImageEntries,
+  type TarImageEntry,
 } from '@/lib/archive'
 import { cloudRunAuthHeaders } from '@/lib/cloudRunAuth'
 import {
@@ -147,6 +149,8 @@ async function buildManifestViaCloudRun(
   })
   const text = await res.text()
   if (!res.ok) {
+    // Old Cloud Run revisions don't have this route yet (404) — caller falls back.
+    if (res.status === 404) return null
     throw new Error(
       `Cloud Run build-manifest failed (${res.status}): ${text.slice(0, 400)}`,
     )
@@ -165,6 +169,61 @@ async function buildManifestViaCloudRun(
     : []
   if (!members.length) return null
   return { members, entries: parseManifestEntries(parsed.entries) }
+}
+
+/**
+ * Index an uncompressed .tar with GCS Range GETs (headers only), then try to
+ * persist manifest.json so the next cold start skips the walk.
+ */
+async function buildManifestViaGcsRangeScan(
+  bucketName: string,
+  archiveName: string,
+  archiveByteLength: number,
+): Promise<{ members: string[]; entries: ManifestEntry[] }> {
+  const lower = archiveName.toLowerCase()
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) {
+    throw new Error(
+      'Compressed .tar.gz demo archives need manifest.json or a Cloud Run rebuild; ranged header scan only works for uncompressed .tar.',
+    )
+  }
+
+  const scanned: TarImageEntry[] = await scanUncompressedTarImageEntries(
+    archiveByteLength,
+    async (start, endInclusive) => {
+      const buf = await downloadGcsRange(bucketName, archiveName, start, endInclusive)
+      return new Uint8Array(buf)
+    },
+  )
+
+  const entries: ManifestEntry[] = scanned.map((e) => ({
+    name: e.name,
+    offset: e.offset,
+    size: e.size,
+  }))
+  const members = entries.map((e) => e.name)
+
+  // Best-effort write so subsequent requests don't re-walk headers.
+  try {
+    const storage = storageClientForDemo()
+    const payload = JSON.stringify(
+      {
+        archive: archiveName,
+        members,
+        entries,
+      },
+      null,
+      2,
+    )
+    await storage.bucket(bucketName).file('manifest.json').save(payload, {
+      contentType: 'application/json',
+      resumable: false,
+      metadata: { cacheControl: 'public, max-age=300' },
+    })
+  } catch {
+    // objectViewer-only SA still works for this request via in-memory entries.
+  }
+
+  return { members, entries }
 }
 
 async function extractViaCloudRun(input: {
@@ -315,45 +374,55 @@ export async function buildDemoCatalog(): Promise<DemoCatalog> {
   const archives = candidates.filter((c) => DEMO_ARCHIVE_EXT.test(c.name))
   if (archives.length) {
     const preferred = [...archives].sort((a, b) => b.size - a.size)[0]
-    // Large archives: build/write manifest via Cloud Run (or fail with instructions).
+    // Large archives: Cloud Run build-manifest, else GCS ranged header scan (no full TAR).
     if (preferred.size > LARGE_ARCHIVE_BYTES) {
+      const archiveName = preferred.name.split('/').pop() || preferred.name
+      const errors: string[] = []
+
+      let built: { members: string[]; entries: ManifestEntry[] } | null = null
       try {
-        const built = await buildManifestViaCloudRun(bucketName, preferred.name)
-        if (built?.members.length) {
-          const archiveName = preferred.name.split('/').pop() || preferred.name
-          manifestCache = {
-            bucket: bucketName,
-            objectName: preferred.name,
-            archiveName,
-            members: [...built.members].sort(),
-            entries: built.entries,
-            loadedAt: Date.now(),
-          }
-          return {
-            kind: 'archive',
-            bucket: bucketName,
-            objectName: preferred.name,
-            archiveName,
-            members: manifestCache.members,
-            entries: built.entries.length ? built.entries : undefined,
-          }
-        }
+        built = await buildManifestViaCloudRun(bucketName, preferred.name)
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err)
-        throw new Error(
-          `Demo archive ${preferred.name} is ${(preferred.size / (1024 * 1024)).toFixed(0)} MB. ` +
-            `Add a manifest.json in gs://${bucketName} with { "archive": "${preferred.name}", "members": ["path/to/B4.tif", ...] } ` +
-            `so listing does not download the whole TAR on Vercel. ` +
-            `From Cloud Shell (repo root): ./cloud_run/write_demo_manifest.sh ` +
-            `— or redeploy Cloud Run (adds /v1/demo/build-manifest) and retry. ` +
-            `(Cloud Run fallback: ${detail})`,
-        )
+        errors.push(err instanceof Error ? err.message : String(err))
       }
+
+      if (!built?.members.length) {
+        try {
+          built = await buildManifestViaGcsRangeScan(
+            bucketName,
+            preferred.name,
+            preferred.size,
+          )
+        } catch (err) {
+          errors.push(err instanceof Error ? err.message : String(err))
+        }
+      }
+
+      if (built?.members.length) {
+        manifestCache = {
+          bucket: bucketName,
+          objectName: preferred.name,
+          archiveName,
+          members: [...built.members].sort(),
+          entries: built.entries,
+          loadedAt: Date.now(),
+        }
+        return {
+          kind: 'archive',
+          bucket: bucketName,
+          objectName: preferred.name,
+          archiveName,
+          members: manifestCache.members,
+          entries: built.entries.length ? built.entries : undefined,
+        }
+      }
+
       throw new Error(
         `Demo archive ${preferred.name} is ${(preferred.size / (1024 * 1024)).toFixed(0)} MB. ` +
-          `Add a manifest.json in gs://${bucketName} with { "archive": "${preferred.name}", "members": ["path/to/B4.tif", ...] } ` +
-          `so listing does not download the whole TAR on Vercel. ` +
-          `Quick fix: ./cloud_run/write_demo_manifest.sh`,
+          `Could not build a member list without downloading the whole TAR. ` +
+          `Run ./cloud_run/write_demo_manifest.sh from Cloud Shell, or grant the Vercel SA ` +
+          `storage.objects.get on the demo bucket. ` +
+          `(${errors.join(' | ') || 'no details'})`,
       )
     }
     const cached = await getCachedArchive(bucketName, preferred.name)

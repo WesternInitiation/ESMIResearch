@@ -36,6 +36,11 @@ echo "Setting CORS on gs://${BUCKET}…"
 gcloud storage buckets update "gs://${BUCKET}" --cors-file="${TMP_CORS}"
 rm -f "${TMP_CORS}"
 
+echo "Granting objectCreator to ${SA_EMAIL} on gs://${BUCKET} (so Load demo can write manifest.json)…"
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${SA_EMAIL}" \
+  --role="roles/storage.objectCreator" || true
+
 # Cloud Run needs objectViewer (+ create) to scan/write the demo TAR manifest.
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)' 2>/dev/null || true)"
 if [[ -n "${PROJECT_NUMBER}" ]]; then
