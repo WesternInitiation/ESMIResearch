@@ -132,7 +132,7 @@ export default function CompressionLab() {
   const [pairMode, setPairMode] = useState(false)
   const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
   const [maxProcessDim, setMaxProcessDim] = useState<number>(1024)
-  const [engine, setEngine] = useState<Engine>('browser')
+  const [engine, setEngine] = useState<Engine>('cloud-run')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
   const [gcsUploads, setGcsUploads] = useState(false)
