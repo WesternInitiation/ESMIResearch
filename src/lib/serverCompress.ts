@@ -1,3 +1,5 @@
+import { readJsonResponse } from '@/lib/httpJson'
+
 export type ServerCompressResponse = {
   engine: string
   method: string
@@ -61,23 +63,35 @@ export async function fetchCloudRunStatus(): Promise<{
       gcsBucket: null,
     }
   }
-  const data = (await res.json()) as {
-    configured?: boolean
-    urlConfigured?: boolean
-    gcsUploads?: boolean
-    gcsBucketConfigured?: boolean
-    gcsAuthConfigured?: boolean
-    gcsAuthValid?: boolean
-    gcsBucket?: string | null
-  }
-  return {
-    configured: Boolean(data.configured),
-    urlConfigured: Boolean(data.urlConfigured),
-    gcsUploads: Boolean(data.gcsUploads),
-    gcsBucketConfigured: Boolean(data.gcsBucketConfigured),
-    gcsAuthConfigured: Boolean(data.gcsAuthConfigured),
-    gcsAuthValid: data.gcsAuthValid !== false,
-    gcsBucket: data.gcsBucket ?? null,
+  try {
+    const data = await readJsonResponse<{
+      configured?: boolean
+      urlConfigured?: boolean
+      gcsUploads?: boolean
+      gcsBucketConfigured?: boolean
+      gcsAuthConfigured?: boolean
+      gcsAuthValid?: boolean
+      gcsBucket?: string | null
+    }>(res, '/api/compress')
+    return {
+      configured: Boolean(data.configured),
+      urlConfigured: Boolean(data.urlConfigured),
+      gcsUploads: Boolean(data.gcsUploads),
+      gcsBucketConfigured: Boolean(data.gcsBucketConfigured),
+      gcsAuthConfigured: Boolean(data.gcsAuthConfigured),
+      gcsAuthValid: data.gcsAuthValid !== false,
+      gcsBucket: data.gcsBucket ?? null,
+    }
+  } catch {
+    return {
+      configured: false,
+      urlConfigured: false,
+      gcsUploads: false,
+      gcsBucketConfigured: false,
+      gcsAuthConfigured: false,
+      gcsAuthValid: false,
+      gcsBucket: null,
+    }
   }
 }
 
@@ -96,15 +110,22 @@ async function uploadToGcs(
       size: file.size,
     }),
   })
-  const signed = await signRes.json()
+  const signed = await readJsonResponse<{
+    error?: string
+    uploadUrl?: string
+    gcsUri?: string
+  }>(signRes, '/api/uploads/sign')
   if (!signRes.ok) {
     throw new Error(signed.error || 'Failed to sign GCS upload URL')
+  }
+  if (!signed.uploadUrl || !signed.gcsUri) {
+    throw new Error('GCS sign response missing uploadUrl/gcsUri')
   }
 
   onProgress?.(
     `Uploading ${(file.size / (1024 * 1024)).toFixed(1)} MB to Cloud Storage…`,
   )
-  const put = await fetch(signed.uploadUrl as string, {
+  const put = await fetch(signed.uploadUrl, {
     method: 'PUT',
     headers: {
       'Content-Type': (file.type || 'application/octet-stream') as string,
@@ -117,7 +138,7 @@ async function uploadToGcs(
       `GCS upload failed (${put.status})${text ? `: ${text.slice(0, 200)}` : ''}`,
     )
   }
-  return signed.gcsUri as string
+  return signed.gcsUri
 }
 
 export async function runServerCompression(input: {
@@ -163,7 +184,10 @@ export async function runServerCompression(input: {
   }
 
   const res = await fetch('/api/compress', { method: 'POST', body: form })
-  const data = await res.json()
+  const data = await readJsonResponse<{
+    detail?: unknown
+    error?: string
+  } & Partial<ServerCompressResponse>>(res, '/api/compress')
   if (!res.ok) {
     const detail = data.detail
     const message =

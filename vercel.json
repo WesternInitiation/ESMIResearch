@@ -1,3 +1,16 @@
 {
-  "framework": "nextjs"
+  "framework": "nextjs",
+  "functions": {
+    "src/app/api/demo/route.ts": {
+      "maxDuration": 300,
+      "memory": 1024
+    },
+    "src/app/api/demo/member/route.ts": {
+      "maxDuration": 300,
+      "memory": 1024
+    },
+    "src/app/api/compress/route.ts": {
+      "maxDuration": 300
+    }
+  }
 }

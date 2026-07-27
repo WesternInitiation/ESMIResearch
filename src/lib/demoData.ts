@@ -1,3 +1,5 @@
+import { readJsonResponse } from '@/lib/httpJson'
+
 /** Client helpers for lazy demo loading from GCS (list first, download one member). */
 
 export type DemoCatalogResponse =
@@ -27,7 +29,7 @@ function networkError(stage: string, err: unknown): Error {
       `Could not reach the demo API (${stage}). Confirm the latest Vercel deploy is live.`,
     )
   }
-  return new Error(raw || `Demo ${stage} failed`)
+  return err instanceof Error ? err : new Error(raw || `Demo ${stage} failed`)
 }
 
 export async function fetchDemoCatalog(
@@ -40,14 +42,19 @@ export async function fetchDemoCatalog(
   } catch (err) {
     throw networkError('list', err)
   }
-  const data = await res.json()
+  let data: DemoCatalogResponse & { error?: string }
+  try {
+    data = await readJsonResponse(res, '/api/demo')
+  } catch (err) {
+    throw networkError('list', err)
+  }
   if (!res.ok) {
     throw new Error(data.error || `Demo list failed (HTTP ${res.status})`)
   }
   if (!data.kind || !Array.isArray(data.members) || !data.members.length) {
     throw new Error('Demo catalog is empty')
   }
-  return data as DemoCatalogResponse
+  return data
 }
 
 export async function fetchDemoMemberFile(input: {
@@ -74,7 +81,17 @@ export async function fetchDemoMemberFile(input: {
     throw networkError('prepare', err)
   }
 
-  const data = await res.json()
+  let data: {
+    error?: string
+    downloadUrl?: string
+    filename?: string
+    size?: number
+  }
+  try {
+    data = await readJsonResponse(res, '/api/demo/member')
+  } catch (err) {
+    throw networkError('prepare', err)
+  }
   if (!res.ok) {
     throw new Error(data.error || `Demo prepare failed (HTTP ${res.status})`)
   }
@@ -90,7 +107,7 @@ export async function fetchDemoMemberFile(input: {
 
   let fileRes: Response
   try {
-    fileRes = await fetch(data.downloadUrl as string)
+    fileRes = await fetch(data.downloadUrl)
   } catch (err) {
     throw networkError('download', err)
   }
@@ -98,7 +115,7 @@ export async function fetchDemoMemberFile(input: {
     throw new Error(`Demo member download failed (HTTP ${fileRes.status})`)
   }
   const blob = await fileRes.blob()
-  const filename = (data.filename as string) || label
+  const filename = data.filename || label
   return new File([blob], filename, {
     type: blob.type || 'application/octet-stream',
   })

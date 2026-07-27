@@ -93,6 +93,50 @@ export async function buildDemoCatalog(): Promise<DemoCatalog> {
       size: Number(f.metadata.size || 0),
     }))
 
+  // Optional lightweight index so listing does not download a huge TAR on Vercel.
+  const manifestFile = files.find(
+    (f) =>
+      f.name === 'manifest.json' ||
+      f.name.endsWith('/manifest.json') ||
+      f.name === 'demo-manifest.json',
+  )
+  if (manifestFile) {
+    try {
+      const [buf] = await manifestFile.download()
+      const parsed = JSON.parse(buf.toString('utf8')) as {
+        archive?: string
+        objectName?: string
+        archiveName?: string
+        members?: string[]
+        kind?: string
+      }
+      const members = Array.isArray(parsed.members)
+        ? parsed.members.filter((m) => typeof m === 'string')
+        : []
+      const objectName = parsed.archive || parsed.objectName
+      if (members.length && objectName) {
+        return {
+          kind: 'archive',
+          bucket: bucketName,
+          objectName,
+          archiveName:
+            parsed.archiveName || objectName.split('/').pop() || objectName,
+          members: [...members].sort(),
+        }
+      }
+      if (members.length && parsed.kind === 'objects') {
+        return {
+          kind: 'objects',
+          bucket: bucketName,
+          members: [...members].sort(),
+          objects: members.map((name) => ({ name, size: 0 })),
+        }
+      }
+    } catch {
+      // Fall through to live listing / TAR scan.
+    }
+  }
+
   if (!candidates.length) {
     throw new Error(
       `No demo images found in gs://${bucketName}. Upload a .tif / .png / .tar(.gz).`,
@@ -102,6 +146,14 @@ export async function buildDemoCatalog(): Promise<DemoCatalog> {
   const archives = candidates.filter((c) => DEMO_ARCHIVE_EXT.test(c.name))
   if (archives.length) {
     const preferred = [...archives].sort((a, b) => b.size - a.size)[0]
+    // Large archives often time out on Vercel if we download them just to list.
+    if (preferred.size > 40 * 1024 * 1024) {
+      throw new Error(
+        `Demo archive ${preferred.name} is ${(preferred.size / (1024 * 1024)).toFixed(0)} MB. ` +
+          `Add a manifest.json in gs://${bucketName} with { "archive": "${preferred.name}", "members": ["path/to/B4.tif", ...] } ` +
+          `so listing does not download the whole TAR on Vercel.`,
+      )
+    }
     const cached = await getCachedArchive(bucketName, preferred.name)
     return {
       kind: 'archive',
