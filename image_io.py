@@ -39,18 +39,43 @@ class LoadedImage:
     raster_rpcs: Any | None = None
 
 
-SUPPORTED_IMAGE_SUFFIXES = (".tif", ".tiff", ".geotiff", ".png", ".jpg", ".jpeg", ".webp")
+SUPPORTED_IMAGE_SUFFIXES = (
+    ".tif",
+    ".tiff",
+    ".geotiff",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".jp2",
+    ".j2k",
+    ".jpx",
+)
 SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
-# Soft caps for in-memory ingest (TAR members / decoded rasters). ~2 GiB.
+# Soft caps for a *selected* member payload (~2 GiB). Listing ignores non-images.
 MAX_ARCHIVE_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
-MAX_ARCHIVE_EXPANDED_BYTES = 2 * 1024 * 1024 * 1024
-MAX_ARCHIVE_MEMBERS = 2_048
+MAX_ARCHIVE_MEMBERS = 500_000
 MAX_DECODED_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def is_tar_archive(filename: str) -> bool:
     """Return whether a filename represents a supported TAR archive."""
     return filename.lower().endswith(SUPPORTED_ARCHIVE_SUFFIXES)
+
+
+def _is_junk_archive_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    base = parts[-1] if parts else path
+    if base == ".DS_Store" or base.startswith("._"):
+        return True
+    return any(part == "__MACOSX" for part in parts)
+
+
+def _is_supported_image_path(path: str) -> bool:
+    lower = path.lower()
+    return (not _is_junk_archive_path(path)) and lower.endswith(SUPPORTED_IMAGE_SUFFIXES)
 
 
 def _tar_stream_mode(filename: str) -> str:
@@ -68,35 +93,29 @@ def scan_archive_image_entries(
     """
     Stream-scan a TAR for image members.
 
-    Returns dicts with name / offset (data start) / size so callers can later
-    fetch a single member with an HTTP Range / GCS ranged download without
-    re-reading the whole archive. Offsets are only valid for uncompressed .tar
-    (not .tar.gz / .tgz).
+    Non-image / junk / duplicate / oversized members are skipped — they do not
+    fail the archive. Returns dicts with name / offset (data start) / size so
+    callers can later fetch a single member with an HTTP Range / GCS ranged
+    download. Offsets are only valid for uncompressed .tar (not .tar.gz / .tgz).
     """
     mode = _tar_stream_mode(filename)
     compressed = mode != "r|"
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
-    expanded_bytes = 0
     try:
         with tarfile.open(fileobj=fileobj, mode=mode) as archive:
             for member_count, member in enumerate(archive, start=1):
                 if member_count > MAX_ARCHIVE_MEMBERS:
-                    raise ValueError("The TAR archive contains too many members.")
-                expanded_bytes += max(int(member.size or 0), 0)
-                if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
-                    raise ValueError("The expanded TAR archive is too large to process.")
+                    raise ValueError("The TAR archive contains too many members to index.")
                 if not member.isfile():
                     continue
-                if not member.name.lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
+                if not _is_supported_image_path(member.name):
                     continue
                 size = int(member.size or 0)
                 if size <= 0 or size > MAX_ARCHIVE_IMAGE_BYTES:
-                    raise ValueError("An image in the TAR archive is too large to process.")
+                    continue
                 if member.name in seen:
-                    raise ValueError(
-                        "The TAR archive contains duplicate image paths and is ambiguous."
-                    )
+                    continue
                 seen.add(member.name)
                 entry: dict[str, Any] = {"name": member.name, "size": size}
                 # offset_data is reliable for uncompressed streaming TARs.
@@ -109,7 +128,7 @@ def scan_archive_image_entries(
     if not candidates:
         raise ValueError(
             "The TAR archive does not contain a supported image "
-            "(GeoTIFF, PNG, JPEG, or WebP)."
+            "(GeoTIFF, PNG, JPEG, WebP, BMP, GIF, or JPEG 2000)."
         )
     return candidates
 
@@ -125,27 +144,19 @@ def load_archive_image(
     member_name: str,
 ) -> LoadedImage:
     """Load one selected image directly from a TAR archive."""
-    if not member_name.lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
+    if not _is_supported_image_path(member_name):
         raise ValueError("The selected archive member is not a supported image.")
 
     image_bytes: bytes | None = None
-    expanded_bytes = 0
     try:
         with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as archive:
             for member_count, member in enumerate(archive, start=1):
                 if member_count > MAX_ARCHIVE_MEMBERS:
-                    raise ValueError("The TAR archive contains too many members.")
-                expanded_bytes += member.size
-                if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
-                    raise ValueError("The expanded TAR archive is too large to process.")
+                    raise ValueError("The TAR archive contains too many members to index.")
                 if not member.isfile():
                     continue
                 if member.name != member_name:
                     continue
-                if image_bytes is not None:
-                    raise ValueError(
-                        "The selected archive image path is duplicated and ambiguous."
-                    )
                 if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
                     raise ValueError("The selected image is too large to process.")
 
@@ -155,6 +166,7 @@ def load_archive_image(
                         "The selected image could not be read from the archive."
                     )
                 image_bytes = extracted.read(MAX_ARCHIVE_IMAGE_BYTES + 1)
+                break  # first match wins
     except (tarfile.TarError, OSError) as exc:
         raise ValueError("The uploaded file is not a readable TAR archive.") from exc
 

@@ -60,29 +60,55 @@ class ArchiveImageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not contain"):
             list_archive_images(archive)
 
-    def test_rejects_archives_over_the_expanded_size_limit(self) -> None:
-        archive = _tar_bytes({"source.png": _png_bytes()})
+    def test_skips_junk_and_non_images_without_failing(self) -> None:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            for name, content in {
+                "__MACOSX/._ignored.png": b"x",
+                ".DS_Store": b"junk",
+                "readme.txt": b"hi",
+                "ok.png": _png_bytes(),
+            }.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                tar.addfile(info, io.BytesIO(content))
+            # second same-named image — listing should keep the first only
+            dup = _png_bytes()
+            info = tarfile.TarInfo("ok.png")
+            info.size = len(dup)
+            tar.addfile(info, io.BytesIO(dup))
 
-        with patch("image_io.MAX_ARCHIVE_EXPANDED_BYTES", 1):
-            with self.assertRaisesRegex(ValueError, "expanded TAR archive"):
-                list_archive_images(archive)
+        self.assertEqual(list_archive_images(buffer.getvalue()), ["ok.png"])
 
-    def test_counts_non_regular_member_payloads_toward_archive_limit(self) -> None:
+    def test_lists_images_even_when_archive_has_large_non_image_members(self) -> None:
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w") as archive:
-            special = tarfile.TarInfo("large-special-member")
+            special = tarfile.TarInfo("nested/dir/")
             special.type = tarfile.DIRTYPE
-            special.size = 64
-            archive.addfile(special, io.BytesIO(b"x" * special.size))
+            special.size = 0
+            archive.addfile(special)
+
+            big = tarfile.TarInfo("blob.bin")
+            big.size = 10_000
+            archive.addfile(big, io.BytesIO(b"z" * big.size))
 
             image = _png_bytes()
             regular = tarfile.TarInfo("source.png")
             regular.size = len(image)
             archive.addfile(regular, io.BytesIO(image))
 
-        with patch("image_io.MAX_ARCHIVE_EXPANDED_BYTES", 32):
-            with self.assertRaisesRegex(ValueError, "expanded TAR archive"):
-                list_archive_images(buffer.getvalue())
+        self.assertEqual(list_archive_images(buffer.getvalue()), ["source.png"])
+
+    def test_skips_oversized_images_during_list_instead_of_failing(self) -> None:
+        png = _png_bytes()
+        archive = _tar_bytes(
+            {
+                "huge.tif": b"x" * (len(png) + 50),
+                "source.png": png,
+            }
+        )
+        with patch("image_io.MAX_ARCHIVE_IMAGE_BYTES", len(png) + 10):
+            self.assertEqual(list_archive_images(archive), ["source.png"])
 
     def test_malformed_archive_image_raises_an_image_error(self) -> None:
         archive = _tar_bytes({"source.png": b"not an image"})
