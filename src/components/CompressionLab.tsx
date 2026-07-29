@@ -111,6 +111,7 @@ const DEFAULT_PARAMS: MethodParams = {
   svdRank: 24,
   waveletKeepFraction: 0.08,
   waveletLevels: 3,
+  waveletName: 'db4',
   bandwidthKeepFraction: 0.12,
   jpegRate: 0.45,
 }
@@ -966,6 +967,7 @@ export default function CompressionLab() {
           svdRank: params.svdRank,
           waveletKeepFraction: params.waveletKeepFraction,
           waveletLevels: params.waveletLevels,
+          waveletName: params.waveletName,
           bandwidthKeepFraction: params.bandwidthKeepFraction,
           jpegRate: params.jpegRate,
           redBand,
@@ -1129,6 +1131,7 @@ export default function CompressionLab() {
               svdRank: params.svdRank,
               waveletKeepFraction: params.waveletKeepFraction,
               waveletLevels: params.waveletLevels,
+              waveletName: params.waveletName,
               bandwidthKeepFraction: params.bandwidthKeepFraction,
               jpegRate: params.jpegRate,
               redBand,
@@ -1600,6 +1603,21 @@ export default function CompressionLab() {
           {method === 'Wavelet transformation' && (
             <>
               <label>
+                Wavelet
+                <select
+                  value={params.waveletName}
+                  onChange={(e) =>
+                    setParams((p) => ({ ...p, waveletName: e.target.value }))
+                  }
+                >
+                  <option value="db4">db4 (best quality)</option>
+                  <option value="db2">db2</option>
+                  <option value="sym4">sym4</option>
+                  <option value="sym2">sym2</option>
+                  <option value="haar">haar</option>
+                </select>
+              </label>
+              <label>
                 Keep fraction
                 <input
                   type="range"
@@ -1632,6 +1650,12 @@ export default function CompressionLab() {
                 />
                 <span>{params.waveletLevels}</span>
               </label>
+              {engine === 'browser' && params.waveletName !== 'haar' && (
+                <p className="hint">
+                  Browser uses Haar multilevel; switch Engine → Cloud Run for{' '}
+                  {params.waveletName}.
+                </p>
+              )}
             </>
           )}
           {method === 'Bandwidth transformation' && (

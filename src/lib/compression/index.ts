@@ -9,6 +9,8 @@ export type MethodParams = {
   svdRank: number
   waveletKeepFraction: number
   waveletLevels: number
+  /** Wavelet family for Cloud Run / Python (browser always uses Haar). */
+  waveletName: string
   bandwidthKeepFraction: number
   jpegRate: number
 }
@@ -38,6 +40,7 @@ export async function runCompression(
     result = runWaveletCompression(bands, bandOrder, width, height, {
       keepFraction: params.waveletKeepFraction,
       levels: params.waveletLevels,
+      wavelet: params.waveletName,
     })
   } else if (method === 'Bandwidth transformation') {
     result = runBandwidthCompression(

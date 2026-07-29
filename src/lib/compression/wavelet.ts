@@ -1,5 +1,16 @@
 import type { BandMap } from '../types'
 
+/**
+ * Browser wavelet compression — fixed multilevel Haar with LL preserved.
+ *
+ * The previous implementation re-transformed the *entire* image at every level
+ * (incorrect). True multilevel DWT only recurses into the LL quadrant.
+ * Approximation coefficients are always kept; ``keepFraction`` then budgets the
+ * largest detail coefficients (same policy as the Python/db4 path).
+ *
+ * Daubechies-4 lives on Cloud Run / PyWavelets; Haar is the portable browser basis.
+ */
+
 function haarForward(row: Float64Array): Float64Array {
   const n = row.length
   const out = new Float64Array(n)
@@ -28,24 +39,44 @@ function haarInverse(row: Float64Array): Float64Array {
   return out
 }
 
-function transform2D(band: Float64Array, width: number, height: number, inverse = false): Float64Array {
-  const temp = new Float64Array(band.length)
-  const out = new Float64Array(band.length)
+/** In-place 2D Haar on the top-left region [0, regionH) × [0, regionW). */
+function haar2DRegion(
+  data: Float64Array,
+  stride: number,
+  regionW: number,
+  regionH: number,
+  inverse: boolean,
+): void {
   const op = inverse ? haarInverse : haarForward
 
-  for (let y = 0; y < height; y++) {
-    const row = band.slice(y * width, y * width + width)
+  // Rows
+  for (let y = 0; y < regionH; y++) {
+    const row = new Float64Array(regionW)
+    const base = y * stride
+    for (let x = 0; x < regionW; x++) row[x] = data[base + x]
     const transformed = op(row)
-    temp.set(transformed, y * width)
+    for (let x = 0; x < regionW; x++) data[base + x] = transformed[x]
   }
 
-  for (let x = 0; x < width; x++) {
-    const col = new Float64Array(height)
-    for (let y = 0; y < height; y++) col[y] = temp[y * width + x]
+  // Columns
+  for (let x = 0; x < regionW; x++) {
+    const col = new Float64Array(regionH)
+    for (let y = 0; y < regionH; y++) col[y] = data[y * stride + x]
     const transformed = op(col)
-    for (let y = 0; y < height; y++) out[y * width + x] = transformed[y]
+    for (let y = 0; y < regionH; y++) data[y * stride + x] = transformed[y]
   }
-  return out
+}
+
+function maxSafeLevels(width: number, height: number): number {
+  let levels = 0
+  let w = width
+  let h = height
+  while (w >= 2 && h >= 2) {
+    levels += 1
+    w = Math.floor(w / 2)
+    h = Math.floor(h / 2)
+  }
+  return Math.max(1, levels)
 }
 
 function compressBandWavelet(
@@ -55,48 +86,82 @@ function compressBandWavelet(
   keepFraction: number,
   levels: number,
 ): { reconstructed: Float64Array; retained: number } {
-  let coeffs = new Float64Array(band)
-  for (let level = 0; level < levels; level++) {
-    coeffs = new Float64Array(transform2D(coeffs, width, height, false))
+  const safeLevels = Math.max(1, Math.min(levels, maxSafeLevels(width, height)))
+  const coeffs = new Float64Array(band)
+
+  // Forward multilevel DWT (LL-only recursion).
+  let regionW = width
+  let regionH = height
+  for (let level = 0; level < safeLevels; level++) {
+    haar2DRegion(coeffs, width, regionW, regionH, false)
+    regionW = Math.floor(regionW / 2)
+    regionH = Math.floor(regionH / 2)
+    if (regionW < 1 || regionH < 1) break
   }
+
+  const llW = Math.max(1, Math.floor(width / 2 ** safeLevels))
+  const llH = Math.max(1, Math.floor(height / 2 ** safeLevels))
+  const approxCount = llW * llH
+  const keepCount = Math.min(
+    coeffs.length,
+    Math.max(approxCount, Math.ceil(coeffs.length * Math.min(1, Math.max(0.001, keepFraction)))),
+  )
 
   const magnitudes = new Float64Array(coeffs.length)
   for (let i = 0; i < coeffs.length; i++) magnitudes[i] = Math.abs(coeffs[i])
-  const sorted = new Float64Array(magnitudes).sort()
-  const keepCount = Math.max(1, Math.ceil(sorted.length * keepFraction))
+
+  // Rank details; force LL above every detail so it is always retained.
+  const ranking = new Float64Array(magnitudes)
+  for (let y = 0; y < llH; y++) {
+    for (let x = 0; x < llW; x++) {
+      ranking[y * width + x] = Number.POSITIVE_INFINITY
+    }
+  }
+  const sorted = Float64Array.from(ranking).sort()
   const threshold = sorted[sorted.length - keepCount] ?? 0
-  let retained = 0
+
   const sparse = new Float64Array(coeffs.length)
+  let retained = 0
   for (let i = 0; i < coeffs.length; i++) {
-    if (Math.abs(coeffs[i]) >= threshold) {
+    const y = Math.floor(i / width)
+    const x = i % width
+    const inLL = y < llH && x < llW
+    if (inLL || Math.abs(coeffs[i]) >= threshold) {
       sparse[i] = coeffs[i]
       retained++
     }
   }
 
-  let reconstructed = sparse
-  for (let level = 0; level < levels; level++) {
-    reconstructed = new Float64Array(transform2D(reconstructed, width, height, true))
+  // Inverse multilevel DWT.
+  for (let level = safeLevels - 1; level >= 0; level--) {
+    const w = Math.max(1, Math.floor(width / 2 ** level))
+    const h = Math.max(1, Math.floor(height / 2 ** level))
+    haar2DRegion(sparse, width, w, h, true)
   }
 
   let bmin = Infinity
   let bmax = -Infinity
-  for (const v of band) {
+  for (let i = 0; i < band.length; i++) {
+    const v = band[i]
     if (v < bmin) bmin = v
     if (v > bmax) bmax = v
   }
-  for (let i = 0; i < reconstructed.length; i++) {
-    reconstructed[i] = Math.min(bmax, Math.max(bmin, reconstructed[i]))
+  for (let i = 0; i < sparse.length; i++) {
+    sparse[i] = Math.min(bmax, Math.max(bmin, sparse[i]))
   }
-  return { reconstructed, retained }
+  return { reconstructed: sparse, retained }
 }
+
+export const BROWSER_WAVELET = 'haar'
+export const WAVELET_FAMILIES = ['haar', 'db2', 'db4', 'sym2', 'sym4'] as const
+export type WaveletFamily = (typeof WAVELET_FAMILIES)[number]
 
 export function runWaveletCompression(
   bands: BandMap,
   bandOrder: string[],
   width: number,
   height: number,
-  options: { keepFraction: number; levels: number },
+  options: { keepFraction: number; levels: number; wavelet?: string },
 ): { bands: BandMap; metadata: Record<string, unknown>; compressedBytesEstimate: number } {
   const out: BandMap = {}
   let retainedTotal = 0
@@ -114,9 +179,16 @@ export function runWaveletCompression(
   return {
     bands: out,
     metadata: {
-      wavelet: 'haar',
+      wavelet: BROWSER_WAVELET,
+      requestedWavelet: options.wavelet || BROWSER_WAVELET,
       keepFraction: options.keepFraction,
       levels: options.levels,
+      preserveApproximation: true,
+      backend: 'haar-multilevel-ll',
+      note:
+        options.wavelet && options.wavelet !== 'haar'
+          ? `Browser engine uses Haar; select Cloud Run for ${options.wavelet}`
+          : undefined,
     },
     compressedBytesEstimate: retainedTotal * 8,
   }

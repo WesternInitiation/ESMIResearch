@@ -150,6 +150,7 @@ export async function runServerCompression(input: {
   svdRank: number
   waveletKeepFraction: number
   waveletLevels: number
+  waveletName?: string
   bandwidthKeepFraction: number
   jpegRate: number
   redBand?: string
@@ -163,6 +164,7 @@ export async function runServerCompression(input: {
   form.set('svd_rank', String(input.svdRank))
   form.set('wavelet_keep_fraction', String(input.waveletKeepFraction))
   form.set('wavelet_levels', String(input.waveletLevels))
+  form.set('wavelet_name', input.waveletName || 'db4')
   form.set('bandwidth_keep_fraction', String(input.bandwidthKeepFraction))
   form.set('jpeg_rate', String(input.jpegRate))
   if (input.archiveMember) form.set('archive_member', input.archiveMember)

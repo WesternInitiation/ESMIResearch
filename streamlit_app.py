@@ -656,9 +656,9 @@ with st.sidebar:
     mode = "rank"
     normalize = True
     channel_configs: dict[str, ChannelCompressionConfig] = {}
-    wavelet_name = "db2"
-    wavelet_level = 2
-    wavelet_keep_fraction = 0.2
+    wavelet_name = "db4"
+    wavelet_level = 3
+    wavelet_keep_fraction = 0.08
     bandwidth_keep_fraction = 0.25
     jpeg2000_rate = 20
 
@@ -711,7 +711,11 @@ with st.sidebar:
                 )
                 st.caption(f"Effective energy target: {adjusted:.3f}")
     elif method == "Wavelet transformation":
-        wavelet_name = st.selectbox("Wavelet family", options=["db1", "db2", "haar", "sym2"])
+        wavelet_name = st.selectbox(
+            "Wavelet family",
+            options=["db4", "db2", "haar", "sym4", "sym2", "db1"],
+            index=0,
+        )
         wavelet_level = st.slider("Wavelet decomposition level", min_value=1, max_value=5, value=2)
         wavelet_keep_fraction = st.slider(
             "Wavelet coefficient keep fraction",

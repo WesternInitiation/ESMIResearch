@@ -169,6 +169,7 @@ def _run_method(
     svd_rank: int,
     wavelet_keep_fraction: float,
     wavelet_levels: int,
+    wavelet_name: str,
     bandwidth_keep_fraction: float,
     jpeg_rate: float,
 ) -> Any:
@@ -185,7 +186,7 @@ def _run_method(
     if method == "Wavelet transformation":
         return run_wavelet_compression(
             bands,
-            wavelet="haar",
+            wavelet=(wavelet_name or "db4").strip() or "db4",
             level=max(1, int(wavelet_levels)),
             keep_fraction=float(np.clip(wavelet_keep_fraction, 0.001, 1.0)),
         )
@@ -457,6 +458,7 @@ async def compress(
     svd_rank: int = Form(32),
     wavelet_keep_fraction: float = Form(0.08),
     wavelet_levels: int = Form(3),
+    wavelet_name: str = Form("db4"),
     bandwidth_keep_fraction: float = Form(0.12),
     jpeg_rate: float = Form(0.45),
     red_band: str | None = Form(None),
@@ -527,6 +529,7 @@ async def compress(
             svd_rank=svd_rank,
             wavelet_keep_fraction=wavelet_keep_fraction,
             wavelet_levels=wavelet_levels,
+            wavelet_name=wavelet_name,
             bandwidth_keep_fraction=bandwidth_keep_fraction,
             jpeg_rate=jpeg_rate,
         )
