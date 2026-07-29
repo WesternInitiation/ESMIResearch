@@ -33,6 +33,11 @@ import {
   extractArchiveMember,
 } from '@/lib/archive'
 import {
+  FILE_INPUT_ACCEPT,
+  RASTER_FILE_INPUT_ACCEPT,
+  SUPPORTED_IMAGE_LABEL,
+} from '@/lib/imageFormats'
+import {
   archiveSelectionFromMembers,
   inspectUpload,
   isLikelySingleBand,
@@ -1563,20 +1568,22 @@ export default function CompressionLab() {
         <aside className="panel controls">
           <h2>Source</h2>
           <label className="file">
-            <span>Upload GeoTIFF / PNG / JPEG / TAR / TAR.GZ (up to ~2 GiB)</span>
+            <span>
+              Upload {SUPPORTED_IMAGE_LABEL} or TAR / TAR.GZ (up to ~2 GiB)
+            </span>
             <input
               type="file"
-              accept=".tif,.tiff,.geotiff,.png,.jpg,.jpeg,.webp,.tar,.tar.gz,.tgz"
+              accept={FILE_INPUT_ACCEPT}
               onChange={(e) => void onFile(e.target.files?.[0] ?? null)}
             />
           </label>
 
           {pendingRedSingle && (
             <label className="file">
-              <span>Upload NIR single-band TIF (pairs with Red above)</span>
+              <span>Upload NIR single-band image (pairs with Red above)</span>
               <input
                 type="file"
-                accept=".tif,.tiff,.geotiff"
+                accept={RASTER_FILE_INPUT_ACCEPT}
                 disabled={busy}
                 onChange={(e) => void onNirPairFile(e.target.files?.[0] ?? null)}
               />

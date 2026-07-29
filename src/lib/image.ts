@@ -7,6 +7,15 @@ import {
   listingFromMembers,
   type ArchiveListing,
 } from './archive'
+import {
+  SUPPORTED_IMAGE_LABEL,
+  bufferLooksLikeJpeg2000,
+  bufferLooksLikeTiff,
+  isGeoTiffFilename,
+  isJpeg2000Filename,
+  isSupportedImageFilename,
+  mimeForImageFilename,
+} from './imageFormats'
 import type { BandMap, ImageSize } from './types'
 
 export type LoadedImage = {
@@ -420,11 +429,53 @@ export async function loadImageBuffer(
   filename: string,
   originalBytes: number,
 ): Promise<LoadedImage> {
-  const name = filename.toLowerCase()
-  if (name.endsWith('.tif') || name.endsWith('.tiff') || name.endsWith('.geotiff')) {
-    return loadGeoTiff(buffer, filename, originalBytes)
+  const looksTiff = bufferLooksLikeTiff(buffer)
+  const looksJp2 = bufferLooksLikeJpeg2000(buffer)
+  const namedTiff = isGeoTiffFilename(filename)
+  const namedJp2 = isJpeg2000Filename(filename)
+
+  // Prefer GeoTIFF / classic TIFF whenever the name or magic says so — including
+  // Landsat-style .TIF and mislabeled members that are still TIFF bytes.
+  if (namedTiff || looksTiff) {
+    try {
+      return await loadGeoTiff(buffer, filename, originalBytes)
+    } catch (err) {
+      if (namedTiff || !isSupportedImageFilename(filename)) {
+        const detail = err instanceof Error ? err.message : String(err)
+        throw new Error(
+          `Could not read TIFF/GeoTIFF "${filename.split('/').pop() || filename}": ${detail}`,
+        )
+      }
+      // Rare false-positive magic on a normal raster — fall through.
+    }
   }
-  return loadRasterViaCanvas(buffer, filename, originalBytes)
+
+  if (namedJp2 || looksJp2) {
+    // Most browsers cannot decode JPEG 2000; try createImageBitmap, then guide the user.
+    try {
+      return await loadRasterViaCanvas(buffer, filename, originalBytes)
+    } catch {
+      throw new Error(
+        `JPEG 2000 (${filename.split('/').pop() || filename}) is not decodable in this browser. ` +
+          'Use Engine → Cloud Run, or convert the band to GeoTIFF / PNG first.',
+      )
+    }
+  }
+
+  if (!isSupportedImageFilename(filename)) {
+    throw new Error(
+      `Unsupported file type: ${filename}. Supported images: ${SUPPORTED_IMAGE_LABEL}.`,
+    )
+  }
+
+  try {
+    return await loadRasterViaCanvas(buffer, filename, originalBytes)
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(
+      `Could not decode image "${filename.split('/').pop() || filename}": ${detail}`,
+    )
+  }
 }
 
 async function loadGeoTiff(
@@ -465,8 +516,16 @@ async function loadRasterViaCanvas(
   filename: string,
   originalBytes: number,
 ): Promise<LoadedImage> {
-  const blob = new Blob([buffer])
-  const bitmap = await createImageBitmap(blob)
+  const mime = mimeForImageFilename(filename)
+  const blob = new Blob([buffer], { type: mime !== 'application/octet-stream' ? mime : undefined })
+  let bitmap: ImageBitmap
+  try {
+    bitmap = await createImageBitmap(blob)
+  } catch {
+    // Retry with a typed blob when the extension was missing / wrong.
+    const typed = new Blob([buffer], { type: mime || 'image/png' })
+    bitmap = await createImageBitmap(typed)
+  }
   const width = bitmap.width
   const height = bitmap.height
   const canvas = document.createElement('canvas')

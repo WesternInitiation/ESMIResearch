@@ -12,9 +12,10 @@ import {
   serviceAccountCredentialsForDemo,
   storageClientForDemo,
 } from '@/lib/gcs'
+import { DEMO_OBJECT_EXT_RE, ARCHIVE_EXT_RE, SUPPORTED_IMAGE_LABEL } from '@/lib/imageFormats'
 
-const DEMO_IMAGE_EXT = /\.(tif|tiff|geotiff|png|jpe?g|webp|tar\.gz|tgz|tar)$/i
-const DEMO_ARCHIVE_EXT = /\.(tar\.gz|tgz|tar)$/i
+const DEMO_IMAGE_EXT = DEMO_OBJECT_EXT_RE
+const DEMO_ARCHIVE_EXT = ARCHIVE_EXT_RE
 /** Archives larger than this must use manifest.json or Cloud Run listing. */
 const LARGE_ARCHIVE_BYTES = 40 * 1024 * 1024
 
@@ -369,7 +370,7 @@ export async function buildDemoCatalog(
 
   if (!candidates.length) {
     throw new Error(
-      `No demo images found in gs://${bucketName}. Upload a .tif / .png / .tar(.gz).`,
+      `No demo images found in gs://${bucketName}. Upload ${SUPPORTED_IMAGE_LABEL} or a .tar / .tar.gz.`,
     )
   }
 

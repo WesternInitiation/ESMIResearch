@@ -58,7 +58,7 @@ signed URL, then Cloud Run downloads `gcs_uri`. Method / NDVI compare stay in th
 
 ## Features
 
-- Upload GeoTIFF, PNG, JPEG, or **TAR / TAR.GZ** archives (**up to ~2 GiB** in the browser / Streamlit)
+- Upload GeoTIFF (`.tif` / `.tiff`), PNG, JPEG, WebP, BMP, GIF, JPEG 2000, or **TAR / TAR.GZ** archives (**up to ~2 GiB** in the browser / Streamlit)
 - Engines: **Browser** (Web Worker, large files) or **Cloud Run** (Python; direct HTTP uploads ~30 MB max due to platform limits)
 - Methods: SVD, wavelet, bandwidth, JPEG2000
 - Per-band RMSE / MAE / PSNR / SSIM + optional NDVI

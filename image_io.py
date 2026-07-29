@@ -43,6 +43,7 @@ SUPPORTED_IMAGE_SUFFIXES = (
     ".tif",
     ".tiff",
     ".geotiff",
+    ".gtiff",
     ".png",
     ".jpg",
     ".jpeg",
@@ -54,6 +55,12 @@ SUPPORTED_IMAGE_SUFFIXES = (
     ".jpx",
 )
 SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
+GEO_TIFF_SUFFIXES = (".tif", ".tiff", ".geotiff", ".gtiff")
+JPEG2000_SUFFIXES = (".jp2", ".j2k", ".jpx")
+RASTER_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+SUPPORTED_IMAGE_LABEL = (
+    ".tif / .tiff / .geotiff / .png / .jpg / .jpeg / .webp / .bmp / .gif / .jp2"
+)
 # Soft caps for a *selected* member payload (~2 GiB). Listing ignores non-images.
 MAX_ARCHIVE_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
 # Soft ceiling only — real archives stop earlier via tarfile iteration.
@@ -77,6 +84,31 @@ def _is_junk_archive_path(path: str) -> bool:
 def _is_supported_image_path(path: str) -> bool:
     lower = path.lower()
     return (not _is_junk_archive_path(path)) and lower.endswith(SUPPORTED_IMAGE_SUFFIXES)
+
+
+def _looks_like_tiff(head: bytes) -> bool:
+    if len(head) < 4:
+        return False
+    return head[:4] in (
+        b"II*\x00",
+        b"MM\x00*",
+        b"II+\x00",
+        b"MM\x00+",
+    )
+
+
+def _looks_like_jpeg2000(head: bytes) -> bool:
+    if len(head) >= 8 and head[4:8] == b"jP  ":
+        return True
+    return len(head) >= 4 and head[:4] == b"\xff\x4f\xff\x51"
+
+
+def _peek_head(file: BinaryIO, size: int = 16) -> bytes:
+    pos = file.tell()
+    try:
+        return file.read(size) or b""
+    finally:
+        file.seek(pos)
 
 
 def _folder_prefixes_for_path(path: str) -> list[str]:
@@ -138,7 +170,7 @@ def scan_archive_image_entries(
     if not candidates:
         raise ValueError(
             "The TAR archive does not contain a supported image "
-            "(GeoTIFF, PNG, JPEG, WebP, BMP, GIF, or JPEG 2000)."
+            f"({SUPPORTED_IMAGE_LABEL})."
         )
     return candidates
 
@@ -221,6 +253,7 @@ def _normalize_band_name(index: int, count: int) -> str:
 
 
 def load_png(file: BinaryIO) -> LoadedImage:
+    """Load a Pillow-decodable raster (PNG / JPEG / WebP / BMP / GIF / …)."""
     image = Image.open(file)
     if image.mode == "P":
         image = image.convert("RGBA" if "transparency" in image.info else "RGB")
@@ -361,12 +394,47 @@ def _apply_common_band_aliases(bands: dict[str, np.ndarray], order: list[str]) -
 
 
 def load_image(file: BinaryIO, filename: str) -> LoadedImage:
+    """Load an image by extension and/or magic bytes (TIFF / JP2 / raster)."""
     lower = filename.lower()
-    if lower.endswith((".tif", ".tiff", ".geotiff")):
-        return load_geotiff(file)
-    if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+    head = _peek_head(file)
+    named_tiff = lower.endswith(GEO_TIFF_SUFFIXES)
+    named_jp2 = lower.endswith(JPEG2000_SUFFIXES)
+    named_raster = lower.endswith(RASTER_SUFFIXES)
+    looks_tiff = _looks_like_tiff(head)
+    looks_jp2 = _looks_like_jpeg2000(head)
+
+    if named_tiff or looks_tiff:
+        try:
+            return load_geotiff(file)
+        except Exception:
+            if named_tiff or not (named_raster or named_jp2):
+                raise
+            file.seek(0)
+
+    if named_jp2 or looks_jp2:
+        # Prefer GDAL/rasterio when available (JP2OpenJPEG), else Pillow.
+        if HAS_RASTERIO:
+            try:
+                pos = file.tell()
+                loaded = load_geotiff(file)
+                loaded.metadata = {**loaded.metadata, "format_hint": "jpeg2000"}
+                return loaded
+            except Exception:
+                file.seek(pos)
+        try:
+            return load_png(file)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not decode JPEG 2000 '{filename}'. "
+                "Install a GDAL build with JP2 support, or convert to GeoTIFF/PNG."
+            ) from exc
+
+    if named_raster or lower.endswith(SUPPORTED_IMAGE_SUFFIXES):
         return load_png(file)
-    raise ValueError(f"Unsupported file type: {filename}")
+
+    raise ValueError(
+        f"Unsupported file type: {filename}. Supported images: {SUPPORTED_IMAGE_LABEL}."
+    )
 
 
 def to_display_rgb(bands: dict[str, np.ndarray], order: list[str]) -> np.ndarray:

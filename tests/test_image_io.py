@@ -127,6 +127,57 @@ class ArchiveImageTests(unittest.TestCase):
         self.assertEqual(listing["images"], ["scene/source.png"])
         self.assertEqual(listing["folders"], ["scene"])
 
+    def test_lists_gtiff_and_bmp_members(self) -> None:
+        archive = _tar_bytes(
+            {
+                "scene/band.gtiff": _png_bytes(),
+                "scene/preview.bmp": _png_bytes(),
+                "notes.txt": b"meta",
+            }
+        )
+        listing = list_archive_listing(archive)
+        self.assertEqual(
+            listing["images"],
+            ["scene/band.gtiff", "scene/preview.bmp"],
+        )
+
+    def test_load_image_accepts_bmp_extension(self) -> None:
+        from image_io import load_image
+
+        png = _png_bytes()
+        # Pillow can open PNG bytes regardless of extension when format is embedded;
+        # use a real BMP for the extension path.
+        bmp_buf = io.BytesIO()
+        Image.fromarray(np.arange(64, dtype=np.uint8).reshape(8, 8)).save(
+            bmp_buf, format="BMP"
+        )
+        loaded = load_image(io.BytesIO(bmp_buf.getvalue()), "gray.bmp")
+        self.assertEqual(loaded.bands["gray"].shape, (8, 8))
+
+    def test_load_image_detects_tiff_magic_without_extension(self) -> None:
+        if not HAS_RASTERIO:
+            self.skipTest("rasterio is not installed")
+        from image_io import load_image
+        from rasterio.io import MemoryFile
+        from rasterio.transform import from_origin
+
+        array = np.arange(16, dtype=np.uint16).reshape(4, 4)
+        with MemoryFile() as memfile:
+            with memfile.open(
+                driver="GTiff",
+                height=4,
+                width=4,
+                count=1,
+                dtype="uint16",
+                transform=from_origin(0, 4, 1, 1),
+                crs="EPSG:4326",
+            ) as dataset:
+                dataset.write(array, 1)
+            raw = memfile.read()
+        loaded = load_image(io.BytesIO(raw), "band_without_ext")
+        self.assertEqual(loaded.source_type, "geotiff")
+        self.assertEqual(loaded.bands["gray"].shape, (4, 4))
+
     def test_skips_oversized_images_during_list_instead_of_failing(self) -> None:
         png = _png_bytes()
         archive = _tar_bytes(

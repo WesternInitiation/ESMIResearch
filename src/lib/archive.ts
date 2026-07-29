@@ -1,20 +1,22 @@
 import { gunzipSync } from 'fflate'
+import {
+  ARCHIVE_EXT_RE,
+  IMAGE_EXT_RE,
+  SUPPORTED_IMAGE_LABEL,
+  isSupportedImageFilename,
+} from '@/lib/imageFormats'
 
-/** Raster-like members the lab can try to load. */
-const IMAGE_EXT =
-  /\.(tif|tiff|geotiff|png|jpe?g|webp|bmp|gif|jp2|j2k|jpx)$/i
 /** Soft ceiling — real archives stop earlier via checksum / ustar magic. */
 const MAX_MEMBERS = 2_000_000
 /** Soft cap for a single extracted member payload (~2 GiB). */
 export const MAX_INGEST_BYTES = 2 * 1024 * 1024 * 1024
 
 export function isTarArchive(filename: string): boolean {
-  const name = filename.toLowerCase()
-  return name.endsWith('.tar') || name.endsWith('.tar.gz') || name.endsWith('.tgz')
+  return ARCHIVE_EXT_RE.test(filename)
 }
 
 export function isSupportedArchiveImage(path: string): boolean {
-  return IMAGE_EXT.test(path) && !isJunkArchivePath(path)
+  return isSupportedImageFilename(path) && !isJunkArchivePath(path)
 }
 
 function isJunkArchivePath(path: string): boolean {
@@ -180,7 +182,7 @@ export function listArchiveListing(
       continue
     }
     if (!isRegularFileType(entry.typeFlag)) continue
-    if (!IMAGE_EXT.test(name)) {
+    if (!IMAGE_EXT_RE.test(name)) {
       // Still record parent folders so users can navigate into dirs that only
       // contain metadata + images deeper down… parents of any file help UX.
       for (const p of folderPrefixesForPath(name)) folderSet.add(p)
@@ -195,7 +197,7 @@ export function listArchiveListing(
 
   if (!images.length) {
     throw new Error(
-      'The TAR archive does not contain a supported image (.tif, .tiff, .png, .jpg, .jpeg, .webp, .bmp, .gif, .jp2).',
+      `The TAR archive does not contain a supported image (${SUPPORTED_IMAGE_LABEL}).`,
     )
   }
   return {
@@ -346,7 +348,7 @@ export async function scanUncompressedTarImageEntries(
     if (
       isRegularFileType(typeFlag) &&
       !isJunkArchivePath(fullName) &&
-      IMAGE_EXT.test(fullName) &&
+      IMAGE_EXT_RE.test(fullName) &&
       size > 0 &&
       size <= MAX_INGEST_BYTES &&
       !seen.has(fullName)
@@ -360,7 +362,7 @@ export async function scanUncompressedTarImageEntries(
 
   if (!entries.length) {
     throw new Error(
-      'The TAR archive does not contain a supported image (.tif, .tiff, .png, .jpg, .jpeg, .webp, .bmp, .gif, .jp2).',
+      `The TAR archive does not contain a supported image (${SUPPORTED_IMAGE_LABEL}).`,
     )
   }
   return entries.sort((a, b) => a.name.localeCompare(b.name))

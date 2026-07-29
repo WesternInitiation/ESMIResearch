@@ -37,8 +37,10 @@ export function gcsDemoBucket(): string {
   )
 }
 
-const DEMO_IMAGE_EXT = /\.(tif|tiff|geotiff|png|jpe?g|webp|tar\.gz|tgz|tar)$/i
-const DEMO_ARCHIVE_EXT = /\.(tar\.gz|tgz|tar)$/i
+import { ARCHIVE_EXT_RE, DEMO_OBJECT_EXT_RE } from '@/lib/imageFormats'
+
+const DEMO_IMAGE_EXT = DEMO_OBJECT_EXT_RE
+const DEMO_ARCHIVE_EXT = ARCHIVE_EXT_RE
 
 export type DemoObjectInfo = {
   name: string
