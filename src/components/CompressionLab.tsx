@@ -1396,6 +1396,41 @@ export default function CompressionLab() {
     }
   }
 
+  async function onDownloadCompressedTif() {
+    if (!result && !compressedArtifactPreview) return
+    setBusy(true)
+    setError(null)
+    try {
+      const filename = `esmi-compressed-${Date.now()}.tif`
+      if (result && Object.keys(result.bands).length > 0) {
+        // Same lossy stand-in used for the Compressed preview / index compare.
+        const compressedBands = await jpegRoundtripBands(
+          result.bands,
+          result.bandOrder,
+          result.width,
+          result.height,
+          jpegQualityForMethod(),
+        )
+        await downloadBandsAsGeoTiff(
+          compressedBands,
+          result.bandOrder,
+          result.width,
+          result.height,
+          filename,
+        )
+      } else if (compressedArtifactPreview) {
+        await downloadRgbPreviewAsGeoTiff(compressedArtifactPreview, filename)
+      } else {
+        throw new Error('No compressed image available to download')
+      }
+      setStatus('Downloaded compressed GeoTIFF')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Compressed GeoTIFF download failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="lab">
       <header className="lab-header">
@@ -1815,8 +1850,18 @@ export default function CompressionLab() {
               <figure>
                 <figcaption>Compressed</figcaption>
                 {compressedArtifactPreview ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
+                    <button
+                      type="button"
+                      className="secondary preview-download"
+                      disabled={busy}
+                      onClick={() => void onDownloadCompressedTif()}
+                    >
+                      Download compressed TIF
+                    </button>
+                  </>
                 ) : (
                   <div className="empty">Waiting for compression</div>
                 )}
