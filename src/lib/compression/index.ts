@@ -1,5 +1,6 @@
 import { runBandwidthCompression } from './bandwidth'
 import { runJpeg2000Compression } from './jpeg2000'
+import { runLzwCompression } from './lzw'
 import { runSvdCompression } from './svd'
 import { runWaveletCompression } from './wavelet'
 import { estimateByteSize, reportAllBands } from '../metrics'
@@ -50,6 +51,8 @@ export async function runCompression(
       height,
       params.bandwidthKeepFraction,
     )
+  } else if (method === 'LZW') {
+    result = runLzwCompression(bands, bandOrder)
   } else {
     result = await runJpeg2000Compression(
       bands,

@@ -4,7 +4,7 @@ ESMI compression API for Google Cloud Run (free tier friendly).
 Endpoints:
   GET  /health
   POST /v1/archive/list   — list image members in a TAR / TAR.GZ
-  POST /v1/compress       — run SVD / wavelet / bandwidth / JPEG2000
+  POST /v1/compress       — run SVD / wavelet / bandwidth / JPEG2000 / LZW
 
 Build from the repository root:
   docker build -f cloud_run/Dockerfile .
@@ -27,6 +27,7 @@ from PIL import Image
 
 from compression.bandwidth import run_bandwidth_compression
 from compression.jpeg2000 import run_jpeg2000_compression
+from compression.lzw import run_lzw_compression
 from compression.svd import run_svd_compression
 from compression.wavelet import run_wavelet_compression
 from image_io import (
@@ -45,6 +46,7 @@ MethodName = Literal[
     "Wavelet transformation",
     "Bandwidth transformation",
     "JPEG2000",
+    "LZW",
 ]
 
 app = FastAPI(title="ESMI Compression API", version="1.0.0")
@@ -195,6 +197,8 @@ def _run_method(
             bands,
             keep_fraction=float(np.clip(bandwidth_keep_fraction, 0.001, 1.0)),
         )
+    if method == "LZW":
+        return run_lzw_compression(bands)
     # JPEG2000 — Pillow may lack OpenJPEG; fall back to JPEG quality proxy.
     rate = max(1, int(round(float(np.clip(jpeg_rate, 0.05, 1.0)) * 100)))
     try:
@@ -469,6 +473,7 @@ async def compress(
         "Wavelet transformation",
         "Bandwidth transformation",
         "JPEG2000",
+        "LZW",
     ):
         raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
 

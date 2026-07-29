@@ -222,6 +222,7 @@ export default function CompressionLab() {
 
   function jpegQualityForMethod(): number {
     if (method === 'JPEG2000') return params.jpegRate
+    if (method === 'LZW') return 0.85
     if (method === 'Wavelet transformation') {
       return Math.min(0.92, Math.max(0.08, params.waveletKeepFraction * 4))
     }
@@ -1403,7 +1404,7 @@ export default function CompressionLab() {
           <h1>ESMI Research</h1>
           <p className="lede">
             Browser-side satellite compression lab with optional Google Cloud Run
-            backend for heavier jobs — SVD, wavelet, bandwidth, and JPEG2000, plus
+            backend for heavier jobs — SVD, wavelet, bandwidth, JPEG2000, and LZW, plus
             TAR archives and NDVI checks.
           </p>
         </div>
@@ -1693,6 +1694,12 @@ export default function CompressionLab() {
               <span>{params.jpegRate.toFixed(2)}</span>
             </label>
           )}
+          {method === 'LZW' && (
+            <p className="hint">
+              LZW quantizes each band to 8-bit then runs classic dictionary coding
+              (ashmeet13-style, adapted for float satellite bands). No extra knobs.
+            </p>
+          )}
 
           <div className="actions">
             <button type="button" disabled={!image || !rawFile || busy} onClick={() => void onRun()}>
@@ -1709,8 +1716,8 @@ export default function CompressionLab() {
               onClick={() => void onCompareAll()}
               title={
                 engine === 'cloud-run'
-                  ? 'Runs all four methods on Cloud Run'
-                  : 'Runs all four methods in the browser worker'
+                  ? 'Runs all methods on Cloud Run'
+                  : 'Runs all methods in the browser worker'
               }
             >
               Compare all methods
@@ -2176,7 +2183,7 @@ export default function CompressionLab() {
           <section className="panel">
             <h2>Method comparison</h2>
             <p className="hint">
-              Runs all four methods on the selected engine (Browser or Cloud Run).
+              Runs all methods on the selected engine (Browser or Cloud Run).
             </p>
             <div className="table-wrap">
               <table>

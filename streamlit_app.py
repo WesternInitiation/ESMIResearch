@@ -20,6 +20,7 @@ import streamlit as st
 from compression.base import CompressionExecutionResult, compute_band_metrics
 from compression.bandwidth import run_bandwidth_compression
 from compression.jpeg2000 import run_jpeg2000_compression
+from compression.lzw import run_lzw_compression
 from compression.svd import run_svd_compression
 from compression.wavelet import run_wavelet_compression
 from image_io import (
@@ -73,7 +74,7 @@ st.set_page_config(page_title="ESMI Compression Lab", page_icon="🛰️", layou
 st.title("ESMI Research — Compression Analysis Lab")
 st.caption(
     "Benchmark satellite image compression with SVD, wavelets, bandwidth-domain "
-    "filtering, and JPEG2000 while tracking runtime, fidelity, and NDVI preservation."
+    "filtering, JPEG2000, and LZW while tracking runtime, fidelity, and NDVI preservation."
 )
 
 COMPRESSION_METHODS = [
@@ -81,6 +82,7 @@ COMPRESSION_METHODS = [
     "Wavelet transformation",
     "Bandwidth transformation",
     "JPEG2000",
+    "LZW",
 ]
 
 UPLOAD_FILE_TYPES = [
@@ -428,6 +430,8 @@ def _run_selected_method(
             working_bands,
             keep_fraction=bandwidth_keep_fraction,
         )
+    elif method == "LZW":
+        raw_result = run_lzw_compression(working_bands)
     else:
         raw_result = run_jpeg2000_compression(
             working_bands,
@@ -623,7 +627,7 @@ with st.sidebar:
         value=False,
         help=(
             "Unlocks the Method Comparison tab so you can benchmark SVD, wavelet, "
-            "bandwidth, and JPEG2000 on the same image without re-running on every "
+            "bandwidth, JPEG2000, and LZW on the same image without re-running on every "
             "page interaction."
         ),
     )
@@ -731,6 +735,11 @@ with st.sidebar:
             max_value=1.0,
             value=0.25,
             step=0.01,
+        )
+    elif method == "LZW":
+        st.caption(
+            "LZW quantizes each band to uint8 (min–max) then applies classic dictionary "
+            "coding (adapted from ashmeet13/LZW-Image-Compression)."
         )
     else:
         jpeg2000_rate = st.slider(
@@ -1109,7 +1118,7 @@ with tab_ndvi:
 with tab_methods:
     st.subheader("Benchmark every compression method")
     st.caption(
-        "Compare SVD, wavelet, bandwidth, and JPEG2000 on the same image using the "
+        "Compare SVD, wavelet, bandwidth, JPEG2000, and LZW on the same image using the "
         "current sidebar parameters. Results are stored until you change settings or "
         "upload a new file — they do not re-run on every page refresh."
     )

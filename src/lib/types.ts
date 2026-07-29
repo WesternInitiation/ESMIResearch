@@ -30,10 +30,12 @@ export type CompressionMethod =
   | 'Wavelet transformation'
   | 'Bandwidth transformation'
   | 'JPEG2000'
+  | 'LZW'
 
 export const COMPRESSION_METHODS: CompressionMethod[] = [
   'SVD',
   'Wavelet transformation',
   'Bandwidth transformation',
   'JPEG2000',
+  'LZW',
 ]
