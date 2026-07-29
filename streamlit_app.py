@@ -30,7 +30,7 @@ from image_io import (
     load_image,
     to_display_rgb,
 )
-from ndvi import compare_ndvi, compute_ndvi
+from ndvi import compare_index_maps, compute_ndvi, compute_ndwi
 from supabase_client import (
     SupabaseImportError,
     SupabaseNotConfiguredError,
@@ -116,6 +116,15 @@ def _list_archive_images(file_bytes: bytes) -> list[str]:
 def _reset_ndvi_confirmation() -> None:
     st.session_state["confirm_ndvi"] = False
     st.session_state.pop("ndvi_run", None)
+
+
+def _render_index_map(ax, index_map: np.ndarray, title: str) -> None:
+    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap.set_bad(color="white")
+    im = ax.imshow(index_map, cmap=cmap, vmin=-1, vmax=1)
+    ax.set_title(title)
+    ax.axis("off")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
 
 def _max_rank(shape: tuple[int, ...]) -> int:
@@ -317,10 +326,7 @@ def _render_shared_run_viewer() -> None:
 
 
 def _render_ndvi(ax, ndvi: np.ndarray, title: str) -> None:
-    im = ax.imshow(ndvi, cmap="RdYlGn", vmin=-1, vmax=1)
-    ax.set_title(title)
-    ax.axis("off")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    _render_index_map(ax, ndvi, title)
 
 
 def _render_error_map(ax, original_rgb: np.ndarray, compressed_rgb: np.ndarray) -> None:
@@ -966,7 +972,7 @@ else:
             )
 
 tab_overview, tab_ndvi, tab_methods, tab_matrix, tab_report = st.tabs(
-    ["Overview", "NDVI", "Method Comparison", "Matrices", "Analysis Report"]
+    ["Overview", "NDVI/NDWI", "Method Comparison", "Matrices", "Analysis Report"]
 )
 
 with tab_overview:
@@ -998,76 +1004,140 @@ with tab_overview:
 
 ndvi_run = st.session_state.get("ndvi_run")
 with tab_ndvi:
-    st.subheader("Optional NDVI preservation test")
+    st.subheader("Optional NDVI/NDWI preservation test")
     st.caption(
-        "Use this when your image has Red and NIR bands (typical for GeoTIFF "
-        "satellite scenes). NDVI is not run during compression — confirm and run "
-        "it here to measure vegetation-index fidelity after compression."
+        "Same workflow as the browser lab: pick an index, choose bands, then confirm "
+        "to measure fidelity after compression. Landsat Collection 2 DN values are "
+        "auto-scaled to surface reflectance (NDVI_RR style) when detected."
     )
-    red_name = st.selectbox(
-        "Red band for NDVI",
-        options=band_order,
-        index=band_order.index("red") if "red" in band_order else 0,
-        key="ndvi_red_band",
-        on_change=_reset_ndvi_confirmation,
-    )
-    nir_name = st.selectbox(
-        "NIR band for NDVI",
-        options=band_order,
-        index=band_order.index("nir") if "nir" in band_order else min(1, band_count - 1),
-        key="ndvi_nir_band",
+
+    index_kind = st.radio(
+        "Index",
+        options=["ndvi", "ndwi"],
+        format_func=lambda value: {
+            "ndvi": "NDVI (NIR − Red)",
+            "ndwi": "NDWI / MNDWI (Green − NIR/SWIR)",
+        }[value],
+        horizontal=True,
+        key="index_kind",
         on_change=_reset_ndvi_confirmation,
     )
 
-    distinct_ndvi_bands = red_name != nir_name
-    if red_name == nir_name:
-        st.warning("Select distinct Red and NIR bands to compute NDVI.")
+    if index_kind == "ndvi":
+        first_name = st.selectbox(
+            "Red band for NDVI",
+            options=band_order,
+            index=band_order.index("red") if "red" in band_order else 0,
+            key="ndvi_red_band",
+            on_change=_reset_ndvi_confirmation,
+        )
+        second_name = st.selectbox(
+            "NIR band for NDVI",
+            options=band_order,
+            index=band_order.index("nir") if "nir" in band_order else min(1, band_count - 1),
+            key="ndvi_nir_band",
+            on_change=_reset_ndvi_confirmation,
+        )
+        index_label = "NDVI"
+    else:
+        first_name = st.selectbox(
+            "Green band for NDWI",
+            options=band_order,
+            index=band_order.index("green") if "green" in band_order else 0,
+            key="ndwi_green_band",
+            on_change=_reset_ndvi_confirmation,
+        )
+        default_second = (
+            "swir"
+            if "swir" in band_order
+            else ("nir" if "nir" in band_order else min(1, band_count - 1))
+        )
+        second_name = st.selectbox(
+            "NIR or SWIR band for NDWI / MNDWI",
+            options=band_order,
+            index=(
+                band_order.index(default_second)
+                if isinstance(default_second, str) and default_second in band_order
+                else int(default_second)
+            ),
+            key="ndwi_second_band",
+            on_change=_reset_ndvi_confirmation,
+        )
+        index_label = "MNDWI" if second_name == "swir" else "NDWI"
+
+    distinct_index_bands = first_name != second_name
+    if not distinct_index_bands:
+        st.warning(f"Select distinct bands to compute {index_label}.")
 
     st.checkbox(
-        "I confirm that I want to run the NDVI test",
+        f"I confirm that I want to run the {index_label} test",
         key="confirm_ndvi",
     )
-    run_ndvi = st.button(
-        "Confirm and run NDVI test",
+    run_index = st.button(
+        f"Confirm and run {index_label} test",
         disabled=not st.session_state.get("confirm_ndvi", False)
-        or not distinct_ndvi_bands,
+        or not distinct_index_bands,
     )
-    ndvi_signature = f"{compression_signature}:{red_name}:{nir_name}"
+    ndvi_signature = (
+        f"{compression_signature}:{index_kind}:{first_name}:{second_name}"
+    )
 
-    if run_ndvi:
-        with st.spinner("Running NDVI preservation test…"):
-            ndvi_orig = compute_ndvi(bands[red_name], bands[nir_name])
-            ndvi_comp = compute_ndvi(
-                result.reconstructed_bands[red_name],
-                result.reconstructed_bands[nir_name],
-            )
-            ndvi_metrics = compare_ndvi(ndvi_orig, ndvi_comp)
+    if run_index:
+        with st.spinner(f"Running {index_label} preservation test…"):
+            if index_kind == "ndvi":
+                index_orig = compute_ndvi(
+                    bands[first_name],
+                    bands[second_name],
+                    landsat_c2_sr=None,
+                )
+                index_comp = compute_ndvi(
+                    result.reconstructed_bands[first_name],
+                    result.reconstructed_bands[second_name],
+                    landsat_c2_sr=None,
+                )
+            else:
+                index_orig = compute_ndwi(
+                    bands[first_name],
+                    bands[second_name],
+                    landsat_c2_sr=None,
+                )
+                index_comp = compute_ndwi(
+                    result.reconstructed_bands[first_name],
+                    result.reconstructed_bands[second_name],
+                    landsat_c2_sr=None,
+                )
+            index_metrics = compare_index_maps(index_orig, index_comp)
         ndvi_run = {
             "signature": ndvi_signature,
-            "original": ndvi_orig,
-            "compressed": ndvi_comp,
-            "metrics": ndvi_metrics,
+            "kind": index_kind,
+            "label": index_label,
+            "first_band": first_name,
+            "second_band": second_name,
+            "original": index_orig,
+            "compressed": index_comp,
+            "metrics": index_metrics,
         }
         st.session_state["ndvi_run"] = ndvi_run
 
     if ndvi_run is not None and ndvi_run["signature"] == ndvi_signature:
-        ndvi_orig = ndvi_run["original"]
-        ndvi_comp = ndvi_run["compressed"]
-        ndvi_metrics = ndvi_run["metrics"]
+        index_orig = ndvi_run["original"]
+        index_comp = ndvi_run["compressed"]
+        index_metrics = ndvi_run["metrics"]
+        label = ndvi_run.get("label", index_label)
 
         n1, n2, n3, n4, n5 = st.columns(5)
-        n1.metric("NDVI RMSE", f"{ndvi_metrics.rmse:.5f}")
-        n2.metric("NDVI MAE", f"{ndvi_metrics.mae:.5f}")
-        n3.metric("NDVI correlation", f"{ndvi_metrics.correlation:.4f}")
-        n4.metric("NDVI SSIM", f"{ndvi_metrics.ssim:.4f}")
-        n5.metric("NDVI bias", f"{ndvi_metrics.bias:.5f}")
+        n1.metric(f"{label} RMSE", f"{index_metrics.rmse:.5f}")
+        n2.metric(f"{label} MAE", f"{index_metrics.mae:.5f}")
+        n3.metric(f"{label} correlation", f"{index_metrics.correlation:.4f}")
+        n4.metric(f"{label} SSIM", f"{index_metrics.ssim:.4f}")
+        n5.metric(f"{label} bias", f"{index_metrics.bias:.5f}")
 
         fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-        _render_ndvi(axes[0], ndvi_orig, "Original NDVI")
-        _render_ndvi(axes[1], ndvi_comp, "Compressed NDVI")
-        diff = ndvi_comp - ndvi_orig
+        _render_index_map(axes[0], index_orig, f"Original {label}")
+        _render_index_map(axes[1], index_comp, f"Compressed {label}")
+        diff = index_comp - index_orig
         im = axes[2].imshow(diff, cmap="coolwarm", vmin=-0.3, vmax=0.3)
-        axes[2].set_title("NDVI difference")
+        axes[2].set_title(f"{label} difference")
         axes[2].axis("off")
         plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
         st.pyplot(fig, clear_figure=True)
@@ -1078,29 +1148,37 @@ with tab_ndvi:
             supabase_ready()
             and saved_meta is not None
             and saved_meta.get("compression_signature") == compression_signature
+            and ndvi_run.get("kind", "ndvi") == "ndvi"
         )
         if can_attach_ndvi:
             if st.button("Save NDVI results to Supabase", key="save_ndvi_supabase"):
                 try:
                     save_ndvi_for_run(
                         run_id=saved_meta["run_id"],
-                        red_band=red_name,
-                        nir_band=nir_name,
-                        rmse=float(ndvi_metrics.rmse),
-                        mae=float(ndvi_metrics.mae),
-                        correlation=float(ndvi_metrics.correlation),
-                        ssim=float(ndvi_metrics.ssim),
-                        bias=float(ndvi_metrics.bias),
+                        red_band=first_name,
+                        nir_band=second_name,
+                        rmse=float(index_metrics.rmse),
+                        mae=float(index_metrics.mae),
+                        correlation=float(index_metrics.correlation),
+                        ssim=float(index_metrics.ssim),
+                        bias=float(index_metrics.bias),
                     )
                     st.success("NDVI metrics attached to the saved Supabase run.")
                 except Exception as exc:
                     st.error(f"Failed to save NDVI: {exc}")
-        elif supabase_ready():
+        elif supabase_ready() and ndvi_run.get("kind", "ndvi") == "ndvi":
             st.caption(
                 "Save the compression run to Supabase first, then attach NDVI metrics."
             )
+        elif supabase_ready():
+            st.caption(
+                "Supabase attach currently stores NDVI band labels; NDWI metrics "
+                "are shown above for this session."
+            )
     else:
-        st.info("NDVI has not been run for this compression result and band selection.")
+        st.info(
+            f"{index_label} has not been run for this compression result and band selection."
+        )
 
 with tab_methods:
     st.subheader("Benchmark every compression method")
@@ -1304,19 +1382,21 @@ with tab_report:
         },
     ]
     if ndvi_run is not None and ndvi_run["signature"] == ndvi_signature:
-        ndvi_metrics = ndvi_run["metrics"]
+        index_metrics = ndvi_run["metrics"]
+        kind = ndvi_run.get("kind", "ndvi")
+        prefix = "ndvi" if kind == "ndvi" else "ndwi"
         report_rows.extend(
             [
-                {"metric": "ndvi_status", "value": "completed"},
-                {"metric": "ndvi_rmse", "value": ndvi_metrics.rmse},
-                {"metric": "ndvi_mae", "value": ndvi_metrics.mae},
-                {"metric": "ndvi_correlation", "value": ndvi_metrics.correlation},
-                {"metric": "ndvi_ssim", "value": ndvi_metrics.ssim},
-                {"metric": "ndvi_bias", "value": ndvi_metrics.bias},
+                {"metric": f"{prefix}_status", "value": "completed"},
+                {"metric": f"{prefix}_rmse", "value": index_metrics.rmse},
+                {"metric": f"{prefix}_mae", "value": index_metrics.mae},
+                {"metric": f"{prefix}_correlation", "value": index_metrics.correlation},
+                {"metric": f"{prefix}_ssim", "value": index_metrics.ssim},
+                {"metric": f"{prefix}_bias", "value": index_metrics.bias},
             ]
         )
     else:
-        report_rows.append({"metric": "ndvi_status", "value": "not_run"})
+        report_rows.append({"metric": "index_status", "value": "not_run"})
 
     stored_comparison = st.session_state.get("method_comparison")
     if (
