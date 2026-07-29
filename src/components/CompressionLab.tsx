@@ -106,6 +106,51 @@ function bytesLabel(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
+function pixelsLabel(width: number, height: number): string {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return '—'
+  }
+  const mp = (width * height) / 1_000_000
+  const mpLabel = mp >= 10 ? mp.toFixed(1) : mp.toFixed(2)
+  return `${Math.round(width)}×${Math.round(height)} px (${mpLabel} MP)`
+}
+
+function groundResolutionLabel(res?: { x: number; y: number } | null): string | null {
+  if (!res) return null
+  const x = Math.abs(res.x)
+  const y = Math.abs(res.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x <= 0 || y <= 0) return null
+  const fmtRes = (n: number) => {
+    if (n >= 100) return n.toFixed(0)
+    if (n >= 10) return n.toFixed(1)
+    if (n >= 1) return n.toFixed(2)
+    return n.toPrecision(3)
+  }
+  if (Math.abs(x - y) / Math.max(x, y) < 0.01) {
+    return `${fmtRes(x)} m/px`
+  }
+  return `${fmtRes(x)}×${fmtRes(y)} m/px`
+}
+
+function sizeWithPixels(
+  bytes: number,
+  width?: number | null,
+  height?: number | null,
+): string {
+  const size = bytesLabel(bytes)
+  if (
+    width == null ||
+    height == null ||
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return size
+  }
+  return `${size} · ${pixelsLabel(width, height)}`
+}
+
 function estimateDecompressedBytes(result: {
   decompressedBytes?: number
   bands?: CompressionResult['bands']
@@ -1307,6 +1352,12 @@ export default function CompressionLab() {
       'compare_target',
       'band',
       'runtime_seconds',
+      'width_px',
+      'height_px',
+      'native_width_px',
+      'native_height_px',
+      'ground_resolution_x',
+      'ground_resolution_y',
       'original_bytes',
       'compressed_bytes',
       'decompressed_bytes',
@@ -1321,6 +1372,12 @@ export default function CompressionLab() {
       'engine',
     ]
     const rows: Array<Array<unknown>> = []
+    const pxW = result?.width ?? image?.size.width ?? ''
+    const pxH = result?.height ?? image?.size.height ?? ''
+    const nativeW = image?.nativeWidth ?? ''
+    const nativeH = image?.nativeHeight ?? ''
+    const gsdX = image?.groundResolution?.x ?? ''
+    const gsdY = image?.groundResolution?.y ?? ''
     if (result) {
       const decomp = estimateDecompressedBytes(result)
       rows.push([
@@ -1330,6 +1387,12 @@ export default function CompressionLab() {
         '',
         '',
         result.runtimeSeconds,
+        pxW,
+        pxH,
+        nativeW,
+        nativeH,
+        gsdX,
+        gsdY,
         result.originalBytes,
         result.compressedBytesEstimate,
         decomp,
@@ -1351,6 +1414,12 @@ export default function CompressionLab() {
           '',
           ch.band,
           result.runtimeSeconds,
+          pxW,
+          pxH,
+          nativeW,
+          nativeH,
+          gsdX,
+          gsdY,
           result.originalBytes,
           result.compressedBytesEstimate,
           decomp,
@@ -1374,6 +1443,12 @@ export default function CompressionLab() {
         indexCompareTarget,
         '',
         result?.runtimeSeconds ?? '',
+        pxW,
+        pxH,
+        nativeW,
+        nativeH,
+        gsdX,
+        gsdY,
         result?.originalBytes ?? '',
         result?.compressedBytesEstimate ?? '',
         result ? estimateDecompressedBytes(result) : '',
@@ -1397,6 +1472,12 @@ export default function CompressionLab() {
           '',
           '',
           row.runtimeSeconds,
+          pxW,
+          pxH,
+          nativeW,
+          nativeH,
+          gsdX,
+          gsdY,
           row.originalBytes,
           row.compressedBytesEstimate,
           row.decompressedBytes,
@@ -1946,12 +2027,38 @@ export default function CompressionLab() {
         <main className="main-col">
           <section className="panel">
             <h2>Preview</h2>
+            {image && (
+              <p className="hint size-meta-line">
+                Processing {pixelsLabel(image.size.width, image.size.height)}
+                {image.processScale < 0.999
+                  ? ` · native ${pixelsLabel(image.nativeWidth, image.nativeHeight)}`
+                  : ''}
+                {groundResolutionLabel(image.groundResolution)
+                  ? ` · ${groundResolutionLabel(image.groundResolution)}`
+                  : ''}
+                {` · file ${bytesLabel(image.originalBytes)}`}
+              </p>
+            )}
             <div className="preview-grid preview-grid-3">
               <figure>
                 <figcaption>Original</figcaption>
                 {originalPreview ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={originalPreview} alt="Original preview" />
+                  <>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={originalPreview} alt="Original preview" />
+                    <p className="size-meta">
+                      {image
+                        ? sizeWithPixels(
+                            image.originalBytes,
+                            image.size.width,
+                            image.size.height,
+                          )
+                        : '—'}
+                      {image?.processScale != null && image.processScale < 0.999
+                        ? ` · native ${Math.round(image.nativeWidth)}×${Math.round(image.nativeHeight)} px`
+                        : ''}
+                    </p>
+                  </>
                 ) : (
                   <div className="empty">Waiting for upload</div>
                 )}
@@ -1962,6 +2069,17 @@ export default function CompressionLab() {
                   <>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
+                    <p className="size-meta">
+                      {result
+                        ? sizeWithPixels(
+                            result.compressedBytesEstimate,
+                            result.width,
+                            result.height,
+                          )
+                        : image
+                          ? `${pixelsLabel(image.size.width, image.size.height)}`
+                          : '—'}
+                    </p>
                     <button
                       type="button"
                       className="secondary preview-download"
@@ -1981,6 +2099,17 @@ export default function CompressionLab() {
                   <>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img src={decompressedPreview} alt="Decompressed preview" />
+                    <p className="size-meta">
+                      {result
+                        ? sizeWithPixels(
+                            estimateDecompressedBytes(result),
+                            result.width,
+                            result.height,
+                          )
+                        : image
+                          ? `${pixelsLabel(image.size.width, image.size.height)}`
+                          : '—'}
+                    </p>
                     <button
                       type="button"
                       className="secondary preview-download"
@@ -2010,8 +2139,20 @@ export default function CompressionLab() {
             <h2>Band metrics</h2>
             <p className={`hint ${result ? '' : 'placeholder'}`}>
               {result
-                ? `Runtime ${result.runtimeSeconds.toFixed(2)}s · Original ${bytesLabel(result.originalBytes)} · Compressed ${bytesLabel(result.compressedBytesEstimate)} · Decompressed ${bytesLabel(estimateDecompressedBytes(result))} · Ratio ${fmt(result.compressionRatio, 3)}`
-                : 'Runtime — · Original — · Compressed — · Decompressed — · Ratio —'}
+                ? [
+                    `Runtime ${result.runtimeSeconds.toFixed(2)}s`,
+                    `Pixels ${pixelsLabel(result.width, result.height)}`,
+                    groundResolutionLabel(image?.groundResolution)
+                      ? `Resolution ${groundResolutionLabel(image?.groundResolution)}`
+                      : null,
+                    `Original ${bytesLabel(result.originalBytes)}`,
+                    `Compressed ${bytesLabel(result.compressedBytesEstimate)}`,
+                    `Decompressed ${bytesLabel(estimateDecompressedBytes(result))}`,
+                    `Ratio ${fmt(result.compressionRatio, 3)}`,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')
+                : 'Runtime — · Pixels — · Original — · Compressed — · Decompressed — · Ratio —'}
             </p>
             <div className="table-wrap">
               <table>
@@ -2345,6 +2486,7 @@ export default function CompressionLab() {
                   <tr>
                     <th>Method</th>
                     <th>Runtime (s)</th>
+                    <th>Pixels</th>
                     <th>Original</th>
                     <th>Compressed</th>
                     <th>Decompressed</th>
@@ -2360,6 +2502,11 @@ export default function CompressionLab() {
                       <tr key={r.method}>
                         <td>{r.method}</td>
                         <td>{r.runtimeSeconds.toFixed(2)}</td>
+                        <td>
+                          {image
+                            ? `${Math.round(image.size.width)}×${Math.round(image.size.height)}`
+                            : '—'}
+                        </td>
                         <td>{bytesLabel(r.originalBytes)}</td>
                         <td>{bytesLabel(r.compressedBytesEstimate)}</td>
                         <td>{bytesLabel(r.decompressedBytes)}</td>
@@ -2371,7 +2518,7 @@ export default function CompressionLab() {
                     ))
                   ) : (
                     <tr>
-                      <td colSpan={9} className="hint placeholder">
+                      <td colSpan={10} className="hint placeholder">
                         Waiting for compare-all results
                       </td>
                     </tr>

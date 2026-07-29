@@ -358,6 +358,21 @@ figcaption {
   text-transform: uppercase;
 }
 
+.size-meta,
+.size-meta-line {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  letter-spacing: 0;
+  text-transform: none;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+}
+
+.size-meta-line {
+  margin: 0 0 0.75rem;
+}
+
 .preview-grid img,
 .shared img {
   width: 100%;

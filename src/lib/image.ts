@@ -28,6 +28,11 @@ export type LoadedImage = {
   previewRgba: Uint8ClampedArray
   filename: string
   archiveMember?: string
+  /**
+   * GeoTIFF ground sample distance when available (CRS units / pixel, usually meters).
+   * x = pixel width, y = pixel height.
+   */
+  groundResolution?: { x: number; y: number }
 }
 
 export type ArchiveSelection = {
@@ -309,6 +314,9 @@ export function pairNamedBandImages(
     previewRgba: toPreviewRgba(bands, bandOrder, width, height),
     filename,
     archiveMember: members.length ? members.join(' + ') : undefined,
+    ...(anchor.image.groundResolution
+      ? { groundResolution: anchor.image.groundResolution }
+      : {}),
   }
 }
 
@@ -353,6 +361,7 @@ export function mergeNamedBands(
     previewRgba: toPreviewRgba(bands, bandOrder, width, height),
     filename: `${label} · ${base.filename}`,
     archiveMember: members.length ? members.join(' + ') : base.archiveMember,
+    ...(base.groundResolution ? { groundResolution: base.groundResolution } : {}),
   }
 }
 
@@ -502,6 +511,10 @@ async function loadGeoTiff(
   if (bands.b4 && !bands.red) bands.red = bands.b4
   if (bands.b8 && !bands.nir) bands.nir = bands.b8
   const order = Object.keys(bands)
+  const groundResolution = readGroundResolution(image as {
+    getResolution?: () => number[] | undefined
+    getFileDirectory?: () => Record<string, unknown> | object
+  })
   return {
     bands,
     bandOrder: order,
@@ -510,7 +523,40 @@ async function loadGeoTiff(
     originalBytes,
     previewRgba: toPreviewRgba(bands, order, width, height),
     filename,
+    ...(groundResolution ? { groundResolution } : {}),
   }
+}
+
+function readGroundResolution(image: {
+  getResolution?: () => number[] | undefined
+  getFileDirectory?: () => Record<string, unknown> | object
+}): { x: number; y: number } | undefined {
+  try {
+    const res = image.getResolution?.()
+    if (Array.isArray(res) && res.length >= 2) {
+      const x = Math.abs(Number(res[0]))
+      const y = Math.abs(Number(res[1]))
+      if (Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0) {
+        return { x, y }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    const dir = (image.getFileDirectory?.() || {}) as Record<string, unknown>
+    const scale = dir.ModelPixelScale
+    if (Array.isArray(scale) && scale.length >= 2) {
+      const x = Math.abs(Number(scale[0]))
+      const y = Math.abs(Number(scale[1]))
+      if (Number.isFinite(x) && Number.isFinite(y) && x > 0 && y > 0) {
+        return { x, y }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return undefined
 }
 
 async function loadRasterViaCanvas(
