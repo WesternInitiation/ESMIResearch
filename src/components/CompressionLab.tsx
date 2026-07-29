@@ -14,11 +14,17 @@ import {
   bandsToCompressedArtifactPreview,
   bandsToDecompressedPreview,
   dataUrlToJpegDataUrl,
-  downloadDataUrl,
   residualPreviewRgba,
   rgbaToPngDataUrl,
 } from '@/lib/preview'
-import { fetchDemoCatalog, fetchDemoMemberFile } from '@/lib/demoData'
+import { downloadCsv } from '@/lib/csv'
+import {
+  downloadBandsAsGeoTiff,
+  downloadRgbPreviewAsGeoTiff,
+} from '@/lib/geotiffExport'
+import { jpegRoundtripBands } from '@/lib/lossyBands'
+import { estimateByteSize } from '@/lib/metrics'
+import { fetchDemoCatalog, fetchDemoMemberFile, fetchGcsBuckets } from '@/lib/demoData'
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression, VERCEL_PROXY_UPLOAD_BYTES } from '@/lib/serverCompress'
 import { MAX_INGEST_BYTES, extractArchiveMember } from '@/lib/archive'
@@ -47,10 +53,15 @@ type CompareRow = {
   method: CompressionMethod
   runtimeSeconds: number
   compressionRatio: number
+  originalBytes: number
+  compressedBytesEstimate: number
+  decompressedBytes: number
   meanRmse: number
   meanPsnr: number
   meanSsim: number
 }
+
+type IndexCompareTarget = 'decompressed' | 'compressed'
 
 type WorkingImage = LoadedImage & {
   nativeWidth: number
@@ -68,9 +79,32 @@ function fmt(n: number, digits = 4): string {
 }
 
 function bytesLabel(n: number): string {
-  if (n < 1024) return `${n} B`
+  if (!Number.isFinite(n) || n < 0) return '—'
+  if (n < 1024) return `${Math.round(n)} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
+}
+
+function estimateDecompressedBytes(result: {
+  decompressedBytes?: number
+  bands?: CompressionResult['bands']
+  width: number
+  height: number
+  channelReports: CompressionResult['channelReports']
+  bandOrder: string[]
+}): number {
+  if (result.decompressedBytes && result.decompressedBytes > 0) {
+    return result.decompressedBytes
+  }
+  if (result.bands && Object.keys(result.bands).length > 0) {
+    return estimateByteSize(result.bands)
+  }
+  const channels = Math.max(
+    result.channelReports.length,
+    result.bandOrder.length,
+    1,
+  )
+  return result.width * result.height * channels * 8
 }
 
 const DEFAULT_PARAMS: MethodParams = {
@@ -148,6 +182,8 @@ export default function CompressionLab() {
   const [busy, setBusy] = useState(false)
 
   const [indexKind, setIndexKind] = useState<'ndvi' | 'ndwi'>('ndvi')
+  const [indexCompareTarget, setIndexCompareTarget] =
+    useState<IndexCompareTarget>('decompressed')
   const [redBand, setRedBand] = useState('red')
   const [nirBand, setNirBand] = useState('nir')
   const [greenBand, setGreenBand] = useState('green')
@@ -155,6 +191,9 @@ export default function CompressionLab() {
   const [indexMetrics, setIndexMetrics] = useState<IndexMetrics | null>(null)
 
   const [compareRows, setCompareRows] = useState<CompareRow[] | null>(null)
+  const [gcsBucketOptions, setGcsBucketOptions] = useState<string[]>([])
+  const [selectedDemoBucket, setSelectedDemoBucket] = useState('')
+  const [customDemoBucket, setCustomDemoBucket] = useState('')
   const [supabaseOk, setSupabaseOk] = useState(false)
   const [recentRuns, setRecentRuns] = useState<SharedRunSummary[]>([])
   const [shareToken, setShareToken] = useState<string | null>(null)
@@ -262,6 +301,19 @@ export default function CompressionLab() {
         setCloudRunOk(false)
         setGcsUploads(false)
         setEngine('browser')
+      }
+    })()
+  }, [])
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const data = await fetchGcsBuckets()
+        const names = data.buckets.map((b) => b.name)
+        setGcsBucketOptions(names)
+        setSelectedDemoBucket((prev) => prev || data.defaultBucket || names[0] || '')
+      } catch {
+        setGcsBucketOptions([])
       }
     })()
   }, [])
@@ -846,6 +898,11 @@ export default function CompressionLab() {
           runtimeSeconds: out.runtimeSeconds,
           originalBytes: out.originalBytes,
           compressedBytesEstimate: out.compressedBytesEstimate,
+          decompressedBytes:
+            out.width *
+            out.height *
+            Math.max(out.channelReports.length, out.bandOrder.length, 1) *
+            8,
           compressionRatio: out.compressionRatio,
           channelReports: out.channelReports,
           metadata: {
@@ -1000,6 +1057,9 @@ export default function CompressionLab() {
           method: m,
           runtimeSeconds: out.runtimeSeconds,
           compressionRatio: out.compressionRatio,
+          originalBytes: out.originalBytes,
+          compressedBytesEstimate: out.compressedBytesEstimate,
+          decompressedBytes: estimateDecompressedBytes(out),
           meanRmse,
           meanPsnr,
           meanSsim,
@@ -1018,7 +1078,7 @@ export default function CompressionLab() {
     }
   }
 
-  function onIndexCompare() {
+  async function onIndexCompare() {
     if (!image || !result) return
     if (Object.keys(result.bands).length === 0) {
       setError(
@@ -1027,46 +1087,76 @@ export default function CompressionLab() {
       setStatus(null)
       return
     }
-    if (indexKind === 'ndvi') {
-      const redO = image.bands[redBand]
-      const nirO = image.bands[nirBand]
-      const redC = result.bands[redBand]
-      const nirC = result.bands[nirBand]
-      if (!redO || !nirO || !redC || !nirC) {
-        setError(`Need both ${redBand} and ${nirBand} in original and reconstructed bands`)
+
+    setBusy(true)
+    setError(null)
+    try {
+      const needed =
+        indexKind === 'ndvi' ? [redBand, nirBand] : [greenBand, ndwiSecondBand]
+      let candidateBands = result.bands
+      if (indexCompareTarget === 'compressed') {
+        candidateBands = await jpegRoundtripBands(
+          result.bands,
+          needed,
+          result.width,
+          result.height,
+          jpegQualityForMethod(),
+        )
+      }
+
+      if (indexKind === 'ndvi') {
+        const redO = image.bands[redBand]
+        const nirO = image.bands[nirBand]
+        const redC = candidateBands[redBand]
+        const nirC = candidateBands[nirBand]
+        if (!redO || !nirO || !redC || !nirC) {
+          setError(`Need both ${redBand} and ${nirBand} in original and candidate bands`)
+          return
+        }
+        const ref = computeNdvi(redO, nirO)
+        const cand = computeNdvi(redC, nirC)
+        setIndexMetrics(compareIndexMaps(ref, cand))
+        setStatus(
+          `NDVI: original vs after-${indexCompareTarget} (local)`,
+        )
         return
       }
-      const ref = computeNdvi(redO, nirO)
-      const cand = computeNdvi(redC, nirC)
-      setIndexMetrics(compareIndexMaps(ref, cand))
-      setStatus('NDVI comparison ready (local)')
-      return
-    }
 
-    const greenO = image.bands[greenBand]
-    const secondO = image.bands[ndwiSecondBand]
-    const greenC = result.bands[greenBand]
-    const secondC = result.bands[ndwiSecondBand]
-    if (!greenO || !secondO || !greenC || !secondC) {
-      setError(
-        `Need both ${greenBand} and ${ndwiSecondBand} in original and reconstructed bands for NDWI`,
-      )
-      return
+      const greenO = image.bands[greenBand]
+      const secondO = image.bands[ndwiSecondBand]
+      const greenC = candidateBands[greenBand]
+      const secondC = candidateBands[ndwiSecondBand]
+      if (!greenO || !secondO || !greenC || !secondC) {
+        setError(
+          `Need both ${greenBand} and ${ndwiSecondBand} in original and candidate bands for NDWI`,
+        )
+        return
+      }
+      const ref = computeNdwi(greenO, secondO)
+      const cand = computeNdwi(greenC, secondC)
+      setIndexMetrics(compareIndexMaps(ref, cand))
+      const label = ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'
+      setStatus(`${label}: original vs after-${indexCompareTarget} (local)`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Index comparison failed')
+    } finally {
+      setBusy(false)
     }
-    const ref = computeNdwi(greenO, secondO)
-    const cand = computeNdwi(greenC, secondC)
-    setIndexMetrics(compareIndexMaps(ref, cand))
-    setStatus(
-      ndwiSecondBand === 'swir'
-        ? 'MNDWI comparison ready (local)'
-        : 'NDWI comparison ready (local)',
-    )
+  }
+
+  function activeDemoBucket(): string {
+    return (customDemoBucket.trim() || selectedDemoBucket).trim()
   }
 
   async function onLoadDemo() {
     setBusy(true)
     setError(null)
-    setStatus('Listing demo files in Cloud Storage…')
+    const bucket = activeDemoBucket()
+    setStatus(
+      bucket
+        ? `Listing files in gs://${bucket}…`
+        : 'Listing demo files in Cloud Storage…',
+    )
     try {
       setImage(null)
       setRawFile(null)
@@ -1081,7 +1171,7 @@ export default function CompressionLab() {
       setNdwiPairLoaded(false)
       clearResultPreviews()
 
-      const catalog = await fetchDemoCatalog((message) => setStatus(message))
+      const catalog = await fetchDemoCatalog((message) => setStatus(message), bucket || undefined)
       const members = catalog.members
       const suggested = suggestNdviMembers(members)
       const suggestedNdwi = suggestNdwiMembers(members, 'nir')
@@ -1090,13 +1180,17 @@ export default function CompressionLab() {
         setArchive({
           archiveName: catalog.archiveName,
           members,
-          demoRemote: { kind: 'archive', objectName: catalog.objectName },
+          demoRemote: {
+            kind: 'archive',
+            objectName: catalog.objectName,
+            bucket: catalog.bucket,
+          },
         })
       } else {
         setArchive({
           archiveName: `gs://${catalog.bucket}`,
           members,
-          demoRemote: { kind: 'objects' },
+          demoRemote: { kind: 'objects', bucket: catalog.bucket },
         })
       }
 
@@ -1120,6 +1214,154 @@ export default function CompressionLab() {
       setError(err instanceof Error ? err.message : 'Failed to load demo catalog')
       setStatus(null)
       setArchive(null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function onExportCsv() {
+    if (!result && !compareRows?.length && !indexMetrics) {
+      setError('Nothing to export yet — run compression or an index compare first.')
+      return
+    }
+    const headers = [
+      'section',
+      'method',
+      'index',
+      'compare_target',
+      'band',
+      'runtime_seconds',
+      'original_bytes',
+      'compressed_bytes',
+      'decompressed_bytes',
+      'compression_ratio',
+      'rmse',
+      'mae',
+      'psnr_db',
+      'ssim',
+      'correlation',
+      'bias',
+      'source',
+      'engine',
+    ]
+    const rows: Array<Array<unknown>> = []
+    if (result) {
+      const decomp = estimateDecompressedBytes(result)
+      rows.push([
+        'run',
+        result.method,
+        '',
+        '',
+        '',
+        result.runtimeSeconds,
+        result.originalBytes,
+        result.compressedBytesEstimate,
+        decomp,
+        result.compressionRatio,
+        '',
+        '',
+        '',
+        '',
+        '',
+        '',
+        image?.filename || '',
+        String(result.metadata.engine || engine),
+      ])
+      for (const ch of result.channelReports) {
+        rows.push([
+          'band_metric',
+          result.method,
+          '',
+          '',
+          ch.band,
+          result.runtimeSeconds,
+          result.originalBytes,
+          result.compressedBytesEstimate,
+          decomp,
+          result.compressionRatio,
+          ch.rmse,
+          ch.mae,
+          ch.psnrDb,
+          ch.ssim,
+          '',
+          '',
+          image?.filename || '',
+          String(result.metadata.engine || engine),
+        ])
+      }
+    }
+    if (indexMetrics) {
+      rows.push([
+        'index_metric',
+        result?.method || '',
+        indexKind === 'ndwi' && ndwiSecondBand === 'swir' ? 'mndwi' : indexKind,
+        indexCompareTarget,
+        '',
+        result?.runtimeSeconds ?? '',
+        result?.originalBytes ?? '',
+        result?.compressedBytesEstimate ?? '',
+        result ? estimateDecompressedBytes(result) : '',
+        result?.compressionRatio ?? '',
+        indexMetrics.rmse,
+        indexMetrics.mae,
+        '',
+        indexMetrics.ssim,
+        indexMetrics.correlation,
+        indexMetrics.bias,
+        image?.filename || '',
+        engine,
+      ])
+    }
+    if (compareRows?.length) {
+      for (const row of compareRows) {
+        rows.push([
+          'method_compare',
+          row.method,
+          '',
+          '',
+          '',
+          row.runtimeSeconds,
+          row.originalBytes,
+          row.compressedBytesEstimate,
+          row.decompressedBytes,
+          row.compressionRatio,
+          row.meanRmse,
+          '',
+          row.meanPsnr,
+          row.meanSsim,
+          '',
+          '',
+          image?.filename || '',
+          engine,
+        ])
+      }
+    }
+    downloadCsv(headers, rows, `esmi-results-${Date.now()}.csv`)
+    setStatus('CSV exported')
+  }
+
+  async function onDownloadDecompressedTif() {
+    if (!result && !decompressedPreview) return
+    setBusy(true)
+    setError(null)
+    try {
+      const filename = `esmi-decompressed-${Date.now()}.tif`
+      if (result && Object.keys(result.bands).length > 0) {
+        await downloadBandsAsGeoTiff(
+          result.bands,
+          result.bandOrder,
+          result.width,
+          result.height,
+          filename,
+        )
+      } else if (decompressedPreview) {
+        await downloadRgbPreviewAsGeoTiff(decompressedPreview, filename)
+      } else {
+        throw new Error('No decompressed image available to download')
+      }
+      setStatus('Downloaded decompressed GeoTIFF')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'GeoTIFF download failed')
     } finally {
       setBusy(false)
     }
@@ -1429,10 +1671,54 @@ export default function CompressionLab() {
               className="secondary"
               disabled={busy}
               onClick={() => void onLoadDemo()}
-              title="Load a built-in Red/Green/NIR demo scene"
+              title="List images from the selected GCS bucket"
             >
               Load demo data
             </button>
+            <button
+              type="button"
+              className="secondary"
+              disabled={busy || (!result && !compareRows?.length && !indexMetrics)}
+              onClick={onExportCsv}
+              title="Export band metrics, sizes, and index results as CSV"
+            >
+              Export CSV
+            </button>
+          </div>
+
+          <div className="gcs-bucket-row">
+            <label>
+              GCS bucket
+              <select
+                value={selectedDemoBucket}
+                disabled={busy || (!gcsBucketOptions.length && !selectedDemoBucket)}
+                onChange={(e) => {
+                  setSelectedDemoBucket(e.target.value)
+                  setCustomDemoBucket('')
+                }}
+              >
+                {(gcsBucketOptions.length
+                  ? gcsBucketOptions
+                  : selectedDemoBucket
+                    ? [selectedDemoBucket]
+                    : ['esmi-research-demo-data']
+                ).map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Or custom bucket
+              <input
+                type="text"
+                value={customDemoBucket}
+                disabled={busy}
+                placeholder="my-bucket-name"
+                onChange={(e) => setCustomDemoBucket(e.target.value)}
+              />
+            </label>
           </div>
 
           {(status || error) && (
@@ -1476,14 +1762,10 @@ export default function CompressionLab() {
                     <button
                       type="button"
                       className="secondary preview-download"
-                      onClick={() =>
-                        downloadDataUrl(
-                          decompressedPreview,
-                          `esmi-decompressed-${Date.now()}.png`,
-                        )
-                      }
+                      disabled={busy}
+                      onClick={() => void onDownloadDecompressedTif()}
                     >
-                      Download decompressed PNG
+                      Download decompressed TIF
                     </button>
                   </>
                 ) : (
@@ -1506,8 +1788,8 @@ export default function CompressionLab() {
             <h2>Band metrics</h2>
             <p className={`hint ${result ? '' : 'placeholder'}`}>
               {result
-                ? `Runtime ${result.runtimeSeconds.toFixed(2)}s · Estimate ${bytesLabel(result.compressedBytesEstimate)} · Ratio ${fmt(result.compressionRatio, 3)}`
-                : 'Runtime — · Estimate — · Ratio —'}
+                ? `Runtime ${result.runtimeSeconds.toFixed(2)}s · Original ${bytesLabel(result.originalBytes)} · Compressed ${bytesLabel(result.compressedBytesEstimate)} · Decompressed ${bytesLabel(estimateDecompressedBytes(result))} · Ratio ${fmt(result.compressionRatio, 3)}`
+                : 'Runtime — · Original — · Compressed — · Decompressed — · Ratio —'}
             </p>
             <div className="table-wrap">
               <table>
@@ -1675,7 +1957,9 @@ export default function CompressionLab() {
           <section className="panel">
             <h2>NDVI/NDWI preservation</h2>
             <p className="hint">
-              Index comparison always runs in the browser against local compression bands.
+              Compare the index on the original image against after-compression
+              (JPEG stand-in of reconstructed bands) or after-decompression
+              (reconstructed float bands). Runs in the browser.
             </p>
             <div className="ndvi-row">
               <label>
@@ -1688,6 +1972,18 @@ export default function CompressionLab() {
                   <option value="ndwi">
                     {ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'}
                   </option>
+                </select>
+              </label>
+              <label>
+                Compare against
+                <select
+                  value={indexCompareTarget}
+                  onChange={(e) =>
+                    setIndexCompareTarget(e.target.value as IndexCompareTarget)
+                  }
+                >
+                  <option value="decompressed">After decompression</option>
+                  <option value="compressed">After compression</option>
                 </select>
               </label>
               {indexKind === 'ndvi' ? (
@@ -1757,7 +2053,7 @@ export default function CompressionLab() {
                 type="button"
                 className="secondary"
                 disabled={!image || !result || busy}
-                onClick={onIndexCompare}
+                onClick={() => void onIndexCompare()}
               >
                 Compare{' '}
                 {indexKind === 'ndvi'
@@ -1827,6 +2123,9 @@ export default function CompressionLab() {
                   <tr>
                     <th>Method</th>
                     <th>Runtime (s)</th>
+                    <th>Original</th>
+                    <th>Compressed</th>
+                    <th>Decompressed</th>
                     <th>Ratio</th>
                     <th>Mean RMSE</th>
                     <th>Mean PSNR</th>
@@ -1839,6 +2138,9 @@ export default function CompressionLab() {
                       <tr key={r.method}>
                         <td>{r.method}</td>
                         <td>{r.runtimeSeconds.toFixed(2)}</td>
+                        <td>{bytesLabel(r.originalBytes)}</td>
+                        <td>{bytesLabel(r.compressedBytesEstimate)}</td>
+                        <td>{bytesLabel(r.decompressedBytes)}</td>
                         <td>{fmt(r.compressionRatio, 3)}</td>
                         <td>{fmt(r.meanRmse)}</td>
                         <td>{fmt(r.meanPsnr, 3)}</td>
@@ -1847,7 +2149,7 @@ export default function CompressionLab() {
                     ))
                   ) : (
                     <tr>
-                      <td colSpan={6} className="hint placeholder">
+                      <td colSpan={9} className="hint placeholder">
                         Waiting for compare-all results
                       </td>
                     </tr>

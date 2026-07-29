@@ -8,7 +8,6 @@ import {
 } from '@/lib/archive'
 import { cloudRunAuthHeaders } from '@/lib/cloudRunAuth'
 import {
-  gcsDemoBucket,
   gcsUploadBucket,
   serviceAccountCredentialsForDemo,
   storageClientForDemo,
@@ -288,13 +287,16 @@ async function extractViaCloudRun(input: {
   }
 }
 
-export async function buildDemoCatalog(): Promise<DemoCatalog> {
+export async function buildDemoCatalog(
+  requestedBucket?: string | null,
+): Promise<DemoCatalog> {
   if (!serviceAccountCredentialsForDemo()) {
     throw new Error(
       'GOOGLE_SERVICE_ACCOUNT_JSON is required to read demo data from GCS',
     )
   }
-  const bucketName = gcsDemoBucket()
+  const { resolveDemoBucket } = await import('@/lib/gcsBuckets')
+  const bucketName = resolveDemoBucket(requestedBucket)
   const storage = storageClientForDemo()
   const [files] = await storage.bucket(bucketName).getFiles({
     autoPaginate: true,
@@ -499,8 +501,10 @@ export async function prepareDemoMember(input: {
   kind: 'archive' | 'objects'
   objectName?: string
   member: string
+  bucket?: string
 }): Promise<{ downloadUrl: string; filename: string; size: number }> {
-  const bucketName = gcsDemoBucket()
+  const { resolveDemoBucket } = await import('@/lib/gcsBuckets')
+  const bucketName = resolveDemoBucket(input.bucket)
   const member = input.member.trim()
   if (!member) throw new Error('member is required')
 

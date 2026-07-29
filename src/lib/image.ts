@@ -26,6 +26,7 @@ export type ArchiveSelection = {
   demoRemote?: {
     kind: 'archive' | 'objects'
     objectName?: string
+    bucket?: string
   }
 }
 
@@ -113,6 +114,7 @@ export async function loadArchiveMemberImage(
       kind: selection.demoRemote.kind,
       objectName: selection.demoRemote.objectName,
       member: memberName,
+      bucket: selection.demoRemote.bucket,
     })
     const loaded = await loadImageFile(file)
     const memberFilename = memberName.split('/').pop() || memberName

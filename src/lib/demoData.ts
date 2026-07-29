@@ -17,6 +17,12 @@ export type DemoCatalogResponse =
       objects: Array<{ name: string; size: number }>
     }
 
+export type GcsBucketListResponse = {
+  buckets: Array<{ name: string; location?: string }>
+  allowed: string[]
+  defaultBucket: string
+}
+
 function networkError(stage: string, err: unknown): Error {
   const raw = err instanceof Error ? err.message : String(err)
   if (/failed to fetch|networkerror|load failed/i.test(raw)) {
@@ -32,13 +38,41 @@ function networkError(stage: string, err: unknown): Error {
   return err instanceof Error ? err : new Error(raw || `Demo ${stage} failed`)
 }
 
-export async function fetchDemoCatalog(
+export async function fetchGcsBuckets(
   onProgress?: (message: string) => void,
-): Promise<DemoCatalogResponse> {
-  onProgress?.('Listing demo files in Cloud Storage…')
+): Promise<GcsBucketListResponse> {
+  onProgress?.('Listing Cloud Storage buckets…')
   let res: Response
   try {
-    res = await fetch('/api/demo', { cache: 'no-store' })
+    res = await fetch('/api/gcs/buckets', { cache: 'no-store' })
+  } catch (err) {
+    throw networkError('buckets', err)
+  }
+  let data: GcsBucketListResponse & { error?: string }
+  try {
+    data = await readJsonResponse(res, '/api/gcs/buckets')
+  } catch (err) {
+    throw networkError('buckets', err)
+  }
+  if (!res.ok) {
+    throw new Error(data.error || `Bucket list failed (HTTP ${res.status})`)
+  }
+  return data
+}
+
+export async function fetchDemoCatalog(
+  onProgress?: (message: string) => void,
+  bucket?: string,
+): Promise<DemoCatalogResponse> {
+  onProgress?.(
+    bucket
+      ? `Listing files in gs://${bucket}…`
+      : 'Listing demo files in Cloud Storage…',
+  )
+  const qs = bucket ? `?bucket=${encodeURIComponent(bucket)}` : ''
+  let res: Response
+  try {
+    res = await fetch(`/api/demo${qs}`, { cache: 'no-store' })
   } catch (err) {
     throw networkError('list', err)
   }
@@ -61,6 +95,7 @@ export async function fetchDemoMemberFile(input: {
   kind: 'archive' | 'objects'
   objectName?: string
   member: string
+  bucket?: string
   onProgress?: (message: string) => void
 }): Promise<File> {
   const label = input.member.split('/').pop() || input.member
@@ -75,6 +110,7 @@ export async function fetchDemoMemberFile(input: {
         kind: input.kind,
         objectName: input.objectName,
         member: input.member,
+        bucket: input.bucket,
       }),
     })
   } catch (err) {

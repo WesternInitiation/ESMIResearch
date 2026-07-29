@@ -393,6 +393,24 @@ th {
   align-items: end;
 }
 
+.gcs-bucket-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  margin-top: 0.85rem;
+}
+
+.gcs-bucket-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+}
+
+.gcs-bucket-row input {
+  width: 100%;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -487,7 +505,8 @@ code {
   .preview-grid,
   .preview-grid-3,
   .ndvi-row,
-  .metric-grid {
+  .metric-grid,
+  .gcs-bucket-row {
     grid-template-columns: 1fr;
   }
 

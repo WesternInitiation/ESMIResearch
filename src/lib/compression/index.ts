@@ -59,8 +59,10 @@ export async function runCompression(
 
   const runtimeSeconds = (performance.now() - started) / 1000
   const channelReports = reportAllBands(bands, result.bands, bandOrder)
+  const original = originalBytes || estimateByteSize(bands)
+  const decompressedBytes = estimateByteSize(result.bands)
   const compressionRatio =
-    originalBytes > 0 ? result.compressedBytesEstimate / originalBytes : 0
+    original > 0 ? result.compressedBytesEstimate / original : 0
 
   return {
     method,
@@ -69,8 +71,9 @@ export async function runCompression(
     width,
     height,
     runtimeSeconds,
-    originalBytes: originalBytes || estimateByteSize(bands),
+    originalBytes: original,
     compressedBytesEstimate: result.compressedBytesEstimate,
+    decompressedBytes,
     compressionRatio,
     channelReports,
     metadata: result.metadata,

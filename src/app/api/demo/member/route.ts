@@ -10,6 +10,7 @@ export async function POST(request: NextRequest) {
       kind?: 'archive' | 'objects'
       objectName?: string
       member?: string
+      bucket?: string
     }
     const kind = body.kind === 'objects' ? 'objects' : 'archive'
     const member = (body.member || '').trim()
@@ -20,6 +21,7 @@ export async function POST(request: NextRequest) {
       kind,
       objectName: body.objectName,
       member,
+      bucket: body.bucket,
     })
     return NextResponse.json(prepared)
   } catch (err) {

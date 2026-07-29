@@ -18,6 +18,8 @@ export type CompressionResult = {
   runtimeSeconds: number
   originalBytes: number
   compressedBytesEstimate: number
+  /** Reconstructed float raster size (or estimate when bands are unavailable). */
+  decompressedBytes?: number
   compressionRatio: number
   channelReports: ChannelReport[]
   metadata: Record<string, unknown>
