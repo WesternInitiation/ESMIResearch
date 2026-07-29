@@ -1,9 +1,12 @@
-import { gunzipSync } from 'fflate'
+import { gunzipSync, unzipSync } from 'fflate'
 import {
   ARCHIVE_EXT_RE,
   IMAGE_EXT_RE,
+  SUPPORTED_ARCHIVE_LABEL,
   SUPPORTED_IMAGE_LABEL,
+  detectArchiveKind,
   isSupportedImageFilename,
+  type ArchiveKind,
 } from '@/lib/imageFormats'
 
 /** Soft ceiling — real archives stop earlier via checksum / ustar magic. */
@@ -11,7 +14,12 @@ const MAX_MEMBERS = 2_000_000
 /** Soft cap for a single extracted member payload (~2 GiB). */
 export const MAX_INGEST_BYTES = 2 * 1024 * 1024 * 1024
 
+/** @deprecated Prefer isArchiveFilename / detectArchiveKind — kept for tar-only callers. */
 export function isTarArchive(filename: string): boolean {
+  return ARCHIVE_EXT_RE.test(filename)
+}
+
+export function isSupportedArchive(filename: string): boolean {
   return ARCHIVE_EXT_RE.test(filename)
 }
 
@@ -19,8 +27,15 @@ export function isSupportedArchiveImage(path: string): boolean {
   return isSupportedImageFilename(path) && !isJunkArchivePath(path)
 }
 
+function normalizeArchivePath(path: string): string {
+  return path
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/{2,}/g, '/')
+}
+
 function isJunkArchivePath(path: string): boolean {
-  const parts = path.split('/').filter(Boolean)
+  const parts = normalizeArchivePath(path).split('/').filter(Boolean)
   const base = parts[parts.length - 1] || path
   if (base === '.DS_Store' || base.startsWith('._')) return true
   if (parts.some((p) => p === '__MACOSX')) return true
@@ -112,7 +127,7 @@ function* iterateTar(data: Uint8Array): Generator<TarEntry> {
     const size = parseOctal(header, 124, 12)
     const typeFlag = String.fromCharCode(header[156] || 48)
     const prefix = readCString(header, 345, 155)
-    let fullName = (prefix ? `${prefix}/${name}` : name).replace(/^\.\//, '')
+    let fullName = normalizeArchivePath(prefix ? `${prefix}/${name}` : name)
     const dataOffset = offset + 512
     const padded = Math.ceil(size / 512) * 512
 
@@ -133,7 +148,7 @@ function* iterateTar(data: Uint8Array): Generator<TarEntry> {
     }
 
     if (pendingLongName) {
-      fullName = pendingLongName.replace(/^\.\//, '')
+      fullName = normalizeArchivePath(pendingLongName)
       pendingLongName = null
     }
 
@@ -150,7 +165,7 @@ export type ArchiveListing = {
 }
 
 function folderPrefixesForPath(path: string): string[] {
-  const parts = path.split('/').filter(Boolean)
+  const parts = normalizeArchivePath(path).split('/').filter(Boolean)
   if (parts.length <= 1) return []
   const out: string[] = []
   for (let i = 1; i < parts.length; i++) {
@@ -159,21 +174,76 @@ function folderPrefixesForPath(path: string): string[] {
   return out
 }
 
-/**
- * Index images + folders inside a TAR / TAR.GZ / TGZ.
- * Non-image / junk / duplicate / oversized members are skipped.
- */
-export function listArchiveListing(
-  buffer: ArrayBuffer,
-  filename: string,
-): ArchiveListing {
+function finalizeListing(images: string[], folderSet: Set<string>): ArchiveListing {
+  if (!images.length) {
+    throw new Error(
+      `The archive does not contain a supported image (${SUPPORTED_IMAGE_LABEL}). ` +
+        `Upload a ${SUPPORTED_ARCHIVE_LABEL} that includes GeoTIFF / PNG / JPEG bands.`,
+    )
+  }
+  return {
+    images: images.sort((a, b) => a.localeCompare(b)),
+    folders: [...folderSet].sort((a, b) => a.localeCompare(b)),
+  }
+}
+
+function listZipListing(buffer: ArrayBuffer): ArchiveListing {
+  const input = new Uint8Array(buffer)
+  const images: string[] = []
+  const folderSet = new Set<string>()
+  const seen = new Set<string>()
+  let members = 0
+
+  try {
+    // Filter returns false so we index names/sizes without decompressing every TIF.
+    unzipSync(input, {
+      filter(file) {
+        members += 1
+        if (members > MAX_MEMBERS) {
+          throw new Error(
+            'The ZIP archive contains too many members to index. Upload a scene folder ZIP, or individual .TIF files.',
+          )
+        }
+        const name = normalizeArchivePath(file.name).replace(/\/$/, '')
+        if (!name || isJunkArchivePath(name)) return false
+        if (file.name.endsWith('/')) {
+          folderSet.add(name)
+          for (const p of folderPrefixesForPath(name)) folderSet.add(p)
+          return false
+        }
+        const size = Number(file.originalSize ?? file.size ?? 0)
+        if (!IMAGE_EXT_RE.test(name)) {
+          for (const p of folderPrefixesForPath(name)) folderSet.add(p)
+          return false
+        }
+        if (size <= 0 || size > MAX_INGEST_BYTES) return false
+        if (seen.has(name)) return false
+        seen.add(name)
+        images.push(name)
+        for (const p of folderPrefixesForPath(name)) folderSet.add(p)
+        return false
+      },
+    })
+  } catch (err) {
+    if (err instanceof Error && /too many members|does not contain/i.test(err.message)) {
+      throw err
+    }
+    throw new Error(
+      'Could not read the ZIP archive. Re-zip your .TIF folder (no encryption) and try again.',
+    )
+  }
+
+  return finalizeListing(images, folderSet)
+}
+
+function listTarListing(buffer: ArrayBuffer, filename: string): ArchiveListing {
   const data = expandTarBytes(buffer, filename)
   const images: string[] = []
   const folderSet = new Set<string>()
   const seen = new Set<string>()
 
   for (const entry of iterateTar(data)) {
-    const name = entry.name.replace(/\/$/, '')
+    const name = normalizeArchivePath(entry.name).replace(/\/$/, '')
     if (!name || isJunkArchivePath(name)) continue
 
     if (isDirectoryType(entry.typeFlag)) {
@@ -183,8 +253,6 @@ export function listArchiveListing(
     }
     if (!isRegularFileType(entry.typeFlag)) continue
     if (!IMAGE_EXT_RE.test(name)) {
-      // Still record parent folders so users can navigate into dirs that only
-      // contain metadata + images deeper down… parents of any file help UX.
       for (const p of folderPrefixesForPath(name)) folderSet.add(p)
       continue
     }
@@ -195,15 +263,27 @@ export function listArchiveListing(
     for (const p of folderPrefixesForPath(name)) folderSet.add(p)
   }
 
-  if (!images.length) {
+  return finalizeListing(images, folderSet)
+}
+
+/**
+ * Index images + folders inside a TAR / TAR.GZ / TGZ / ZIP.
+ * Non-image / junk / duplicate / oversized members are skipped.
+ * ZIP members are listed without decompressing every file.
+ */
+export function listArchiveListing(
+  buffer: ArrayBuffer,
+  filename: string,
+): ArchiveListing {
+  const kind: ArchiveKind | null = detectArchiveKind(buffer, filename)
+  if (!kind) {
     throw new Error(
-      `The TAR archive does not contain a supported image (${SUPPORTED_IMAGE_LABEL}).`,
+      `Not a supported archive (${SUPPORTED_ARCHIVE_LABEL}). ` +
+        `If this is a folder of .TIF files, zip or tar it first.`,
     )
   }
-  return {
-    images: images.sort((a, b) => a.localeCompare(b)),
-    folders: [...folderSet].sort((a, b) => a.localeCompare(b)),
-  }
+  if (kind === 'zip') return listZipListing(buffer)
+  return listTarListing(buffer, filename)
 }
 
 /** @deprecated Prefer listArchiveListing — kept for callers that only need image paths. */
@@ -373,13 +453,43 @@ export function extractArchiveMember(
   filename: string,
   memberName: string,
 ): { bytes: ArrayBuffer; memberFilename: string } {
-  if (!isSupportedArchiveImage(memberName)) {
+  const want = normalizeArchivePath(memberName)
+  if (!isSupportedArchiveImage(want)) {
     throw new Error('The selected archive member is not a supported image.')
   }
+
+  const kind = detectArchiveKind(buffer, filename)
+  if (kind === 'zip') {
+    try {
+      const files = unzipSync(new Uint8Array(buffer), {
+        filter(file) {
+          return normalizeArchivePath(file.name) === want
+        },
+      })
+      const key = Object.keys(files).find((k) => normalizeArchivePath(k) === want)
+      const bytes = key ? files[key] : undefined
+      if (!bytes || !bytes.byteLength) {
+        throw new Error('The selected archive image is missing.')
+      }
+      if (bytes.byteLength > MAX_INGEST_BYTES) {
+        throw new Error('The selected archive image is larger than the ~2 GiB ingest limit.')
+      }
+      const copy = new Uint8Array(bytes.byteLength)
+      copy.set(bytes)
+      const base = want.split('/').pop() || want
+      return { bytes: copy.buffer, memberFilename: base }
+    } catch (err) {
+      if (err instanceof Error && /missing|ingest limit|not a supported/i.test(err.message)) {
+        throw err
+      }
+      throw new Error('Could not extract the selected image from the ZIP archive.')
+    }
+  }
+
   const data = expandTarBytes(buffer, filename)
   let match: TarEntry | null = null
   for (const entry of iterateTar(data)) {
-    if (entry.name !== memberName) continue
+    if (normalizeArchivePath(entry.name) !== want) continue
     if (!isRegularFileType(entry.typeFlag)) continue
     match = entry
     break
@@ -391,6 +501,6 @@ export function extractArchiveMember(
   const slice = data.subarray(match.offset, match.offset + match.size)
   const copy = new Uint8Array(slice.byteLength)
   copy.set(slice)
-  const base = memberName.split('/').pop() || memberName
+  const base = want.split('/').pop() || want
   return { bytes: copy.buffer, memberFilename: base }
 }

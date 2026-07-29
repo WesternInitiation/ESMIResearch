@@ -444,7 +444,7 @@ async def archive_list(file: UploadFile = File(...)) -> JSONResponse:
         )
     filename = file.filename or "upload.tar"
     if not is_tar_archive(filename):
-        raise HTTPException(status_code=400, detail="File is not a TAR archive")
+        raise HTTPException(status_code=400, detail="File is not a TAR/ZIP archive")
     try:
         listing = list_archive_listing(raw, filename=filename)
     except ValueError as exc:

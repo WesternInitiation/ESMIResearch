@@ -370,7 +370,7 @@ export async function buildDemoCatalog(
 
   if (!candidates.length) {
     throw new Error(
-      `No demo images found in gs://${bucketName}. Upload ${SUPPORTED_IMAGE_LABEL} or a .tar / .tar.gz.`,
+      `No demo images found in gs://${bucketName}. Upload ${SUPPORTED_IMAGE_LABEL} or a .tar / .tar.gz / .zip.`,
     )
   }
 

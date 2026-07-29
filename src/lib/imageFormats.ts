@@ -1,5 +1,5 @@
 /**
- * Canonical image / archive format lists for the whole lab (upload UI, TAR
+ * Canonical image / archive format lists for the whole lab (upload UI, TAR/ZIP
  * indexing, demo GCS catalog, and loaders). Keep Python `image_io.py` in sync.
  */
 
@@ -22,23 +22,34 @@ export const IMAGE_EXTENSIONS = [
   ...JPEG2000_EXTENSIONS,
 ] as const
 
-export const ARCHIVE_EXTENSIONS = ['.tar', '.tar.gz', '.tgz'] as const
+export const ARCHIVE_EXTENSIONS = ['.tar', '.tar.gz', '.tgz', '.zip'] as const
 
-/** Match a supported image path (case-insensitive). */
+/** Match a supported image path (case-insensitive), including Landsat `.TIF`. */
 export const IMAGE_EXT_RE =
   /\.(tif|tiff|geotiff|gtiff|png|jpe?g|webp|bmp|gif|jp2|j2k|jpx)$/i
 
-/** Match a supported archive path. */
-export const ARCHIVE_EXT_RE = /\.(tar\.gz|tgz|tar)$/i
+/** Match a supported archive path (TAR / TAR.GZ / ZIP). */
+export const ARCHIVE_EXT_RE = /\.(tar\.gz|tgz|tar|zip)$/i
+
+export const TAR_EXT_RE = /\.(tar\.gz|tgz|tar)$/i
+export const ZIP_EXT_RE = /\.zip$/i
 
 /** Demo / GCS objects: images + archives. */
 export const DEMO_OBJECT_EXT_RE =
-  /\.(tif|tiff|geotiff|gtiff|png|jpe?g|webp|bmp|gif|jp2|j2k|jpx|tar\.gz|tgz|tar)$/i
+  /\.(tif|tiff|geotiff|gtiff|png|jpe?g|webp|bmp|gif|jp2|j2k|jpx|tar\.gz|tgz|tar|zip)$/i
 
-/** `<input type="file" accept=…>` for the main upload control. */
+/**
+ * `<input type="file" accept=…>` for the main upload control.
+ * Include uppercase extensions — some OS file pickers are case-sensitive.
+ */
 export const FILE_INPUT_ACCEPT = [
   ...IMAGE_EXTENSIONS,
+  ...IMAGE_EXTENSIONS.map((e) => e.toUpperCase()),
   ...ARCHIVE_EXTENSIONS,
+  ...ARCHIVE_EXTENSIONS.map((e) => e.toUpperCase()),
+  '.TIF',
+  '.TIFF',
+  '.ZIP',
   'image/tiff',
   'image/png',
   'image/jpeg',
@@ -48,13 +59,18 @@ export const FILE_INPUT_ACCEPT = [
   'image/jp2',
   'application/x-tar',
   'application/gzip',
+  'application/zip',
+  'application/x-zip-compressed',
 ].join(',')
 
 /** Single-band / NIR companion upload (rasters only, no archives). */
 export const RASTER_FILE_INPUT_ACCEPT = [
   ...GEO_TIFF_EXTENSIONS,
+  ...GEO_TIFF_EXTENSIONS.map((e) => e.toUpperCase()),
   ...RASTER_EXTENSIONS,
   ...JPEG2000_EXTENSIONS,
+  '.TIF',
+  '.TIFF',
   'image/tiff',
   'image/png',
   'image/jpeg',
@@ -67,6 +83,8 @@ export const RASTER_FILE_INPUT_ACCEPT = [
 export const SUPPORTED_IMAGE_LABEL =
   '.tif / .tiff / .geotiff / .png / .jpg / .jpeg / .webp / .bmp / .gif / .jp2'
 
+export const SUPPORTED_ARCHIVE_LABEL = '.tar / .tar.gz / .tgz / .zip'
+
 export function extensionOf(filename: string): string {
   const lower = filename.toLowerCase().replace(/\\/g, '/')
   const base = lower.split('/').pop() || lower
@@ -76,7 +94,7 @@ export function extensionOf(filename: string): string {
 }
 
 export function isSupportedImageFilename(filename: string): boolean {
-  return IMAGE_EXT_RE.test(filename)
+  return IMAGE_EXT_RE.test(filename.replace(/\\/g, '/'))
 }
 
 export function isGeoTiffFilename(filename: string): boolean {
@@ -89,6 +107,14 @@ export function isJpeg2000Filename(filename: string): boolean {
 
 export function isArchiveFilename(filename: string): boolean {
   return ARCHIVE_EXT_RE.test(filename)
+}
+
+export function isTarFilename(filename: string): boolean {
+  return TAR_EXT_RE.test(filename)
+}
+
+export function isZipFilename(filename: string): boolean {
+  return ZIP_EXT_RE.test(filename)
 }
 
 export function mimeForImageFilename(filename: string): string {
@@ -136,4 +162,45 @@ export function bufferLooksLikeJpeg2000(buffer: ArrayBuffer | Uint8Array): boole
     return true
   }
   return u.length >= 4 && u[0] === 0xff && u[1] === 0x4f && u[2] === 0xff && u[3] === 0x51
+}
+
+/** ZIP local/central/end signatures start with PK. */
+export function bufferLooksLikeZip(buffer: ArrayBuffer | Uint8Array): boolean {
+  const u = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer)
+  if (u.length < 4) return false
+  return u[0] === 0x50 && u[1] === 0x4b && (u[2] === 0x03 || u[2] === 0x05 || u[2] === 0x07)
+}
+
+export function bufferLooksLikeGzip(buffer: ArrayBuffer | Uint8Array): boolean {
+  const u = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer)
+  return u.length >= 2 && u[0] === 0x1f && u[1] === 0x8b
+}
+
+export function bufferLooksLikeTar(buffer: ArrayBuffer | Uint8Array): boolean {
+  const u = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer)
+  if (u.length < 262) return false
+  // ustar magic at offset 257
+  return (
+    u[257] === 0x75 &&
+    u[258] === 0x73 &&
+    u[259] === 0x74 &&
+    u[260] === 0x61 &&
+    u[261] === 0x72
+  )
+}
+
+export type ArchiveKind = 'zip' | 'tar' | 'tar.gz'
+
+/** Detect archive kind from filename and/or magic bytes. */
+export function detectArchiveKind(
+  buffer: ArrayBuffer | Uint8Array,
+  filename = '',
+): ArchiveKind | null {
+  const lower = filename.toLowerCase()
+  if (lower.endsWith('.zip') || bufferLooksLikeZip(buffer)) return 'zip'
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz') || bufferLooksLikeGzip(buffer)) {
+    return 'tar.gz'
+  }
+  if (lower.endsWith('.tar') || bufferLooksLikeTar(buffer)) return 'tar'
+  return null
 }

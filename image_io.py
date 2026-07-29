@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tarfile
+import zipfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import PurePosixPath
@@ -54,13 +55,16 @@ SUPPORTED_IMAGE_SUFFIXES = (
     ".j2k",
     ".jpx",
 )
-SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
+SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".zip")
+TAR_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
+ZIP_ARCHIVE_SUFFIXES = (".zip",)
 GEO_TIFF_SUFFIXES = (".tif", ".tiff", ".geotiff", ".gtiff")
 JPEG2000_SUFFIXES = (".jp2", ".j2k", ".jpx")
 RASTER_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 SUPPORTED_IMAGE_LABEL = (
     ".tif / .tiff / .geotiff / .png / .jpg / .jpeg / .webp / .bmp / .gif / .jp2"
 )
+SUPPORTED_ARCHIVE_LABEL = ".tar / .tar.gz / .tgz / .zip"
 # Soft caps for a *selected* member payload (~2 GiB). Listing ignores non-images.
 MAX_ARCHIVE_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
 # Soft ceiling only — real archives stop earlier via tarfile iteration.
@@ -69,8 +73,16 @@ MAX_DECODED_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def is_tar_archive(filename: str) -> bool:
-    """Return whether a filename represents a supported TAR archive."""
+    """Return whether a filename represents a TAR / TAR.GZ / ZIP archive."""
     return filename.lower().endswith(SUPPORTED_ARCHIVE_SUFFIXES)
+
+
+def is_zip_archive(filename: str) -> bool:
+    return filename.lower().endswith(ZIP_ARCHIVE_SUFFIXES)
+
+
+def is_plain_tar_archive(filename: str) -> bool:
+    return filename.lower().endswith(TAR_ARCHIVE_SUFFIXES)
 
 
 def _is_junk_archive_path(path: str) -> bool:
@@ -82,7 +94,7 @@ def _is_junk_archive_path(path: str) -> bool:
 
 
 def _is_supported_image_path(path: str) -> bool:
-    lower = path.lower()
+    lower = _normalize_archive_path(path).lower()
     return (not _is_junk_archive_path(path)) and lower.endswith(SUPPORTED_IMAGE_SUFFIXES)
 
 
@@ -175,23 +187,75 @@ def scan_archive_image_entries(
     return candidates
 
 
+def _normalize_archive_path(path: str) -> str:
+    p = path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    while "//" in p:
+        p = p.replace("//", "/")
+    return p
+
+
+def _looks_like_zip(head: bytes) -> bool:
+    return len(head) >= 4 and head[0] == 0x50 and head[1] == 0x4B and head[2] in (0x03, 0x05, 0x07)
+
+
+def _is_zip_bytes(archive_bytes: bytes, filename: str = "") -> bool:
+    return is_zip_archive(filename) or _looks_like_zip(archive_bytes[:4])
+
+
+def scan_zip_image_entries(archive_bytes: bytes) -> list[dict[str, Any]]:
+    """Index image members in a ZIP without extracting payloads."""
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        with zipfile.ZipFile(BytesIO(archive_bytes)) as archive:
+            for member_count, info in enumerate(archive.infolist(), start=1):
+                if member_count > MAX_ARCHIVE_MEMBERS:
+                    raise ValueError("The ZIP archive contains too many members to index.")
+                if info.is_dir():
+                    continue
+                name = _normalize_archive_path(info.filename)
+                if not _is_supported_image_path(name):
+                    continue
+                size = int(info.file_size or 0)
+                if size <= 0 or size > MAX_ARCHIVE_IMAGE_BYTES:
+                    continue
+                if name in seen:
+                    continue
+                seen.add(name)
+                candidates.append({"name": name, "size": size})
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValueError("The uploaded file is not a readable ZIP archive.") from exc
+
+    if not candidates:
+        raise ValueError(
+            "The ZIP archive does not contain a supported image "
+            f"({SUPPORTED_IMAGE_LABEL})."
+        )
+    return candidates
+
+
 def list_archive_listing(
     archive_bytes: bytes,
     *,
     filename: str = "archive.tar",
 ) -> dict[str, list[str]]:
-    """List image paths and folder prefixes inside a TAR / TAR.GZ / TGZ."""
+    """List image paths and folder prefixes inside a TAR / TAR.GZ / TGZ / ZIP."""
     name = filename or "archive.tar"
-    # Detect gzip even when the caller passes a bare .tar name.
-    if (
-        len(archive_bytes) >= 2
-        and archive_bytes[0] == 0x1F
-        and archive_bytes[1] == 0x8B
-        and not name.lower().endswith((".gz", ".tgz"))
-    ):
-        name = "archive.tar.gz"
-    entries = scan_archive_image_entries(BytesIO(archive_bytes), filename=name)
-    images = sorted(entry["name"] for entry in entries)
+    if _is_zip_bytes(archive_bytes, name):
+        entries = scan_zip_image_entries(archive_bytes)
+    else:
+        # Detect gzip even when the caller passes a bare .tar name.
+        if (
+            len(archive_bytes) >= 2
+            and archive_bytes[0] == 0x1F
+            and archive_bytes[1] == 0x8B
+            and not name.lower().endswith((".gz", ".tgz"))
+        ):
+            name = "archive.tar.gz"
+        entries = scan_archive_image_entries(BytesIO(archive_bytes), filename=name)
+    images = sorted(_normalize_archive_path(entry["name"]) for entry in entries)
     folders: set[str] = set()
     for image_name in images:
         folders.update(_folder_prefixes_for_path(image_name))
@@ -199,7 +263,7 @@ def list_archive_listing(
 
 
 def list_archive_images(archive_bytes: bytes, *, filename: str = "archive.tar") -> list[str]:
-    """List supported regular image files in a TAR archive without extracting it."""
+    """List supported regular image files in an archive without extracting it."""
     return list_archive_listing(archive_bytes, filename=filename)["images"]
 
 
@@ -207,37 +271,55 @@ def load_archive_image(
     archive_bytes: bytes,
     member_name: str,
 ) -> LoadedImage:
-    """Load one selected image directly from a TAR archive."""
-    if not _is_supported_image_path(member_name):
+    """Load one selected image directly from a TAR or ZIP archive."""
+    want = _normalize_archive_path(member_name)
+    if not _is_supported_image_path(want):
         raise ValueError("The selected archive member is not a supported image.")
 
     image_bytes: bytes | None = None
-    try:
-        with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as archive:
-            try:
-                member = archive.getmember(member_name)
-            except KeyError as exc:
-                raise ValueError("The selected archive image is missing.") from exc
-            if not member.isfile():
-                raise ValueError("The selected archive image is missing.")
-            if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
-                raise ValueError("The selected image is too large to process.")
-            extracted = archive.extractfile(member)
-            if extracted is None:
-                raise ValueError(
-                    "The selected image could not be read from the archive."
-                )
-            image_bytes = extracted.read(MAX_ARCHIVE_IMAGE_BYTES + 1)
-    except (tarfile.TarError, OSError) as exc:
-        raise ValueError("The uploaded file is not a readable TAR archive.") from exc
+    if _is_zip_bytes(archive_bytes, ""):
+        try:
+            with zipfile.ZipFile(BytesIO(archive_bytes)) as archive:
+                match = None
+                for info in archive.infolist():
+                    if _normalize_archive_path(info.filename) == want and not info.is_dir():
+                        match = info
+                        break
+                if match is None:
+                    raise ValueError("The selected archive image is missing.")
+                if match.file_size <= 0 or match.file_size > MAX_ARCHIVE_IMAGE_BYTES:
+                    raise ValueError("The selected image is too large to process.")
+                image_bytes = archive.read(match)[: MAX_ARCHIVE_IMAGE_BYTES + 1]
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise ValueError("The uploaded file is not a readable ZIP archive.") from exc
+    else:
+        try:
+            with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as archive:
+                match = None
+                for member in archive.getmembers():
+                    if _normalize_archive_path(member.name) == want and member.isfile():
+                        match = member
+                        break
+                if match is None:
+                    raise ValueError("The selected archive image is missing.")
+                if match.size <= 0 or match.size > MAX_ARCHIVE_IMAGE_BYTES:
+                    raise ValueError("The selected image is too large to process.")
+                extracted = archive.extractfile(match)
+                if extracted is None:
+                    raise ValueError(
+                        "The selected image could not be read from the archive."
+                    )
+                image_bytes = extracted.read(MAX_ARCHIVE_IMAGE_BYTES + 1)
+        except (tarfile.TarError, OSError) as exc:
+            raise ValueError("The uploaded file is not a readable TAR archive.") from exc
 
     if image_bytes is None:
         raise ValueError("The selected archive image is missing.")
     if len(image_bytes) > MAX_ARCHIVE_IMAGE_BYTES:
         raise ValueError("The selected image is too large to process.")
 
-    loaded = load_image(BytesIO(image_bytes), PurePosixPath(member_name).name)
-    loaded.metadata["archive_member"] = member_name
+    loaded = load_image(BytesIO(image_bytes), PurePosixPath(want).name)
+    loaded.metadata["archive_member"] = want
     return loaded
 
 
@@ -406,10 +488,16 @@ def load_image(file: BinaryIO, filename: str) -> LoadedImage:
     if named_tiff or looks_tiff:
         try:
             return load_geotiff(file)
-        except Exception:
-            if named_tiff or not (named_raster or named_jp2):
+        except Exception as geotiff_exc:
+            if looks_tiff:
                 raise
+            # Extension says .TIF but payload isn't TIFF (common in test zips /
+            # mislabeled exports) — fall back to Pillow.
             file.seek(0)
+            try:
+                return load_png(file)
+            except Exception:
+                raise geotiff_exc from None
 
     if named_jp2 or looks_jp2:
         # Prefer GDAL/rasterio when available (JP2OpenJPEG), else Pillow.

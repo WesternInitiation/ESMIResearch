@@ -11,6 +11,7 @@ import {
   SUPPORTED_IMAGE_LABEL,
   bufferLooksLikeJpeg2000,
   bufferLooksLikeTiff,
+  detectArchiveKind,
   isGeoTiffFilename,
   isJpeg2000Filename,
   isSupportedImageFilename,
@@ -126,7 +127,8 @@ export async function inspectUpload(
   file: File,
 ): Promise<{ kind: 'image'; file: File } | { kind: 'archive'; selection: ArchiveSelection }> {
   const buffer = await file.arrayBuffer()
-  if (isTarArchive(file.name)) {
+  // Detect ZIP/TAR by extension or magic bytes (folder-of-.TIF zips, misnamed downloads).
+  if (detectArchiveKind(buffer, file.name) || isTarArchive(file.name)) {
     const listing = listArchiveListing(buffer, file.name)
     return {
       kind: 'archive',

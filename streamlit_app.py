@@ -103,6 +103,7 @@ UPLOAD_FILE_TYPES = [
     "tar.gz",
     "tgz",
     "gz",
+    "zip",
 ]
 
 

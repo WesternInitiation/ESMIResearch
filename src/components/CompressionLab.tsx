@@ -35,6 +35,7 @@ import {
 import {
   FILE_INPUT_ACCEPT,
   RASTER_FILE_INPUT_ACCEPT,
+  SUPPORTED_ARCHIVE_LABEL,
   SUPPORTED_IMAGE_LABEL,
 } from '@/lib/imageFormats'
 import {
@@ -1569,7 +1570,8 @@ export default function CompressionLab() {
           <h2>Source</h2>
           <label className="file">
             <span>
-              Upload {SUPPORTED_IMAGE_LABEL} or TAR / TAR.GZ (up to ~2 GiB)
+              Upload {SUPPORTED_IMAGE_LABEL} or {SUPPORTED_ARCHIVE_LABEL} of .TIF
+              bands (up to ~2 GiB)
             </span>
             <input
               type="file"

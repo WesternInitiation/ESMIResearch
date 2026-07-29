@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import tarfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import numpy as np
@@ -126,6 +127,18 @@ class ArchiveImageTests(unittest.TestCase):
         listing = list_archive_listing(gz_buf.getvalue(), filename="upload.tar")
         self.assertEqual(listing["images"], ["scene/source.png"])
         self.assertEqual(listing["folders"], ["scene"])
+
+    def test_lists_uppercase_tif_members_in_zip(self) -> None:
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, mode="w") as zf:
+            zf.writestr("scene/B4.TIF", _png_bytes())
+            zf.writestr("scene/B5.TIF", _png_bytes())
+            zf.writestr("MTL.txt", b"meta")
+        listing = list_archive_listing(zbuf.getvalue(), filename="LC08_bands.zip")
+        self.assertEqual(listing["images"], ["scene/B4.TIF", "scene/B5.TIF"])
+        self.assertEqual(listing["folders"], ["scene"])
+        loaded = load_archive_image(zbuf.getvalue(), "scene/B4.TIF")
+        self.assertEqual(loaded.metadata["archive_member"], "scene/B4.TIF")
 
     def test_lists_gtiff_and_bmp_members(self) -> None:
         archive = _tar_bytes(
