@@ -3,8 +3,8 @@ import { gunzipSync } from 'fflate'
 /** Raster-like members the lab can try to load. */
 const IMAGE_EXT =
   /\.(tif|tiff|geotiff|png|jpe?g|webp|bmp|gif|jp2|j2k|jpx)$/i
-/** Soft ceiling so pathological archives don't hang the tab forever. */
-const MAX_MEMBERS = 500_000
+/** Soft ceiling — real archives stop earlier via checksum / ustar magic. */
+const MAX_MEMBERS = 2_000_000
 /** Soft cap for a single extracted member payload (~2 GiB). */
 export const MAX_INGEST_BYTES = 2 * 1024 * 1024 * 1024
 
@@ -18,7 +18,7 @@ export function isSupportedArchiveImage(path: string): boolean {
 }
 
 function isJunkArchivePath(path: string): boolean {
-  const parts = path.split('/')
+  const parts = path.split('/').filter(Boolean)
   const base = parts[parts.length - 1] || path
   if (base === '.DS_Store' || base.startsWith('._')) return true
   if (parts.some((p) => p === '__MACOSX')) return true
@@ -28,6 +28,10 @@ function isJunkArchivePath(path: string): boolean {
 function isRegularFileType(typeFlag: string): boolean {
   // '0' / NUL = normal, '7' = contiguous, 'S' = GNU sparse (payload still usable).
   return typeFlag === '0' || typeFlag === '\0' || typeFlag === '7' || typeFlag === 'S'
+}
+
+function isDirectoryType(typeFlag: string): boolean {
+  return typeFlag === '5'
 }
 
 function readCString(bytes: Uint8Array, start: number, length: number): string {
@@ -40,7 +44,21 @@ function readCString(bytes: Uint8Array, start: number, length: number): string {
 function parseOctal(bytes: Uint8Array, start: number, length: number): number {
   const raw = readCString(bytes, start, length).replace(/\0/g, '').trim()
   if (!raw) return 0
-  return parseInt(raw, 8) || 0
+  const n = parseInt(raw, 8)
+  return Number.isFinite(n) && n >= 0 ? n : 0
+}
+
+/** Validate ustar/old-tar header checksum so image payloads aren't scanned as members. */
+function isValidTarHeader(header: Uint8Array): boolean {
+  if (header.every((b) => b === 0)) return false
+  let sum = 0
+  for (let i = 0; i < 512; i++) {
+    sum += i >= 148 && i < 156 ? 0x20 : header[i]
+  }
+  const stored = parseOctal(header, 148, 8)
+  // Exact checksum match covers ustar and old pre-ustar headers. Reject
+  // anything else so TIFF/JPEG payloads are never treated as headers.
+  return stored === sum
 }
 
 function expandTarBytes(buffer: ArrayBuffer, filename: string): Uint8Array {
@@ -54,11 +72,18 @@ function expandTarBytes(buffer: ArrayBuffer, filename: string): Uint8Array {
   try {
     return gunzipSync(input)
   } catch {
-    throw new Error('Could not decompress the .tar.gz / .tgz archive.')
+    throw new Error(
+      'Could not decompress the .tar.gz / .tgz archive. Re-upload as .tar or check the file.',
+    )
   }
 }
 
-type TarEntry = { name: string; size: number; typeFlag: string; offset: number }
+type TarEntry = {
+  name: string
+  size: number
+  typeFlag: string
+  offset: number
+}
 
 function* iterateTar(data: Uint8Array): Generator<TarEntry> {
   let offset = 0
@@ -70,9 +95,15 @@ function* iterateTar(data: Uint8Array): Generator<TarEntry> {
     const isEmpty = header.every((b) => b === 0)
     if (isEmpty) break
 
+    // Stop at first invalid block — do not scan binary payloads as headers
+    // (that used to inflate member counts into the millions).
+    if (!isValidTarHeader(header)) break
+
     members += 1
     if (members > MAX_MEMBERS) {
-      throw new Error('The TAR archive contains too many members to index.')
+      throw new Error(
+        'The TAR archive contains too many members to index. Try a scene folder TAR, or upload individual images.',
+      )
     }
 
     const name = readCString(header, 0, 100)
@@ -81,7 +112,7 @@ function* iterateTar(data: Uint8Array): Generator<TarEntry> {
     const prefix = readCString(header, 345, 155)
     let fullName = (prefix ? `${prefix}/${name}` : name).replace(/^\.\//, '')
     const dataOffset = offset + 512
-    const padded = Math.ceil(Math.max(size, 0) / 512) * 512
+    const padded = Math.ceil(size / 512) * 512
 
     // GNU long-name / pax path: next header uses this name.
     if (typeFlag === 'L' || typeFlag === 'x' || typeFlag === 'g') {
@@ -109,30 +140,150 @@ function* iterateTar(data: Uint8Array): Generator<TarEntry> {
   }
 }
 
-/**
- * List loadable image members in a TAR.
- * Non-image / junk / duplicate / oversized members are skipped — they do not
- * fail the archive. Any member count / mix of files is fine as long as ≥1 image.
- */
-export function listArchiveImages(buffer: ArrayBuffer, filename: string): string[] {
-  const data = expandTarBytes(buffer, filename)
-  const names: string[] = []
-  const seen = new Set<string>()
-  for (const entry of iterateTar(data)) {
-    if (!isRegularFileType(entry.typeFlag)) continue
-    if (isJunkArchivePath(entry.name)) continue
-    if (!IMAGE_EXT.test(entry.name)) continue
-    if (entry.size <= 0 || entry.size > MAX_INGEST_BYTES) continue
-    if (seen.has(entry.name)) continue
-    seen.add(entry.name)
-    names.push(entry.name)
+export type ArchiveListing = {
+  /** All image member paths (sorted). */
+  images: string[]
+  /** Folder prefixes that contain images (sorted, no trailing slash). */
+  folders: string[]
+}
+
+function folderPrefixesForPath(path: string): string[] {
+  const parts = path.split('/').filter(Boolean)
+  if (parts.length <= 1) return []
+  const out: string[] = []
+  for (let i = 1; i < parts.length; i++) {
+    out.push(parts.slice(0, i).join('/'))
   }
-  if (!names.length) {
+  return out
+}
+
+/**
+ * Index images + folders inside a TAR / TAR.GZ / TGZ.
+ * Non-image / junk / duplicate / oversized members are skipped.
+ */
+export function listArchiveListing(
+  buffer: ArrayBuffer,
+  filename: string,
+): ArchiveListing {
+  const data = expandTarBytes(buffer, filename)
+  const images: string[] = []
+  const folderSet = new Set<string>()
+  const seen = new Set<string>()
+
+  for (const entry of iterateTar(data)) {
+    const name = entry.name.replace(/\/$/, '')
+    if (!name || isJunkArchivePath(name)) continue
+
+    if (isDirectoryType(entry.typeFlag)) {
+      folderSet.add(name)
+      for (const p of folderPrefixesForPath(name)) folderSet.add(p)
+      continue
+    }
+    if (!isRegularFileType(entry.typeFlag)) continue
+    if (!IMAGE_EXT.test(name)) {
+      // Still record parent folders so users can navigate into dirs that only
+      // contain metadata + images deeper down… parents of any file help UX.
+      for (const p of folderPrefixesForPath(name)) folderSet.add(p)
+      continue
+    }
+    if (entry.size <= 0 || entry.size > MAX_INGEST_BYTES) continue
+    if (seen.has(name)) continue
+    seen.add(name)
+    images.push(name)
+    for (const p of folderPrefixesForPath(name)) folderSet.add(p)
+  }
+
+  if (!images.length) {
     throw new Error(
       'The TAR archive does not contain a supported image (.tif, .tiff, .png, .jpg, .jpeg, .webp, .bmp, .gif, .jp2).',
     )
   }
-  return names.sort()
+  return {
+    images: images.sort((a, b) => a.localeCompare(b)),
+    folders: [...folderSet].sort((a, b) => a.localeCompare(b)),
+  }
+}
+
+/** @deprecated Prefer listArchiveListing — kept for callers that only need image paths. */
+export function listArchiveImages(buffer: ArrayBuffer, filename: string): string[] {
+  return listArchiveListing(buffer, filename).images
+}
+
+/** Build a listing from a flat member path list (e.g. demo catalog / manifest). */
+export function listingFromMembers(members: string[]): ArchiveListing {
+  const folderSet = new Set<string>()
+  const images: string[] = []
+  const seen = new Set<string>()
+  for (const raw of members) {
+    const name = raw.replace(/\/$/, '')
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    images.push(name)
+    for (const p of folderPrefixesForPath(name)) folderSet.add(p)
+  }
+  return {
+    images: images.sort((a, b) => a.localeCompare(b)),
+    folders: [...folderSet].sort((a, b) => a.localeCompare(b)),
+  }
+}
+
+/**
+ * Descend into single-child folder chains so Landsat-style TARs open
+ * on the first folder that actually contains choices.
+ */
+export function initialArchiveFolder(listing: ArchiveListing): string {
+  let path = ''
+  for (let depth = 0; depth < 32; depth++) {
+    const { folders, images } = archiveChildren(listing, path)
+    if (images.length === 0 && folders.length === 1) {
+      path = folders[0]
+      continue
+    }
+    return path
+  }
+  return path
+}
+
+/**
+ * Immediate child folders + images under ``prefix`` ('' = archive root).
+ */
+export function archiveChildren(
+  listing: ArchiveListing,
+  prefix = '',
+): { folders: string[]; images: string[] } {
+  const norm = prefix.replace(/^\/+|\/+$/g, '')
+  const folderSet = new Set<string>()
+  const images: string[] = []
+
+  for (const image of listing.images) {
+    if (norm) {
+      if (image === norm || !image.startsWith(`${norm}/`)) continue
+      const rest = image.slice(norm.length + 1)
+      const slash = rest.indexOf('/')
+      if (slash === -1) images.push(image)
+      else folderSet.add(`${norm}/${rest.slice(0, slash)}`)
+    } else {
+      const slash = image.indexOf('/')
+      if (slash === -1) images.push(image)
+      else folderSet.add(image.slice(0, slash))
+    }
+  }
+
+  // Include empty dirs recorded during index (rare but useful).
+  for (const folder of listing.folders) {
+    if (norm) {
+      if (folder === norm || !folder.startsWith(`${norm}/`)) continue
+      const rest = folder.slice(norm.length + 1)
+      if (!rest.includes('/')) folderSet.add(folder)
+    } else if (!folder.includes('/')) {
+      folderSet.add(folder)
+    }
+  }
+
+  return {
+    folders: [...folderSet].sort((a, b) => a.localeCompare(b)),
+    images: images.sort((a, b) => a.localeCompare(b)),
+  }
 }
 
 export type TarImageEntry = { name: string; offset: number; size: number }
@@ -154,12 +305,14 @@ export async function scanUncompressedTarImageEntries(
   while (offset + 512 <= archiveByteLength) {
     const header = await readRange(offset, offset + 511)
     if (header.byteLength < 512) break
-    const isEmpty = header.every((b) => b === 0)
-    if (isEmpty) break
+    if (header.every((b) => b === 0)) break
+    if (!isValidTarHeader(header)) break
 
     members += 1
     if (members > MAX_MEMBERS) {
-      throw new Error('The TAR archive contains too many members to index.')
+      throw new Error(
+        'The TAR archive contains too many members to index. Try browsing a scene subfolder archive.',
+      )
     }
 
     const name = readCString(header, 0, 100)
@@ -168,7 +321,7 @@ export async function scanUncompressedTarImageEntries(
     const prefix = readCString(header, 345, 155)
     let fullName = (prefix ? `${prefix}/${name}` : name).replace(/^\.\//, '')
     const dataOffset = offset + 512
-    const padded = Math.ceil(Math.max(size, 0) / 512) * 512
+    const padded = Math.ceil(size / 512) * 512
 
     if (typeFlag === 'L' || typeFlag === 'x' || typeFlag === 'g') {
       if (size > 0 && size < 64 * 1024 && dataOffset + size - 1 < archiveByteLength) {
@@ -227,7 +380,7 @@ export function extractArchiveMember(
     if (entry.name !== memberName) continue
     if (!isRegularFileType(entry.typeFlag)) continue
     match = entry
-    break // first match wins (duplicates ignored)
+    break
   }
   if (!match) throw new Error('The selected archive image is missing.')
   if (match.size <= 0 || match.size > MAX_INGEST_BYTES) {

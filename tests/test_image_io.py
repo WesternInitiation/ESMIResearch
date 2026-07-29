@@ -12,6 +12,7 @@ from image_io import (
     HAS_RASTERIO,
     encode_reconstructed_image,
     list_archive_images,
+    list_archive_listing,
     load_archive_image,
 )
 
@@ -98,6 +99,33 @@ class ArchiveImageTests(unittest.TestCase):
             archive.addfile(regular, io.BytesIO(image))
 
         self.assertEqual(list_archive_images(buffer.getvalue()), ["source.png"])
+
+    def test_lists_folders_inside_nested_archive(self) -> None:
+        archive = _tar_bytes(
+            {
+                "scene/a/band4.tif": _png_bytes(),
+                "scene/a/band5.tif": _png_bytes(),
+                "scene/b/band4.tif": _png_bytes(),
+                "readme.txt": b"meta",
+            }
+        )
+        listing = list_archive_listing(archive)
+        self.assertEqual(
+            listing["images"],
+            ["scene/a/band4.tif", "scene/a/band5.tif", "scene/b/band4.tif"],
+        )
+        self.assertEqual(listing["folders"], ["scene", "scene/a", "scene/b"])
+
+    def test_lists_gzipped_tar_via_magic_bytes(self) -> None:
+        raw = _tar_bytes({"scene/source.png": _png_bytes()})
+        gz_buf = io.BytesIO()
+        import gzip
+
+        with gzip.GzipFile(fileobj=gz_buf, mode="wb") as gz:
+            gz.write(raw)
+        listing = list_archive_listing(gz_buf.getvalue(), filename="upload.tar")
+        self.assertEqual(listing["images"], ["scene/source.png"])
+        self.assertEqual(listing["folders"], ["scene"])
 
     def test_skips_oversized_images_during_list_instead_of_failing(self) -> None:
         png = _png_bytes()

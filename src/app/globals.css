@@ -160,6 +160,36 @@ input[type='range'] {
   width: 100%;
 }
 
+.archive-browser {
+  display: grid;
+  gap: 0.35rem;
+  margin-bottom: 0.85rem;
+}
+
+.archive-folder-bar {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.45rem;
+  align-items: stretch;
+}
+
+.archive-folder-bar button {
+  padding: 0.45rem 0.7rem;
+  white-space: nowrap;
+}
+
+.archive-folder-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.45rem;
+}
+
+.archive-folder-chips button {
+  padding: 0.35rem 0.55rem;
+  font-size: 0.85rem;
+}
+
 select,
 button {
   font: inherit;

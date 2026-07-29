@@ -1,8 +1,11 @@
 import { fromArrayBuffer } from 'geotiff'
 import {
   extractArchiveMember,
+  initialArchiveFolder,
   isTarArchive,
-  listArchiveImages,
+  listArchiveListing,
+  listingFromMembers,
+  type ArchiveListing,
 } from './archive'
 import type { BandMap, ImageSize } from './types'
 
@@ -21,12 +24,32 @@ export type ArchiveSelection = {
   /** Present for locally uploaded archives; empty/omitted for GCS demo catalogs. */
   buffer?: ArrayBuffer
   archiveName: string
+  /** All image paths in the archive (for NDVI/NDWI pairing across folders). */
   members: string[]
+  /** Full folder + image index for browsing. */
+  listing: ArchiveListing
+  /** Current folder prefix inside the archive ('' = root). */
+  folderPath: string
   /** Lazy demo archive/objects — members are fetched on demand via /api/demo/member. */
   demoRemote?: {
     kind: 'archive' | 'objects'
     objectName?: string
     bucket?: string
+  }
+}
+
+export function archiveSelectionFromMembers(
+  archiveName: string,
+  members: string[],
+  extras: Partial<Pick<ArchiveSelection, 'buffer' | 'demoRemote'>> = {},
+): ArchiveSelection {
+  const listing = listingFromMembers(members)
+  return {
+    archiveName,
+    members: listing.images,
+    listing,
+    folderPath: initialArchiveFolder(listing),
+    ...extras,
   }
 }
 
@@ -95,10 +118,16 @@ export async function inspectUpload(
 ): Promise<{ kind: 'image'; file: File } | { kind: 'archive'; selection: ArchiveSelection }> {
   const buffer = await file.arrayBuffer()
   if (isTarArchive(file.name)) {
-    const members = listArchiveImages(buffer, file.name)
+    const listing = listArchiveListing(buffer, file.name)
     return {
       kind: 'archive',
-      selection: { buffer, archiveName: file.name, members },
+      selection: {
+        buffer,
+        archiveName: file.name,
+        members: listing.images,
+        listing,
+        folderPath: initialArchiveFolder(listing),
+      },
     }
   }
   return { kind: 'image', file }

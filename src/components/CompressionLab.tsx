@@ -27,8 +27,13 @@ import { estimateByteSize } from '@/lib/metrics'
 import { fetchDemoCatalog, fetchDemoMemberFile, fetchGcsBuckets } from '@/lib/demoData'
 import { downsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression, VERCEL_PROXY_UPLOAD_BYTES } from '@/lib/serverCompress'
-import { MAX_INGEST_BYTES, extractArchiveMember } from '@/lib/archive'
 import {
+  MAX_INGEST_BYTES,
+  archiveChildren,
+  extractArchiveMember,
+} from '@/lib/archive'
+import {
+  archiveSelectionFromMembers,
   inspectUpload,
   isLikelySingleBand,
   loadArchiveMemberImage,
@@ -71,6 +76,16 @@ type WorkingImage = LoadedImage & {
 
 function memberLabel(path: string): string {
   return path.split('/').pop() || path
+}
+
+function folderBreadcrumb(path: string): string {
+  return path ? path : '(archive root)'
+}
+
+function parentFolder(path: string): string {
+  if (!path) return ''
+  const i = path.lastIndexOf('/')
+  return i === -1 ? '' : path.slice(0, i)
 }
 
 function fmt(n: number, digits = 4): string {
@@ -219,6 +234,20 @@ export default function CompressionLab() {
       image.size.height,
     )
   }, [image, serverOriginalPreview])
+
+  const archiveFolderView = useMemo(() => {
+    if (!archive) return { folders: [] as string[], images: [] as string[] }
+    return archiveChildren(archive.listing, archive.folderPath)
+  }, [archive])
+
+  function navigateArchiveFolder(nextPath: string) {
+    if (!archive) return
+    setArchive({ ...archive, folderPath: nextPath })
+    const child = archiveChildren(archive.listing, nextPath)
+    if (archiveMember && child.images.includes(archiveMember)) return
+    // Update the picker highlight without forcing a download/reload.
+    setArchiveMember(child.images[0] ?? '')
+  }
 
   function jpegQualityForMethod(): number {
     if (method === 'JPEG2000') return params.jpegRate
@@ -377,21 +406,21 @@ export default function CompressionLab() {
       const suggestedNdwi = suggestNdwiMembers(members, 'nir')
 
       if (catalog.kind === 'archive') {
-        setArchive({
-          archiveName: catalog.archiveName,
-          members,
-          demoRemote: {
-            kind: 'archive',
-            objectName: catalog.objectName,
-            bucket: catalog.bucket,
-          },
-        })
+        setArchive(
+          archiveSelectionFromMembers(catalog.archiveName, members, {
+            demoRemote: {
+              kind: 'archive',
+              objectName: catalog.objectName,
+              bucket: catalog.bucket,
+            },
+          }),
+        )
       } else {
-        setArchive({
-          archiveName: `gs://${catalog.bucket}`,
-          members,
-          demoRemote: { kind: 'objects', bucket: catalog.bucket },
-        })
+        setArchive(
+          archiveSelectionFromMembers(`gs://${catalog.bucket}`, members, {
+            demoRemote: { kind: 'objects', bucket: catalog.bucket },
+          }),
+        )
       }
 
       // Same dropdown UX as a dropped TAR — do not download until the user picks.
@@ -672,7 +701,11 @@ export default function CompressionLab() {
         setNdwiSecondRole(suggestedNdwi.secondRole)
         if (suggested.red && suggested.nir) {
           setStatus(
-            `Archive ${file.name}: found likely Red (${suggested.red.split('/').pop()}) and NIR (${suggested.nir.split('/').pop()}). Load NDVI pair or pick one image.`,
+            `Archive ${file.name}: ${inspected.selection.members.length} images` +
+              (inspected.selection.listing.folders.length
+                ? ` in ${inspected.selection.listing.folders.length} folders`
+                : '') +
+              `. Found likely Red (${suggested.red.split('/').pop()}) and NIR (${suggested.nir.split('/').pop()}). Load NDVI pair or browse folders.`,
           )
           // Auto-load the Landsat-style pair when both B4/B5-like members exist.
           const redImg = await loadArchiveMemberImage(inspected.selection, suggested.red)
@@ -708,7 +741,11 @@ export default function CompressionLab() {
           const loaded = await loadArchiveMemberImage(inspected.selection, first)
           await applyLoaded(loaded, file)
           setStatus(
-            `Archive loaded. For NDVI/NDWI with single-band TIFs, pick band members and load a pair.`,
+            `Archive loaded (${inspected.selection.members.length} images` +
+              (inspected.selection.listing.folders.length
+                ? `, ${inspected.selection.listing.folders.length} folders`
+                : '') +
+              `). Browse folders or pick a band pair for NDVI/NDWI.`,
           )
         }
       } else {
@@ -756,6 +793,10 @@ export default function CompressionLab() {
   async function onArchiveMemberChange(member: string) {
     if (!archive || !member) return
     setArchiveMember(member)
+    const parent = parentFolder(member)
+    if (parent !== archive.folderPath) {
+      setArchive({ ...archive, folderPath: parent })
+    }
     setPairMode(false)
     setNdviPairLoaded(false)
     setNdwiPairLoaded(false)
@@ -1543,27 +1584,86 @@ export default function CompressionLab() {
           )}
 
           {archive && (
-            <label>
-              {archive.demoRemote
-                ? 'Demo image (downloaded on select)'
-                : 'Single image inside archive'}
-              <select
-                value={archiveMember}
-                disabled={busy}
-                onChange={(e) => void onArchiveMemberChange(e.target.value)}
-              >
-                {archive.demoRemote && (
+            <div className="archive-browser">
+              {(archiveFolderView.folders.length > 0 || archive.folderPath) && (
+                <label>
+                  <span>Folder in archive</span>
+                  <div className="archive-folder-bar">
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={busy || !archive.folderPath}
+                      onClick={() => navigateArchiveFolder(parentFolder(archive.folderPath))}
+                    >
+                      Up
+                    </button>
+                    <select
+                      value={archive.folderPath}
+                      disabled={busy}
+                      onChange={(e) => navigateArchiveFolder(e.target.value)}
+                    >
+                      <option value="">
+                        {folderBreadcrumb('')}
+                      </option>
+                      {archive.listing.folders.map((folder) => (
+                        <option key={folder} value={folder}>
+                          {folder}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {archiveFolderView.folders.length > 0 && (
+                    <div className="archive-folder-chips">
+                      {archiveFolderView.folders.map((folder) => (
+                        <button
+                          key={folder}
+                          type="button"
+                          className="secondary"
+                          disabled={busy}
+                          onClick={() => navigateArchiveFolder(folder)}
+                        >
+                          {memberLabel(folder)}/
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </label>
+              )}
+              <label>
+                {archive.demoRemote
+                  ? 'Demo image (downloaded on select)'
+                  : 'Image in this folder'}
+                <select
+                  value={
+                    archiveFolderView.images.includes(archiveMember)
+                      ? archiveMember
+                      : ''
+                  }
+                  disabled={busy}
+                  onChange={(e) => void onArchiveMemberChange(e.target.value)}
+                >
                   <option value="" disabled>
-                    Select an image…
+                    {archiveFolderView.images.length
+                      ? 'Select an image…'
+                      : archiveFolderView.folders.length
+                        ? 'Open a subfolder…'
+                        : 'No images here'}
                   </option>
-                )}
-                {archive.members.map((m) => (
-                  <option key={m} value={m}>
-                    {memberLabel(m)}
-                  </option>
-                ))}
-              </select>
-            </label>
+                  {archiveFolderView.images.map((m) => (
+                    <option key={m} value={m}>
+                      {memberLabel(m)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="hint">
+                {archive.members.length} images
+                {archive.listing.folders.length
+                  ? ` · ${archive.listing.folders.length} folders`
+                  : ''}
+                {archive.folderPath ? ` · in ${archive.folderPath}` : ''}
+              </p>
+            </div>
           )}
 
           <h2>Engine</h2>

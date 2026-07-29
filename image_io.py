@@ -56,7 +56,8 @@ SUPPORTED_IMAGE_SUFFIXES = (
 SUPPORTED_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
 # Soft caps for a *selected* member payload (~2 GiB). Listing ignores non-images.
 MAX_ARCHIVE_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
-MAX_ARCHIVE_MEMBERS = 500_000
+# Soft ceiling only — real archives stop earlier via tarfile iteration.
+MAX_ARCHIVE_MEMBERS = 2_000_000
 MAX_DECODED_IMAGE_BYTES = 2 * 1024 * 1024 * 1024
 
 
@@ -76,6 +77,13 @@ def _is_junk_archive_path(path: str) -> bool:
 def _is_supported_image_path(path: str) -> bool:
     lower = path.lower()
     return (not _is_junk_archive_path(path)) and lower.endswith(SUPPORTED_IMAGE_SUFFIXES)
+
+
+def _folder_prefixes_for_path(path: str) -> list[str]:
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    if len(parts) <= 1:
+        return []
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
 def _tar_stream_mode(filename: str) -> str:
@@ -106,7 +114,9 @@ def scan_archive_image_entries(
         with tarfile.open(fileobj=fileobj, mode=mode) as archive:
             for member_count, member in enumerate(archive, start=1):
                 if member_count > MAX_ARCHIVE_MEMBERS:
-                    raise ValueError("The TAR archive contains too many members to index.")
+                    raise ValueError(
+                        "The TAR archive contains too many members to index."
+                    )
                 if not member.isfile():
                     continue
                 if not _is_supported_image_path(member.name):
@@ -133,10 +143,32 @@ def scan_archive_image_entries(
     return candidates
 
 
-def list_archive_images(archive_bytes: bytes) -> list[str]:
+def list_archive_listing(
+    archive_bytes: bytes,
+    *,
+    filename: str = "archive.tar",
+) -> dict[str, list[str]]:
+    """List image paths and folder prefixes inside a TAR / TAR.GZ / TGZ."""
+    name = filename or "archive.tar"
+    # Detect gzip even when the caller passes a bare .tar name.
+    if (
+        len(archive_bytes) >= 2
+        and archive_bytes[0] == 0x1F
+        and archive_bytes[1] == 0x8B
+        and not name.lower().endswith((".gz", ".tgz"))
+    ):
+        name = "archive.tar.gz"
+    entries = scan_archive_image_entries(BytesIO(archive_bytes), filename=name)
+    images = sorted(entry["name"] for entry in entries)
+    folders: set[str] = set()
+    for image_name in images:
+        folders.update(_folder_prefixes_for_path(image_name))
+    return {"images": images, "folders": sorted(folders)}
+
+
+def list_archive_images(archive_bytes: bytes, *, filename: str = "archive.tar") -> list[str]:
     """List supported regular image files in a TAR archive without extracting it."""
-    entries = scan_archive_image_entries(BytesIO(archive_bytes), filename="archive.tar")
-    return sorted(entry["name"] for entry in entries)
+    return list_archive_listing(archive_bytes, filename=filename)["images"]
 
 
 def load_archive_image(
@@ -150,23 +182,20 @@ def load_archive_image(
     image_bytes: bytes | None = None
     try:
         with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:*") as archive:
-            for member_count, member in enumerate(archive, start=1):
-                if member_count > MAX_ARCHIVE_MEMBERS:
-                    raise ValueError("The TAR archive contains too many members to index.")
-                if not member.isfile():
-                    continue
-                if member.name != member_name:
-                    continue
-                if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
-                    raise ValueError("The selected image is too large to process.")
-
-                extracted = archive.extractfile(member)
-                if extracted is None:
-                    raise ValueError(
-                        "The selected image could not be read from the archive."
-                    )
-                image_bytes = extracted.read(MAX_ARCHIVE_IMAGE_BYTES + 1)
-                break  # first match wins
+            try:
+                member = archive.getmember(member_name)
+            except KeyError as exc:
+                raise ValueError("The selected archive image is missing.") from exc
+            if not member.isfile():
+                raise ValueError("The selected archive image is missing.")
+            if member.size <= 0 or member.size > MAX_ARCHIVE_IMAGE_BYTES:
+                raise ValueError("The selected image is too large to process.")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise ValueError(
+                    "The selected image could not be read from the archive."
+                )
+            image_bytes = extracted.read(MAX_ARCHIVE_IMAGE_BYTES + 1)
     except (tarfile.TarError, OSError) as exc:
         raise ValueError("The uploaded file is not a readable TAR archive.") from exc
 

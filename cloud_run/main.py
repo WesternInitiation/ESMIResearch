@@ -33,6 +33,7 @@ from compression.wavelet import run_wavelet_compression
 from image_io import (
     is_tar_archive,
     list_archive_images,
+    list_archive_listing,
     load_archive_image,
     load_image,
     scan_archive_image_entries,
@@ -445,10 +446,16 @@ async def archive_list(file: UploadFile = File(...)) -> JSONResponse:
     if not is_tar_archive(filename):
         raise HTTPException(status_code=400, detail="File is not a TAR archive")
     try:
-        members = list_archive_images(raw)
+        listing = list_archive_listing(raw, filename=filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse({"members": members, "filename": filename})
+    return JSONResponse(
+        {
+            "members": listing["images"],
+            "folders": listing["folders"],
+            "filename": filename,
+        }
+    )
 
 
 @app.post("/v1/compress")
