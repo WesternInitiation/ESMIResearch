@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   fetchSupabaseStatus,
   listRecentRuns,
@@ -194,6 +194,7 @@ export default function CompressionLab() {
   const [gcsBucketOptions, setGcsBucketOptions] = useState<string[]>([])
   const [selectedDemoBucket, setSelectedDemoBucket] = useState('')
   const [customDemoBucket, setCustomDemoBucket] = useState('')
+  const demoLoadSeq = useRef(0)
   const [supabaseOk, setSupabaseOk] = useState(false)
   const [recentRuns, setRecentRuns] = useState<SharedRunSummary[]>([])
   const [shareToken, setShareToken] = useState<string | null>(null)
@@ -311,12 +312,111 @@ export default function CompressionLab() {
         const data = await fetchGcsBuckets()
         const names = data.buckets.map((b) => b.name)
         setGcsBucketOptions(names)
-        setSelectedDemoBucket((prev) => prev || data.defaultBucket || names[0] || '')
+        const initial = data.defaultBucket || names[0] || ''
+        if (initial) {
+          setSelectedDemoBucket(initial)
+          void onLoadDemo(initial)
+        }
       } catch {
         setGcsBucketOptions([])
       }
     })()
+    // Intentionally mount-only: load the default bucket once options arrive.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Custom bucket name: debounce so typing doesn't spam list requests.
+  useEffect(() => {
+    const bucket = customDemoBucket.trim()
+    if (!bucket) return
+    const timer = window.setTimeout(() => {
+      void onLoadDemo(bucket)
+    }, 700)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [customDemoBucket])
+
+  function activeDemoBucket(): string {
+    return (customDemoBucket.trim() || selectedDemoBucket).trim()
+  }
+
+  async function onLoadDemo(bucketOverride?: string) {
+    const bucket = (bucketOverride ?? activeDemoBucket()).trim()
+    if (!bucket) {
+      setError('Select a GCS bucket to load demo data')
+      return
+    }
+
+    const seq = ++demoLoadSeq.current
+    setBusy(true)
+    setError(null)
+    setStatus(`Listing files in gs://${bucket}…`)
+    try {
+      setImage(null)
+      setRawFile(null)
+      setResult(null)
+      setIndexMetrics(null)
+      setCompareRows(null)
+      setSharedView(null)
+      setShareToken(null)
+      setPendingRedSingle(null)
+      setPairMode(false)
+      setNdviPairLoaded(false)
+      setNdwiPairLoaded(false)
+      clearResultPreviews()
+
+      const catalog = await fetchDemoCatalog((message) => {
+        if (seq === demoLoadSeq.current) setStatus(message)
+      }, bucket)
+      if (seq !== demoLoadSeq.current) return
+
+      const members = catalog.members
+      const suggested = suggestNdviMembers(members)
+      const suggestedNdwi = suggestNdwiMembers(members, 'nir')
+
+      if (catalog.kind === 'archive') {
+        setArchive({
+          archiveName: catalog.archiveName,
+          members,
+          demoRemote: {
+            kind: 'archive',
+            objectName: catalog.objectName,
+            bucket: catalog.bucket,
+          },
+        })
+      } else {
+        setArchive({
+          archiveName: `gs://${catalog.bucket}`,
+          members,
+          demoRemote: { kind: 'objects', bucket: catalog.bucket },
+        })
+      }
+
+      // Same dropdown UX as a dropped TAR — do not download until the user picks.
+      setArchiveMember('')
+      setNdviRedMember(suggested.red || '')
+      setNdviNirMember(
+        suggested.nir || members.find((m) => m !== suggested.red) || '',
+      )
+      setNdwiGreenMember(suggestedNdwi.green || '')
+      setNdwiSecondMember(
+        suggestedNdwi.second ||
+          members.find((m) => m !== suggestedNdwi.green) ||
+          '',
+      )
+      setNdwiSecondRole(suggestedNdwi.secondRole)
+      setStatus(
+        `Demo ready from gs://${catalog.bucket} (${members.length} images). Pick one from the dropdown — only that file is downloaded.`,
+      )
+    } catch (err) {
+      if (seq !== demoLoadSeq.current) return
+      setError(err instanceof Error ? err.message : 'Failed to load demo catalog')
+      setStatus(null)
+      setArchive(null)
+    } finally {
+      if (seq === demoLoadSeq.current) setBusy(false)
+    }
+  }
 
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get('run')
@@ -1144,81 +1244,6 @@ export default function CompressionLab() {
     }
   }
 
-  function activeDemoBucket(): string {
-    return (customDemoBucket.trim() || selectedDemoBucket).trim()
-  }
-
-  async function onLoadDemo() {
-    setBusy(true)
-    setError(null)
-    const bucket = activeDemoBucket()
-    setStatus(
-      bucket
-        ? `Listing files in gs://${bucket}…`
-        : 'Listing demo files in Cloud Storage…',
-    )
-    try {
-      setImage(null)
-      setRawFile(null)
-      setResult(null)
-      setIndexMetrics(null)
-      setCompareRows(null)
-      setSharedView(null)
-      setShareToken(null)
-      setPendingRedSingle(null)
-      setPairMode(false)
-      setNdviPairLoaded(false)
-      setNdwiPairLoaded(false)
-      clearResultPreviews()
-
-      const catalog = await fetchDemoCatalog((message) => setStatus(message), bucket || undefined)
-      const members = catalog.members
-      const suggested = suggestNdviMembers(members)
-      const suggestedNdwi = suggestNdwiMembers(members, 'nir')
-
-      if (catalog.kind === 'archive') {
-        setArchive({
-          archiveName: catalog.archiveName,
-          members,
-          demoRemote: {
-            kind: 'archive',
-            objectName: catalog.objectName,
-            bucket: catalog.bucket,
-          },
-        })
-      } else {
-        setArchive({
-          archiveName: `gs://${catalog.bucket}`,
-          members,
-          demoRemote: { kind: 'objects', bucket: catalog.bucket },
-        })
-      }
-
-      // Same dropdown UX as a dropped TAR — do not download until the user picks.
-      setArchiveMember('')
-      setNdviRedMember(suggested.red || '')
-      setNdviNirMember(
-        suggested.nir || members.find((m) => m !== suggested.red) || '',
-      )
-      setNdwiGreenMember(suggestedNdwi.green || '')
-      setNdwiSecondMember(
-        suggestedNdwi.second ||
-          members.find((m) => m !== suggestedNdwi.green) ||
-          '',
-      )
-      setNdwiSecondRole(suggestedNdwi.secondRole)
-      setStatus(
-        `Demo ready (${members.length} images). Pick one from the dropdown — only that file is downloaded.`,
-      )
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load demo catalog')
-      setStatus(null)
-      setArchive(null)
-    } finally {
-      setBusy(false)
-    }
-  }
-
   function onExportCsv() {
     if (!result && !compareRows?.length && !indexMetrics) {
       setError('Nothing to export yet — run compression or an index compare first.')
@@ -1669,11 +1694,11 @@ export default function CompressionLab() {
             <button
               type="button"
               className="secondary"
-              disabled={busy}
+              disabled={busy || !activeDemoBucket()}
               onClick={() => void onLoadDemo()}
-              title="List images from the selected GCS bucket"
+              title="Reload the selected GCS bucket catalog"
             >
-              Load demo data
+              Reload bucket
             </button>
             <button
               type="button"
@@ -1693,8 +1718,10 @@ export default function CompressionLab() {
                 value={selectedDemoBucket}
                 disabled={busy || (!gcsBucketOptions.length && !selectedDemoBucket)}
                 onChange={(e) => {
-                  setSelectedDemoBucket(e.target.value)
+                  const name = e.target.value
+                  setSelectedDemoBucket(name)
                   setCustomDemoBucket('')
+                  if (name) void onLoadDemo(name)
                 }}
               >
                 {(gcsBucketOptions.length
@@ -1717,9 +1744,19 @@ export default function CompressionLab() {
                 disabled={busy}
                 placeholder="my-bucket-name"
                 onChange={(e) => setCustomDemoBucket(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    const name = customDemoBucket.trim()
+                    if (name) void onLoadDemo(name)
+                  }
+                }}
               />
             </label>
           </div>
+          <p className="hint">
+            Choosing a bucket loads its catalog automatically (custom names debounce ~0.7s).
+          </p>
 
           {(status || error) && (
             <p className={error ? 'error' : 'status'}>{error || status}</p>
