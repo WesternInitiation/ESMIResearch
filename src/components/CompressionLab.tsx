@@ -1516,8 +1516,21 @@ export default function CompressionLab() {
       } else {
         throw new Error('No decompressed image available to download')
       }
-      setStatus('Downloaded decompressed GeoTIFF')
+      setStatus(`Downloaded ${filename}`)
     } catch (err) {
+      // Last-resort: offer the preview PNG so the user still gets a file.
+      if (decompressedPreview) {
+        try {
+          const pngName = `esmi-decompressed-${Date.now()}.png`
+          const { downloadPngDataUrl } = await import('@/lib/geotiffExport')
+          downloadPngDataUrl(decompressedPreview, pngName)
+          setStatus(`GeoTIFF encode failed; downloaded PNG instead (${pngName})`)
+          setError(null)
+          return
+        } catch {
+          // fall through
+        }
+      }
       setError(err instanceof Error ? err.message : 'GeoTIFF download failed')
     } finally {
       setBusy(false)
@@ -1551,8 +1564,20 @@ export default function CompressionLab() {
       } else {
         throw new Error('No compressed image available to download')
       }
-      setStatus('Downloaded compressed GeoTIFF')
+      setStatus(`Downloaded ${filename}`)
     } catch (err) {
+      if (compressedArtifactPreview) {
+        try {
+          const pngName = `esmi-compressed-${Date.now()}.png`
+          const { downloadPngDataUrl } = await import('@/lib/geotiffExport')
+          downloadPngDataUrl(compressedArtifactPreview, pngName)
+          setStatus(`GeoTIFF encode failed; downloaded PNG instead (${pngName})`)
+          setError(null)
+          return
+        } catch {
+          // fall through
+        }
+      }
       setError(err instanceof Error ? err.message : 'Compressed GeoTIFF download failed')
     } finally {
       setBusy(false)

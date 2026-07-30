@@ -1,18 +1,62 @@
 import { writeArrayBuffer } from 'geotiff'
 import type { BandMap } from './types'
-import { downloadDataUrl } from './preview'
 
-function downloadArrayBuffer(buffer: ArrayBuffer, filename: string, mime: string) {
-  const blob = new Blob([buffer], { type: mime })
+function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = filename
   a.rel = 'noopener'
+  a.style.display = 'none'
   document.body.appendChild(a)
   a.click()
-  a.remove()
-  URL.revokeObjectURL(url)
+  // Keep the object URL alive briefly so the browser can start the download.
+  window.setTimeout(() => {
+    a.remove()
+    URL.revokeObjectURL(url)
+  }, 2000)
+}
+
+function downloadArrayBuffer(buffer: ArrayBuffer, filename: string, mime: string) {
+  downloadBlob(new Blob([buffer], { type: mime }), filename)
+}
+
+/**
+ * geotiff.writeArrayBuffer expects either:
+ * - a flat TypedArray / number[] of pixel-interleaved samples, with width+height in metadata, or
+ * - a nested [band][row][column] number[][][].
+ * Passing [Float32Array, …] planar arrays fails (width becomes undefined).
+ */
+function interleaveBands(
+  bandArrays: Array<Float32Array | Uint8Array | Float64Array>,
+  width: number,
+  height: number,
+  asFloat: boolean,
+): Float32Array | Uint8Array {
+  const n = width * height
+  const bands = bandArrays.length
+  if (!bands) throw new Error('No bands available to write as GeoTIFF')
+  for (const band of bandArrays) {
+    if (band.length < n) {
+      throw new Error(`Band length ${band.length} is shorter than ${width}×${height}`)
+    }
+  }
+  if (asFloat) {
+    const out = new Float32Array(n * bands)
+    for (let i = 0; i < n; i++) {
+      const o = i * bands
+      for (let b = 0; b < bands; b++) out[o + b] = Number(bandArrays[b][i])
+    }
+    return out
+  }
+  const out = new Uint8Array(n * bands)
+  for (let i = 0; i < n; i++) {
+    const o = i * bands
+    for (let b = 0; b < bands; b++) {
+      out[o + b] = Math.max(0, Math.min(255, Math.round(Number(bandArrays[b][i]))))
+    }
+  }
+  return out
 }
 
 /**
@@ -34,24 +78,18 @@ export async function bandsToGeoTiffArrayBuffer(
     return f32
   })
 
-  const planar = samples as Float32Array[] & { width: number; height: number }
-  planar.width = width
-  planar.height = height
-
+  const interleaved = interleaveBands(samples, width, height, true)
   const metadata = {
     width,
     height,
     BitsPerSample: samples.map(() => 32),
     SampleFormat: samples.map(() => 3), // IEEE floating point
     SamplesPerPixel: samples.length,
-    PhotometricInterpretation: samples.length === 1 ? 1 : 2,
-    PlanarConfiguration: 1,
+    PhotometricInterpretation: samples.length >= 3 ? 2 : 1,
+    PlanarConfiguration: 1, // chunky / pixel-interleaved
   }
 
-  const written = writeArrayBuffer(
-    planar as unknown as Parameters<typeof writeArrayBuffer>[0],
-    metadata,
-  )
+  const written = writeArrayBuffer(interleaved, metadata)
   return written instanceof Promise ? await written : written
 }
 
@@ -66,7 +104,10 @@ export async function downloadBandsAsGeoTiff(
   downloadArrayBuffer(buffer, filename, 'image/tiff')
 }
 
-/** Fallback: decode a PNG/JPEG data URL to an 8-bit RGB GeoTIFF. */
+/**
+ * Decode a PNG/JPEG data URL and write an 8-bit RGB GeoTIFF.
+ * Used when Cloud Run results have no in-browser band arrays.
+ */
 export async function downloadRgbPreviewAsGeoTiff(
   dataUrl: string,
   filename: string,
@@ -79,10 +120,12 @@ export async function downloadRgbPreviewAsGeoTiff(
   })
   const width = img.naturalWidth || img.width
   const height = img.naturalHeight || img.height
+  if (!width || !height) throw new Error('Preview image has no dimensions')
+
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
-  const ctx = canvas.getContext('2d')
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
   if (!ctx) throw new Error('Could not create canvas context')
   ctx.drawImage(img, 0, 0)
   const rgba = ctx.getImageData(0, 0, width, height).data
@@ -96,12 +139,9 @@ export async function downloadRgbPreviewAsGeoTiff(
     g[i] = rgba[o + 1]
     b[i] = rgba[o + 2]
   }
-  const planar = [r, g, b] as Uint8Array[] & { width: number; height: number }
-  planar.width = width
-  planar.height = height
-  const written = writeArrayBuffer(
-    planar as unknown as Parameters<typeof writeArrayBuffer>[0],
-    {
+
+  const interleaved = interleaveBands([r, g, b], width, height, false)
+  const written = writeArrayBuffer(interleaved, {
     width,
     height,
     BitsPerSample: [8, 8, 8],
@@ -113,5 +153,17 @@ export async function downloadRgbPreviewAsGeoTiff(
   downloadArrayBuffer(buffer, filename, 'image/tiff')
 }
 
-/** @deprecated Prefer GeoTIFF helpers — kept for non-image text downloads. */
-export { downloadDataUrl }
+/**
+ * Fallback PNG download when GeoTIFF encoding is unavailable.
+ * Prefer GeoTIFF helpers for scientific rasters.
+ */
+export function downloadPngDataUrl(dataUrl: string, filename: string) {
+  const a = document.createElement('a')
+  a.href = dataUrl
+  a.download = filename.endsWith('.png') ? filename : `${filename.replace(/\.tif+$/i, '')}.png`
+  a.rel = 'noopener'
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  window.setTimeout(() => a.remove(), 500)
+}
