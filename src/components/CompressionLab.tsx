@@ -20,6 +20,7 @@ import {
 import { downloadCsv } from '@/lib/csv'
 import {
   downloadBandsAsGeoTiff,
+  downloadPngDataUrl,
   downloadRgbPreviewAsGeoTiff,
 } from '@/lib/geotiffExport'
 import { jpegRoundtripBands } from '@/lib/lossyBands'
@@ -1503,6 +1504,7 @@ export default function CompressionLab() {
     setError(null)
     try {
       const filename = `esmi-decompressed-${Date.now()}.tif`
+      // Prefer real reconstructed bands when present; otherwise encode the preview.
       if (result && Object.keys(result.bands).length > 0) {
         await downloadBandsAsGeoTiff(
           result.bands,
@@ -1518,20 +1520,14 @@ export default function CompressionLab() {
       }
       setStatus(`Downloaded ${filename}`)
     } catch (err) {
-      // Last-resort: offer the preview PNG so the user still gets a file.
       if (decompressedPreview) {
-        try {
-          const pngName = `esmi-decompressed-${Date.now()}.png`
-          const { downloadPngDataUrl } = await import('@/lib/geotiffExport')
-          downloadPngDataUrl(decompressedPreview, pngName)
-          setStatus(`GeoTIFF encode failed; downloaded PNG instead (${pngName})`)
-          setError(null)
-          return
-        } catch {
-          // fall through
-        }
+        const pngName = `esmi-decompressed-${Date.now()}.png`
+        downloadPngDataUrl(decompressedPreview, pngName)
+        setStatus(`Downloaded ${pngName} (TIFF encode unavailable)`)
+        setError(null)
+      } else {
+        setError(err instanceof Error ? err.message : 'Download failed')
       }
-      setError(err instanceof Error ? err.message : 'GeoTIFF download failed')
     } finally {
       setBusy(false)
     }
@@ -1543,8 +1539,10 @@ export default function CompressionLab() {
     setError(null)
     try {
       const filename = `esmi-compressed-${Date.now()}.tif`
-      if (result && Object.keys(result.bands).length > 0) {
-        // Same lossy stand-in used for the Compressed preview / index compare.
+      // Preview-based RGB GeoTIFF is the most reliable path for "compressed" artifact.
+      if (compressedArtifactPreview) {
+        await downloadRgbPreviewAsGeoTiff(compressedArtifactPreview, filename)
+      } else if (result && Object.keys(result.bands).length > 0) {
         const compressedBands = await jpegRoundtripBands(
           result.bands,
           result.bandOrder,
@@ -1559,26 +1557,19 @@ export default function CompressionLab() {
           result.height,
           filename,
         )
-      } else if (compressedArtifactPreview) {
-        await downloadRgbPreviewAsGeoTiff(compressedArtifactPreview, filename)
       } else {
         throw new Error('No compressed image available to download')
       }
       setStatus(`Downloaded ${filename}`)
     } catch (err) {
       if (compressedArtifactPreview) {
-        try {
-          const pngName = `esmi-compressed-${Date.now()}.png`
-          const { downloadPngDataUrl } = await import('@/lib/geotiffExport')
-          downloadPngDataUrl(compressedArtifactPreview, pngName)
-          setStatus(`GeoTIFF encode failed; downloaded PNG instead (${pngName})`)
-          setError(null)
-          return
-        } catch {
-          // fall through
-        }
+        const pngName = `esmi-compressed-${Date.now()}.png`
+        downloadPngDataUrl(compressedArtifactPreview, pngName)
+        setStatus(`Downloaded ${pngName} (TIFF encode unavailable)`)
+        setError(null)
+      } else {
+        setError(err instanceof Error ? err.message : 'Download failed')
       }
-      setError(err instanceof Error ? err.message : 'Compressed GeoTIFF download failed')
     } finally {
       setBusy(false)
     }

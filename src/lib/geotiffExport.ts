@@ -1,4 +1,3 @@
-import { writeArrayBuffer } from 'geotiff'
 import type { BandMap } from './types'
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -14,18 +13,23 @@ function downloadBlob(blob: Blob, filename: string) {
   window.setTimeout(() => {
     a.remove()
     URL.revokeObjectURL(url)
-  }, 2000)
+  }, 2500)
 }
 
 function downloadArrayBuffer(buffer: ArrayBuffer, filename: string, mime: string) {
   downloadBlob(new Blob([buffer], { type: mime }), filename)
 }
 
+function assertPositiveInt(name: string, value: number): number {
+  const n = Math.floor(Number(value))
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`Invalid ${name} for GeoTIFF export: ${value}`)
+  }
+  return n
+}
+
 /**
- * geotiff.writeArrayBuffer expects either:
- * - a flat TypedArray / number[] of pixel-interleaved samples, with width+height in metadata, or
- * - a nested [band][row][column] number[][][].
- * Passing [Float32Array, …] planar arrays fails (width becomes undefined).
+ * Pixel-interleave band planes into one contiguous buffer.
  */
 function interleaveBands(
   bandArrays: Array<Float32Array | Uint8Array | Float64Array>,
@@ -33,12 +37,14 @@ function interleaveBands(
   height: number,
   asFloat: boolean,
 ): Float32Array | Uint8Array {
-  const n = width * height
+  const w = assertPositiveInt('width', width)
+  const h = assertPositiveInt('height', height)
+  const n = w * h
   const bands = bandArrays.length
   if (!bands) throw new Error('No bands available to write as GeoTIFF')
   for (const band of bandArrays) {
     if (band.length < n) {
-      throw new Error(`Band length ${band.length} is shorter than ${width}×${height}`)
+      throw new Error(`Band length ${band.length} is shorter than ${w}×${h}`)
     }
   }
   if (asFloat) {
@@ -56,6 +62,129 @@ function interleaveBands(
       out[o + b] = Math.max(0, Math.min(255, Math.round(Number(bandArrays[b][i]))))
     }
   }
+  return out
+}
+
+type TiffWriteOptions = {
+  width: number
+  height: number
+  samplesPerPixel: number
+  bitsPerSample: 8 | 32
+  /** 1 = unsigned int, 3 = IEEE float */
+  sampleFormat: 1 | 3
+  /** 1 = min-is-black, 2 = RGB */
+  photometric: 1 | 2
+  /** Contiguous pixel-interleaved sample bytes / floats */
+  data: Uint8Array | Float32Array
+}
+
+/**
+ * Minimal uncompressed little-endian TIFF writer.
+ *
+ * We deliberately do NOT use geotiff.js `writeArrayBuffer` — it treats arrays of
+ * TypedArrays as `[band][row][col]` and throws "width of type undefined".
+ */
+export function writeClassicTiff(options: TiffWriteOptions): ArrayBuffer {
+  const width = assertPositiveInt('width', options.width)
+  const height = assertPositiveInt('height', options.height)
+  const spp = assertPositiveInt('samplesPerPixel', options.samplesPerPixel)
+  const bps = options.bitsPerSample
+  const bytesPerSample = bps / 8
+  const expected = width * height * spp * bytesPerSample
+  const raw =
+    options.data instanceof Uint8Array
+      ? options.data
+      : new Uint8Array(
+          options.data.buffer,
+          options.data.byteOffset,
+          options.data.byteLength,
+        )
+  if (raw.byteLength < expected) {
+    throw new Error(
+      `TIFF payload too small: got ${raw.byteLength} B, need ${expected} B for ${width}×${height}×${spp}`,
+    )
+  }
+  const strip = raw.subarray(0, expected)
+
+  // Layout (word-aligned sections):
+  // [0..8)     header
+  // [8..)      optional BitsPerSample array (if spp > 1)
+  //            optional SampleFormat array (if spp > 1)
+  //            strip bytes
+  //            IFD
+  const needsBitsArray = spp > 1
+  const needsFormatArray = spp > 1
+  const bitsPerSampleBytes = needsBitsArray ? spp * 2 : 0
+  const sampleFormatBytes = needsFormatArray ? spp * 2 : 0
+  const bitsOffset = 8
+  const sampleFormatOffset = bitsOffset + bitsPerSampleBytes
+  const stripOffset = sampleFormatOffset + sampleFormatBytes
+  const ifdOffset = stripOffset + strip.byteLength
+
+  const entryCount = 11
+  const ifdSize = 2 + entryCount * 12 + 4
+  const total = ifdOffset + ifdSize
+  const out = new ArrayBuffer(total)
+  const view = new DataView(out)
+  const u8 = new Uint8Array(out)
+
+  // Header: little-endian classic TIFF
+  view.setUint16(0, 0x4949, true) // II
+  view.setUint16(2, 42, true)
+  view.setUint32(4, ifdOffset, true)
+
+  if (needsBitsArray) {
+    for (let i = 0; i < spp; i++) {
+      view.setUint16(bitsOffset + i * 2, bps, true)
+    }
+  }
+  if (needsFormatArray) {
+    for (let i = 0; i < spp; i++) {
+      view.setUint16(sampleFormatOffset + i * 2, options.sampleFormat, true)
+    }
+  }
+
+  // Strip data — little-endian sample bytes (matches II header)
+  u8.set(strip, stripOffset)
+
+  // IFD
+  let p = ifdOffset
+  view.setUint16(p, entryCount, true)
+  p += 2
+
+  const writeEntry = (
+    tag: number,
+    type: number,
+    count: number,
+    valueOrOffset: number,
+  ) => {
+    view.setUint16(p, tag, true)
+    view.setUint16(p + 2, type, true)
+    view.setUint32(p + 4, count, true)
+    view.setUint32(p + 8, valueOrOffset, true)
+    p += 12
+  }
+
+  // TIFF types: 3=SHORT 4=LONG
+  // Values ≤4 bytes must be stored inline in the value field (not as an offset).
+  writeEntry(256, 4, 1, width) // ImageWidth
+  writeEntry(257, 4, 1, height) // ImageLength
+  writeEntry(258, 3, spp, needsBitsArray ? bitsOffset : bps) // BitsPerSample
+  writeEntry(259, 3, 1, 1) // Compression = none
+  writeEntry(262, 3, 1, options.photometric) // PhotometricInterpretation
+  writeEntry(273, 4, 1, stripOffset) // StripOffsets
+  writeEntry(277, 3, 1, spp) // SamplesPerPixel
+  writeEntry(278, 4, 1, height) // RowsPerStrip
+  writeEntry(279, 4, 1, strip.byteLength) // StripByteCounts
+  writeEntry(284, 3, 1, 1) // PlanarConfiguration = chunky
+  writeEntry(
+    339,
+    3,
+    spp,
+    needsFormatArray ? sampleFormatOffset : options.sampleFormat,
+  ) // SampleFormat
+
+  view.setUint32(p, 0, true) // next IFD = none
   return out
 }
 
@@ -79,18 +208,15 @@ export async function bandsToGeoTiffArrayBuffer(
   })
 
   const interleaved = interleaveBands(samples, width, height, true)
-  const metadata = {
+  return writeClassicTiff({
     width,
     height,
-    BitsPerSample: samples.map(() => 32),
-    SampleFormat: samples.map(() => 3), // IEEE floating point
-    SamplesPerPixel: samples.length,
-    PhotometricInterpretation: samples.length >= 3 ? 2 : 1,
-    PlanarConfiguration: 1, // chunky / pixel-interleaved
-  }
-
-  const written = writeArrayBuffer(interleaved, metadata)
-  return written instanceof Promise ? await written : written
+    samplesPerPixel: samples.length,
+    bitsPerSample: 32,
+    sampleFormat: 3,
+    photometric: samples.length >= 3 ? 2 : 1,
+    data: interleaved,
+  })
 }
 
 export async function downloadBandsAsGeoTiff(
@@ -118,9 +244,8 @@ export async function downloadRgbPreviewAsGeoTiff(
     el.onerror = () => reject(new Error('Failed to decode preview for GeoTIFF export'))
     el.src = dataUrl
   })
-  const width = img.naturalWidth || img.width
-  const height = img.naturalHeight || img.height
-  if (!width || !height) throw new Error('Preview image has no dimensions')
+  const width = assertPositiveInt('preview width', img.naturalWidth || img.width)
+  const height = assertPositiveInt('preview height', img.naturalHeight || img.height)
 
   const canvas = document.createElement('canvas')
   canvas.width = width
@@ -141,26 +266,27 @@ export async function downloadRgbPreviewAsGeoTiff(
   }
 
   const interleaved = interleaveBands([r, g, b], width, height, false)
-  const written = writeArrayBuffer(interleaved, {
+  const buffer = writeClassicTiff({
     width,
     height,
-    BitsPerSample: [8, 8, 8],
-    SamplesPerPixel: 3,
-    PhotometricInterpretation: 2,
-    PlanarConfiguration: 1,
+    samplesPerPixel: 3,
+    bitsPerSample: 8,
+    sampleFormat: 1,
+    photometric: 2,
+    data: interleaved,
   })
-  const buffer = written instanceof Promise ? await written : written
   downloadArrayBuffer(buffer, filename, 'image/tiff')
 }
 
 /**
- * Fallback PNG download when GeoTIFF encoding is unavailable.
- * Prefer GeoTIFF helpers for scientific rasters.
+ * Fallback PNG download when the caller already has a preview data URL.
  */
 export function downloadPngDataUrl(dataUrl: string, filename: string) {
   const a = document.createElement('a')
   a.href = dataUrl
-  a.download = filename.endsWith('.png') ? filename : `${filename.replace(/\.tif+$/i, '')}.png`
+  a.download = filename.endsWith('.png')
+    ? filename
+    : `${filename.replace(/\.tiff?$/i, '')}.png`
   a.rel = 'noopener'
   a.style.display = 'none'
   document.body.appendChild(a)
