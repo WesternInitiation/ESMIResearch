@@ -266,8 +266,16 @@ def _download_gcs(uri: str) -> tuple[bytes, str, Any]:
     return raw, filename, blob
 
 
+# Only auto-delete browser signed-PUT staging objects. Never delete demo-extracts
+# (reused for Compare-all) or objects from other buckets passed as gcs_uri.
+_GCS_DELETE_PREFIXES: tuple[str, ...] = ("uploads/",)
+
+
 def _maybe_delete_gcs_blob(blob: Any) -> None:
     if not DELETE_GCS_AFTER_JOB or blob is None:
+        return
+    name = getattr(blob, "name", "") or ""
+    if not any(name.startswith(prefix) for prefix in _GCS_DELETE_PREFIXES):
         return
     try:
         blob.delete()

@@ -171,7 +171,7 @@ export async function loadArchiveMemberImage(
 ): Promise<LoadedImage> {
   if (selection.demoRemote) {
     const { fetchDemoMemberFile } = await import('@/lib/demoData')
-    const file = await fetchDemoMemberFile({
+    const { file } = await fetchDemoMemberFile({
       kind: selection.demoRemote.kind,
       objectName: selection.demoRemote.objectName,
       member: memberName,

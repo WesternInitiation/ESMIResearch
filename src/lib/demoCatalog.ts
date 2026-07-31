@@ -19,6 +19,14 @@ const DEMO_ARCHIVE_EXT = ARCHIVE_EXT_RE
 /** Archives larger than this must use manifest.json or Cloud Run listing. */
 const LARGE_ARCHIVE_BYTES = 40 * 1024 * 1024
 
+export type PreparedDemoMember = {
+  downloadUrl: string
+  filename: string
+  size: number
+  /** Staged object in GCS_UPLOAD_BUCKET — Cloud Run can read this without a browser re-upload. */
+  gcsUri: string
+}
+
 type ManifestEntry = { name: string; offset: number; size: number }
 
 type ArchiveCache = {
@@ -232,7 +240,7 @@ async function extractViaCloudRun(input: {
   member: string
   offset?: number
   size?: number
-}): Promise<{ downloadUrl: string; filename: string; size: number }> {
+}): Promise<PreparedDemoMember> {
   const base = compressApiBase()
   const staging = gcsUploadBucket()
   if (!base) {
@@ -285,6 +293,7 @@ async function extractViaCloudRun(input: {
     downloadUrl,
     filename: parsed.filename || input.member.split('/').pop() || 'member.bin',
     size: Number(parsed.size || 0),
+    gcsUri: `gs://${parsed.bucket}/${parsed.objectName}`,
   }
 }
 
@@ -447,11 +456,15 @@ export async function buildDemoCatalog(
   }
 }
 
+function safeName(filename: string): string {
+  return filename.replace(/[^\w.\-()+ ]+/g, '_').slice(0, 180) || 'member.bin'
+}
+
 async function stageBytesAndSign(input: {
   bytes: Buffer | Uint8Array
   filename: string
   contentType?: string
-}): Promise<{ downloadUrl: string; filename: string; size: number }> {
+}): Promise<PreparedDemoMember> {
   const staging = gcsUploadBucket()
   const storage = storageClientForDemo()
   const filename = input.filename.split('/').pop() || input.filename
@@ -471,7 +484,12 @@ async function stageBytesAndSign(input: {
       action: 'read',
       expires,
     })
-    return { downloadUrl, filename, size: input.bytes.byteLength }
+    return {
+      downloadUrl,
+      filename,
+      size: input.bytes.byteLength,
+      gcsUri: `gs://${staging}/${objectName}`,
+    }
   }
 
   // Fallback: signed read from demo bucket only works if that bucket has CORS.
@@ -480,8 +498,44 @@ async function stageBytesAndSign(input: {
   )
 }
 
-function safeName(filename: string): string {
-  return filename.replace(/[^\w.\-()+ ]+/g, '_').slice(0, 180) || 'member.bin'
+/**
+ * Server-side GCS copy into the staging bucket. Works for any source bucket the
+ * Vercel SA can read (and that passes GCS_ALLOWED_BUCKETS). Avoids pulling the
+ * full object through Vercel just to re-upload it.
+ */
+async function copyObjectToStaging(input: {
+  sourceBucket: string
+  sourceObject: string
+  filename: string
+}): Promise<PreparedDemoMember> {
+  const staging = gcsUploadBucket()
+  if (!staging) {
+    throw new Error(
+      'GCS_UPLOAD_BUCKET is not set — needed to stage demo objects for Cloud Run.',
+    )
+  }
+  const storage = storageClientForDemo()
+  const filename = input.filename.split('/').pop() || input.filename
+  const destObject = `demo-extracts/${Date.now()}-${randomUUID()}/${safeName(filename)}`
+  const src = storage.bucket(input.sourceBucket).file(input.sourceObject)
+  const dest = storage.bucket(staging).file(destObject)
+
+  const [meta] = await src.getMetadata()
+  const size = Number(meta.size || 0)
+  await src.copy(dest)
+
+  const expires = Date.now() + 60 * 60 * 1000
+  const [downloadUrl] = await dest.getSignedUrl({
+    version: 'v4',
+    action: 'read',
+    expires,
+  })
+  return {
+    downloadUrl,
+    filename,
+    size,
+    gcsUri: `gs://${staging}/${destObject}`,
+  }
 }
 
 function lookupManifestEntry(
@@ -503,16 +557,37 @@ export async function prepareDemoMember(input: {
   objectName?: string
   member: string
   bucket?: string
-}): Promise<{ downloadUrl: string; filename: string; size: number }> {
+}): Promise<PreparedDemoMember> {
   const { resolveDemoBucket } = await import('@/lib/gcsBuckets')
   const bucketName = resolveDemoBucket(input.bucket)
   const member = input.member.trim()
   if (!member) throw new Error('member is required')
 
   if (input.kind === 'objects') {
-    const buf = await downloadGcsObject(bucketName, member)
     const filename = member.split('/').pop() || member
-    return stageBytesAndSign({ bytes: buf, filename })
+    // Prefer GCS server-side copy so other allowed buckets work without
+    // streaming the full object through Vercel.
+    try {
+      return await copyObjectToStaging({
+        sourceBucket: bucketName,
+        sourceObject: member,
+        filename,
+      })
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err)
+      // Fall back to download+reupload (same SA; useful if copy IAM is limited).
+      try {
+        const buf = await downloadGcsObject(bucketName, member)
+        return stageBytesAndSign({ bytes: buf, filename })
+      } catch (fallbackErr) {
+        const fallback =
+          fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+        throw new Error(
+          `Failed to stage gs://${bucketName}/${member} into GCS_UPLOAD_BUCKET. ` +
+            `Copy error: ${detail}. Download fallback: ${fallback}`,
+        )
+      }
+    }
   }
 
   const objectName = (input.objectName || '').trim()

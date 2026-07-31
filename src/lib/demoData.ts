@@ -91,13 +91,20 @@ export async function fetchDemoCatalog(
   return data
 }
 
+export type DemoMemberFetchResult = {
+  file: File
+  /** Staged gs:// URI in GCS_UPLOAD_BUCKET for Cloud Run (skips browser re-upload). */
+  gcsUri: string
+  size: number
+}
+
 export async function fetchDemoMemberFile(input: {
   kind: 'archive' | 'objects'
   objectName?: string
   member: string
   bucket?: string
   onProgress?: (message: string) => void
-}): Promise<File> {
+}): Promise<DemoMemberFetchResult> {
   const label = input.member.split('/').pop() || input.member
   input.onProgress?.(`Preparing ${label} from demo storage…`)
 
@@ -122,6 +129,7 @@ export async function fetchDemoMemberFile(input: {
     downloadUrl?: string
     filename?: string
     size?: number
+    gcsUri?: string
   }
   try {
     data = await readJsonResponse(res, '/api/demo/member')
@@ -134,9 +142,12 @@ export async function fetchDemoMemberFile(input: {
   if (!data.downloadUrl) {
     throw new Error('Demo prepare returned no download URL')
   }
+  if (!data.gcsUri || !data.gcsUri.startsWith('gs://')) {
+    throw new Error('Demo prepare returned no staged gcsUri for Cloud Run')
+  }
 
   input.onProgress?.(
-    `Downloading ${data.filename || label}${
+    `Downloading preview of ${data.filename || label}${
       data.size ? ` (${(Number(data.size) / (1024 * 1024)).toFixed(1)} MB)` : ''
     }…`,
   )
@@ -152,7 +163,11 @@ export async function fetchDemoMemberFile(input: {
   }
   const blob = await fileRes.blob()
   const filename = data.filename || label
-  return new File([blob], filename, {
-    type: blob.type || 'application/octet-stream',
-  })
+  return {
+    file: new File([blob], filename, {
+      type: blob.type || 'application/octet-stream',
+    }),
+    gcsUri: data.gcsUri,
+    size: Number(data.size || blob.size),
+  }
 }

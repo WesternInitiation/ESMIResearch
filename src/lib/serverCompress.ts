@@ -143,8 +143,11 @@ async function uploadToGcs(
 }
 
 export async function runServerCompression(input: {
-  file: Blob
+  /** Required unless `gcsUri` is already staged (demo GCS path). */
+  file?: Blob | null
   filename: string
+  /** When set, Cloud Run reads this URI directly — no browser → GCS re-upload. */
+  gcsUri?: string | null
   method: string
   archiveMember?: string | null
   maxDim: number
@@ -172,18 +175,32 @@ export async function runServerCompression(input: {
   if (input.redBand) form.set('red_band', input.redBand)
   if (input.nirBand) form.set('nir_band', input.nirBand)
 
-  const useGcs = Boolean(input.gcsUploads) && input.file.size > VERCEL_PROXY_UPLOAD_BYTES
-  if (useGcs) {
-    const gcsUri = await uploadToGcs(input.file, input.filename, input.onProgress)
-    form.set('gcs_uri', gcsUri)
+  const stagedUri = (input.gcsUri || '').trim()
+  if (stagedUri.startsWith('gs://')) {
+    form.set('gcs_uri', stagedUri)
     form.set('filename', input.filename)
-    input.onProgress?.('Starting Cloud Run job from Cloud Storage…')
-  } else if (input.file.size > VERCEL_PROXY_UPLOAD_BYTES) {
-    throw new Error(
-      `File is ${(input.file.size / (1024 * 1024)).toFixed(1)} MB. Set GCS_UPLOAD_BUCKET on Vercel (see cloud_run/README.md) to send large jobs to Cloud Run, or use Engine → Browser.`,
+    input.onProgress?.(
+      'Starting Cloud Run from staged Cloud Storage (skipping re-upload)…',
     )
   } else {
-    form.set('file', input.file, input.filename)
+    const file = input.file
+    if (!file) {
+      throw new Error('Missing file for Cloud Run (and no staged gcsUri)')
+    }
+    const useGcs =
+      Boolean(input.gcsUploads) && file.size > VERCEL_PROXY_UPLOAD_BYTES
+    if (useGcs) {
+      const gcsUri = await uploadToGcs(file, input.filename, input.onProgress)
+      form.set('gcs_uri', gcsUri)
+      form.set('filename', input.filename)
+      input.onProgress?.('Starting Cloud Run job from Cloud Storage…')
+    } else if (file.size > VERCEL_PROXY_UPLOAD_BYTES) {
+      throw new Error(
+        `File is ${(file.size / (1024 * 1024)).toFixed(1)} MB. Set GCS_UPLOAD_BUCKET on Vercel (see cloud_run/README.md) to send large jobs to Cloud Run, or use Engine → Browser.`,
+      )
+    } else {
+      form.set('file', file, input.filename)
+    }
   }
 
   const res = await fetch('/api/compress', { method: 'POST', body: form })

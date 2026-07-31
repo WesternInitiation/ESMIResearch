@@ -213,6 +213,14 @@ gcloud run deploy esmi-compress --image gcr.io/esmi-research/esmi-compress:lates
 (80–100+&nbsp;MB) use a **signed GCS PUT** from the browser, then Cloud Run reads
 `gcs_uri`. Without `GCS_UPLOAD_BUCKET`, use **Engine → Browser** for large files.
 
+**Demo / other buckets:** picking a GCS catalog member stages a copy into
+`GCS_UPLOAD_BUCKET` (`demo-extracts/…`) and returns that `gcs_uri` to Cloud Run,
+so the browser does **not** re-upload the object. This works for any bucket the
+Vercel SA can read that is allowed by `GCS_ALLOWED_BUCKETS` (or project listing
+when that env is unset). Cloud Run only needs read access on the staging bucket.
+After-job cleanup deletes only `uploads/` objects (browser signed PUTs), never
+`demo-extracts/` or source catalog paths.
+
 ---
 
 ## Step 5 — Use it in the app

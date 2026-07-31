@@ -314,6 +314,8 @@ function isMultiMemberStack(img: LoadedImage | null | undefined): boolean {
 export default function CompressionLab() {
   const [image, setImage] = useState<WorkingImage | null>(null)
   const [rawFile, setRawFile] = useState<File | null>(null)
+  /** Staged gs:// from demo prepare — Cloud Run skips browser re-upload when set. */
+  const [sourceGcsUri, setSourceGcsUri] = useState<string | null>(null)
   const [archive, setArchive] = useState<ArchiveSelection | null>(null)
   const [archiveMember, setArchiveMember] = useState<string>('')
   const [ndviRedMember, setNdviRedMember] = useState<string>('')
@@ -579,6 +581,7 @@ export default function CompressionLab() {
     try {
       setImage(null)
       setRawFile(null)
+      setSourceGcsUri(null)
       setResult(null)
       setIndexMetrics(null)
       setCompareRows(null)
@@ -684,10 +687,15 @@ export default function CompressionLab() {
     else if (order.includes('nir')) setNdwiSecondBand('nir')
   }, [image])
 
-  async function applyLoaded(loaded: LoadedImage, file: File | null) {
+  async function applyLoaded(
+    loaded: LoadedImage,
+    file: File | null,
+    stagedGcsUri: string | null = null,
+  ) {
     const working = toWorkingImage(loaded, maxProcessDim)
     setImage(working)
     setRawFile(file)
+    setSourceGcsUri(stagedGcsUri)
     setResult(null)
     setIndexMetrics(null)
     setCompareRows(null)
@@ -861,6 +869,7 @@ export default function CompressionLab() {
     setNdwiPairLoaded(false)
     setPairMode(false)
     setPendingRedSingle(null)
+    setSourceGcsUri(null)
     if (file.size > MAX_INGEST_BYTES) {
       setError(
         `File is ${(file.size / (1024 * 1024 * 1024)).toFixed(2)} GiB — ingest limit is ~2 GiB.`,
@@ -876,6 +885,7 @@ export default function CompressionLab() {
       if (inspected.kind === 'archive') {
         setArchive(inspected.selection)
         setRawFile(file)
+        setSourceGcsUri(null)
         const suggested = suggestNdviMembers(inspected.selection.members)
         const suggestedNdwi = suggestNdwiMembers(inspected.selection.members, 'nir')
         const first = inspected.selection.members[0]
@@ -959,6 +969,7 @@ export default function CompressionLab() {
           // Hold as Red candidate; ask for a second single-band NIR upload.
           setPendingRedSingle(loaded)
           setRawFile(file)
+          setSourceGcsUri(null)
           setImage(null)
           setStatus(
             `Loaded single-band ${file.name} as Red candidate. Upload a second single-band TIF for NIR to enable NDVI.`,
@@ -1014,21 +1025,21 @@ export default function CompressionLab() {
     )
     try {
       if (archive.demoRemote) {
-        const file = await fetchDemoMemberFile({
+        const prepared = await fetchDemoMemberFile({
           kind: archive.demoRemote.kind,
           objectName: archive.demoRemote.objectName,
           member,
           bucket: archive.demoRemote.bucket,
           onProgress: (message) => setStatus(message),
         })
-        // Cloud Run + Native: decode a light preview in the browser; upload the
-        // original File so the server compresses at full resolution without OOM.
+        // Cloud Run + Native: decode a light preview in the browser; pass the
+        // staged gs:// URI so Cloud Run skips the browser → GCS re-upload.
         const uiDecodeDim =
           engine === 'cloud-run' || maxProcessDim === 0
             ? PREVIEW_MAX_DIM
             : maxProcessDim
         setStatus(`Decoding preview (≤${uiDecodeDim}px)…`)
-        const loaded = await loadImageFile(file, { maxDecodeDim: uiDecodeDim })
+        const loaded = await loadImageFile(prepared.file, { maxDecodeDim: uiDecodeDim })
         const memberFilename = member.split('/').pop() || member
         await applyLoaded(
           {
@@ -1036,16 +1047,17 @@ export default function CompressionLab() {
             archiveMember: member,
             filename: `${archive.archiveName} → ${memberFilename}`,
           },
-          file,
+          prepared.file,
+          prepared.gcsUri,
         )
         setStatus(
           engine === 'cloud-run'
-            ? `Ready · preview ≤${uiDecodeDim}px · Cloud Run will use native ${loaded.fileNativeWidth || loaded.size.width}×${loaded.fileNativeHeight || loaded.size.height}`
+            ? `Ready · preview ≤${uiDecodeDim}px · Cloud Run will read staged object (native ${loaded.fileNativeWidth || loaded.size.width}×${loaded.fileNativeHeight || loaded.size.height})`
             : `Loaded ${memberFilename}`,
         )
       } else {
         const loaded = await loadArchiveMemberImage(archive, member)
-        await applyLoaded(loaded, rawFile)
+        await applyLoaded(loaded, rawFile, null)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load archive member')
@@ -1053,6 +1065,7 @@ export default function CompressionLab() {
       setImage(null)
       // Keep catalog; clear the failed member file so Run stays disabled cleanly.
       setRawFile(null)
+      setSourceGcsUri(null)
     } finally {
       setBusy(false)
     }
@@ -1147,7 +1160,7 @@ export default function CompressionLab() {
   }
 
   async function onRun() {
-    if (!image || !rawFile) return
+    if (!image || (!rawFile && !sourceGcsUri)) return
     setError(null)
     setIndexMetrics(null)
     setBusy(true)
@@ -1161,9 +1174,10 @@ export default function CompressionLab() {
       } else {
         try {
           // Prefer the selected TAR member only — never upload the whole archive.
-          let uploadFile: Blob = rawFile
-          let uploadName = rawFile.name
+          let uploadFile: Blob | null = rawFile
+          let uploadName = rawFile?.name || image.filename.split('→').pop()?.trim() || 'image.bin'
           let usedMember: string | null = null
+          const stagedUri = sourceGcsUri
 
           if (archive) {
             const memberPath =
@@ -1180,9 +1194,9 @@ export default function CompressionLab() {
               return
             }
             if (archive.demoRemote) {
-              // rawFile is already the selected demo member download.
+              // Prefer staged gs:// from prepare; rawFile is only for local preview.
               uploadFile = rawFile
-              uploadName = rawFile.name
+              uploadName = rawFile?.name || memberPath.split('/').pop() || 'member.bin'
               usedMember = memberPath
             } else {
               if (!archive.buffer) {
@@ -1204,8 +1218,13 @@ export default function CompressionLab() {
             }
           }
 
-          // Small files go through Vercel multipart; larger ones use GCS signed PUT.
-          if (uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES && !gcsUploads) {
+          // Staged demo URI skips size checks / re-upload. Local large files still need GCS uploads.
+          if (
+            !stagedUri &&
+            uploadFile &&
+            uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES &&
+            !gcsUploads
+          ) {
             setError(
               `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB. ` +
                 `Set GCS_UPLOAD_BUCKET on Vercel (see cloud_run/README.md) for 80–100+ MB Cloud Run jobs, ` +
@@ -1214,15 +1233,23 @@ export default function CompressionLab() {
             setBusy(false)
             return
           }
+          if (!stagedUri && !uploadFile) {
+            setError('No image bytes available for Cloud Run')
+            setBusy(false)
+            return
+          }
 
           setStatus(
-            usedMember
-              ? `Preparing ${uploadName} for Cloud Run…`
-              : 'Preparing Cloud Run job…',
+            stagedUri
+              ? `Starting Cloud Run from staged storage…`
+              : usedMember
+                ? `Preparing ${uploadName} for Cloud Run…`
+                : 'Preparing Cloud Run job…',
           )
           const out = await runServerCompression({
             file: uploadFile,
             filename: uploadName,
+            gcsUri: stagedUri,
             method,
             // Member already extracted client-side — do not re-send the TAR.
             archiveMember: null,
@@ -1378,7 +1405,9 @@ export default function CompressionLab() {
     // Keep prior Run previews/downloads/residual while the comparison table updates.
 
     const useCloudRun =
-      engine === 'cloud-run' && !isMultiMemberStack(image) && Boolean(rawFile)
+      engine === 'cloud-run' &&
+      !isMultiMemberStack(image) &&
+      Boolean(rawFile || sourceGcsUri)
 
     if (engine === 'cloud-run' && isMultiMemberStack(image)) {
       setStatus(
@@ -1391,10 +1420,14 @@ export default function CompressionLab() {
     }
 
     try {
-      let cloudUpload: { file: Blob; filename: string } | null = null
-      if (useCloudRun && rawFile) {
-        let uploadFile: Blob = rawFile
-        let uploadName = rawFile.name
+      let cloudUpload: {
+        file: Blob | null
+        filename: string
+        gcsUri: string | null
+      } | null = null
+      if (useCloudRun && (rawFile || sourceGcsUri)) {
+        let uploadFile: Blob | null = rawFile
+        let uploadName = rawFile?.name || image.filename.split('→').pop()?.trim() || 'image.bin'
         if (archive) {
           const memberPath =
             archiveMember && !archiveMember.includes(' + ')
@@ -1407,7 +1440,7 @@ export default function CompressionLab() {
           }
           if (archive.demoRemote) {
             uploadFile = rawFile
-            uploadName = rawFile.name
+            uploadName = rawFile?.name || memberPath.split('/').pop() || 'member.bin'
           } else {
             if (!archive.buffer) {
               throw new Error('Archive bytes are missing')
@@ -1424,13 +1457,22 @@ export default function CompressionLab() {
             uploadName = memberFilename
           }
         }
-        if (uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES && !gcsUploads) {
+        if (
+          !sourceGcsUri &&
+          uploadFile &&
+          uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES &&
+          !gcsUploads
+        ) {
           throw new Error(
             `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB. ` +
               `Set GCS_UPLOAD_BUCKET for large Cloud Run jobs, or switch Engine → Browser.`,
           )
         }
-        cloudUpload = { file: uploadFile, filename: uploadName }
+        cloudUpload = {
+          file: uploadFile,
+          filename: uploadName,
+          gcsUri: sourceGcsUri,
+        }
       }
 
       const rows: CompareRow[] = []
@@ -1447,6 +1489,7 @@ export default function CompressionLab() {
             out = await runServerCompression({
               file: cloudUpload.file,
               filename: cloudUpload.filename,
+              gcsUri: cloudUpload.gcsUri,
               method: m,
               archiveMember: null,
               maxDim: maxProcessDim,
@@ -2221,7 +2264,7 @@ export default function CompressionLab() {
           )}
 
           <div className="actions">
-            <button type="button" disabled={!image || !rawFile || busy} onClick={() => void onRun()}>
+            <button type="button" disabled={!image || (!rawFile && !sourceGcsUri) || busy} onClick={() => void onRun()}>
               {busy
                 ? 'Working…'
                 : engine === 'cloud-run' && !isMultiMemberStack(image)
@@ -2231,7 +2274,7 @@ export default function CompressionLab() {
             <button
               type="button"
               className="secondary"
-              disabled={!image || busy || (engine === 'cloud-run' && !rawFile)}
+              disabled={!image || busy || (engine === 'cloud-run' && !rawFile && !sourceGcsUri)}
               onClick={() => void onCompareAll()}
               title={
                 engine === 'cloud-run'
