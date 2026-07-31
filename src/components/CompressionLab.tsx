@@ -93,6 +93,17 @@ function memberLabel(path: string): string {
   return path.split('/').pop() || path
 }
 
+/** Prefer parent/file so demo-extracts/<uuid>/band.TIF stay distinguishable. */
+function objectMemberLabel(path: string): string {
+  const parts = path.split('/').filter(Boolean)
+  if (parts.length <= 1) return parts[0] || path
+  const file = parts[parts.length - 1]
+  const parent = parts[parts.length - 2]
+  const short =
+    parent.length > 14 ? `${parent.slice(0, 8)}…${parent.slice(-4)}` : parent
+  return `${short}/${file}`
+}
+
 function folderBreadcrumb(path: string): string {
   return path ? path : '(archive root)'
 }
@@ -397,9 +408,12 @@ export default function CompressionLab() {
     if (!archive) return
     setArchive({ ...archive, folderPath: nextPath })
     const child = archiveChildren(archive.listing, nextPath)
-    if (archiveMember && child.images.includes(archiveMember)) return
-    // Update the picker highlight without forcing a download/reload.
-    setArchiveMember(child.images[0] ?? '')
+    // Keep the current selection only if it is still in this folder.
+    // Do NOT auto-highlight the first image — that makes the select look
+    // chosen without firing onChange / loading a preview.
+    if (archiveMember && !child.images.includes(archiveMember)) {
+      setArchiveMember('')
+    }
   }
 
   function jpegQualityForMethod(): number {
@@ -2125,7 +2139,11 @@ export default function CompressionLab() {
 
           {archive && (
             <div className="archive-browser">
-              {(archiveFolderView.folders.length > 0 || archive.folderPath) && (
+              {/* Object buckets (e.g. esmi-uploads) use flat paths under
+                  demo-extracts/<id>/… — folder chrome hid images and auto-highlight
+                  looked selected without loading a preview. */}
+              {archive.demoRemote?.kind !== 'objects' &&
+                (archiveFolderView.folders.length > 0 || archive.folderPath) && (
                 <label>
                   <span>Folder in archive</span>
                   <div className="archive-folder-bar">
@@ -2170,12 +2188,17 @@ export default function CompressionLab() {
                 </label>
               )}
               <label>
-                {archive.demoRemote
-                  ? 'Demo image (downloaded on select)'
-                  : 'Image in this folder'}
+                {archive.demoRemote?.kind === 'objects'
+                  ? 'Bucket image (preview on select)'
+                  : archive.demoRemote
+                    ? 'Demo image (downloaded on select)'
+                    : 'Image in this folder'}
                 <select
                   value={
-                    archiveFolderView.images.includes(archiveMember)
+                    (archive.demoRemote?.kind === 'objects'
+                      ? archive.listing.images
+                      : archiveFolderView.images
+                    ).includes(archiveMember)
                       ? archiveMember
                       : ''
                   }
@@ -2183,26 +2206,44 @@ export default function CompressionLab() {
                   onChange={(e) => void onArchiveMemberChange(e.target.value)}
                 >
                   <option value="" disabled>
-                    {archiveFolderView.images.length
-                      ? 'Select an image…'
-                      : archiveFolderView.folders.length
-                        ? 'Open a subfolder…'
-                        : 'No images here'}
+                    {archive.demoRemote?.kind === 'objects'
+                      ? archive.listing.images.length
+                        ? 'Select an image…'
+                        : 'No images in bucket'
+                      : archiveFolderView.images.length
+                        ? 'Select an image…'
+                        : archiveFolderView.folders.length
+                          ? 'Open a subfolder…'
+                          : 'No images here'}
                   </option>
-                  {archiveFolderView.images.map((m) => (
-                    <option key={m} value={m}>
-                      {memberLabel(m)}
+                  {(archive.demoRemote?.kind === 'objects'
+                    ? archive.listing.images
+                    : archiveFolderView.images
+                  ).map((m) => (
+                    <option key={m} value={m} title={m}>
+                      {archive.demoRemote?.kind === 'objects'
+                        ? objectMemberLabel(m)
+                        : memberLabel(m)}
                     </option>
                   ))}
                 </select>
               </label>
               <p className="hint">
                 {archive.members.length} images
-                {archive.listing.folders.length
-                  ? ` · ${archive.listing.folders.length} folders`
+                {archive.demoRemote?.kind === 'objects'
+                  ? ' · pick one to load preview'
+                  : archive.listing.folders.length
+                    ? ` · ${archive.listing.folders.length} folders`
+                    : ''}
+                {archive.demoRemote?.kind !== 'objects' && archive.folderPath
+                  ? ` · in ${archive.folderPath}`
                   : ''}
-                {archive.folderPath ? ` · in ${archive.folderPath}` : ''}
               </p>
+              {busy && status && (
+                <p className="status" aria-live="polite">
+                  {status}
+                </p>
+              )}
             </div>
           )}
 
