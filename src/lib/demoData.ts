@@ -155,14 +155,11 @@ export async function fetchDemoMemberLight(input: {
   if (!data.gcsUri || !data.gcsUri.startsWith('gs://')) {
     throw new Error('Demo light prepare returned no staged gcsUri')
   }
-  if (!data.downloadUrl) {
-    throw new Error('Demo light prepare returned no download URL')
-  }
   return {
     gcsUri: data.gcsUri,
     filename: data.filename || label,
     size: Number(data.size || 0),
-    downloadUrl: data.downloadUrl,
+    downloadUrl: data.downloadUrl || '',
     lightPreview: Boolean(data.lightPreview && data.previewPngBase64),
     previewPngBase64: data.previewPngBase64,
     nativeWidth: data.nativeWidth,

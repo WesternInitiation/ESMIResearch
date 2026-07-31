@@ -36,6 +36,7 @@ from image_io import (
     list_archive_listing,
     load_archive_image,
     load_image,
+    preview_raster_bytes,
     scan_archive_image_entries,
     to_display_rgb,
 )
@@ -108,7 +109,7 @@ def health() -> dict[str, object]:
             "lzw": True,
             "nativeRestore": True,  # max_dim<=0 keeps native; else upsample back
             "residualPreview": True,
-            "lightPreview": True,  # /v1/demo/preview — skip browser full-file download
+            "lightPreview": True,  # /v1/demo/preview + /v1/demo/light_prepare
             "methods": list(SUPPORTED_METHODS),
         },
     }
@@ -572,8 +573,8 @@ async def demo_preview(
     """
     Build a ≤max_dim PNG preview from a staged gs:// object.
 
-    Used so the browser can skip downloading 40–150 MB GeoTIFFs just to show
-    the Original panel — Cloud Run still compresses the staged native object.
+    Uses rasterio out_shape so Landsat-sized GeoTIFFs are not fully decoded
+    into native float arrays just for the UI thumbnail.
     Does not delete the GCS object.
     """
     uri = (gcs_uri or "").strip()
@@ -592,24 +593,22 @@ async def demo_preview(
 
     source_filename = (filename or "").strip() or gcs_filename
     try:
-        bands, band_order, source_name = _load_from_upload(raw, source_filename, None)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        bands, band_order, native_w, native_h, preview_w, preview_h = (
+            preview_raster_bytes(raw, source_filename, max_dim=max(64, int(max_dim)))
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Failed to load image for preview: {exc}",
         ) from exc
 
-    native = next(iter(bands.values())).shape
-    native_h, native_w = int(native[0]), int(native[1])
-    cap = max(64, int(max_dim)) if int(max_dim) > 0 else 1024
-    preview = _preview_rgb_capped(bands, band_order, cap)
+    # If fallback returned native-sized bands, cap the PNG.
+    preview = _preview_rgb_capped(bands, band_order, max(64, int(max_dim) or 1024))
     preview_h, preview_w = int(preview.shape[0]), int(preview.shape[1])
 
     return JSONResponse(
         {
-            "filename": source_name,
+            "filename": source_filename.rsplit("/", 1)[-1],
             "originalBytes": len(raw),
             "nativeWidth": native_w,
             "nativeHeight": native_h,
@@ -618,6 +617,162 @@ async def demo_preview(
             "bandOrder": band_order,
             "previewPngBase64": _png_b64(preview),
             "gcsUri": uri,
+        }
+    )
+
+
+@app.post("/v1/demo/light_prepare")
+async def demo_light_prepare(
+    staging_bucket: str | None = Form(None),
+    max_dim: int = Form(1024),
+    source_bucket: str | None = Form(None),
+    source_object: str | None = Form(None),
+    archive: str | None = Form(None),
+    member: str | None = Form(None),
+    offset: int | None = Form(None),
+    size: int | None = Form(None),
+    filename: str | None = Form(None),
+) -> JSONResponse:
+    """
+    In-region stage + ≤max_dim preview so Vercel never downloads 40–150 MB TIFs.
+
+    Object mode: source_bucket + source_object
+    Archive mode: source_bucket + archive + member (+ optional offset/size)
+    """
+    import time
+    import uuid
+
+    from google.cloud import storage
+
+    staging = (staging_bucket or "").strip() or _staging_bucket_default()
+    if not staging:
+        raise HTTPException(
+            status_code=400,
+            detail="staging_bucket / GCS_UPLOAD_BUCKET is required",
+        )
+
+    bucket_name = (source_bucket or "").strip() or _demo_bucket_default()
+    client = storage.Client()
+    raw: bytes | None = None
+    out_name = (filename or "").strip()
+
+    src_object = (source_object or "").strip()
+    archive_name = (archive or "").strip()
+    member_name = (member or "").strip()
+
+    if src_object and not archive_name:
+        blob = client.bucket(bucket_name).blob(src_object)
+        if not blob.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"GCS object not found: gs://{bucket_name}/{src_object}",
+            )
+        try:
+            raw = blob.download_as_bytes()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to download source object: {exc}",
+            ) from exc
+        out_name = out_name or src_object.rsplit("/", 1)[-1] or "member.bin"
+    elif archive_name and member_name:
+        if not is_tar_archive(archive_name):
+            raise HTTPException(status_code=400, detail="archive must be a TAR/ZIP")
+        src = client.bucket(bucket_name).blob(archive_name)
+        if not src.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"GCS object not found: gs://{bucket_name}/{archive_name}",
+            )
+        out_name = out_name or member_name.rsplit("/", 1)[-1] or "member.bin"
+        if offset is not None and size is not None and int(size) > 0:
+            start = int(offset)
+            end = start + int(size) - 1
+            try:
+                raw = src.download_as_bytes(start=start, end=end)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Ranged download failed: {exc}",
+                ) from exc
+        else:
+            try:
+                with src.open("rb") as handle:
+                    with tarfile.open(
+                        fileobj=handle,
+                        mode="r|gz"
+                        if archive_name.lower().endswith((".tar.gz", ".tgz"))
+                        else "r|",
+                    ) as tf:
+                        for info in tf:
+                            if not info.isfile() or info.name != member_name:
+                                continue
+                            extracted = tf.extractfile(info)
+                            if extracted is None:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail="Could not read archive member",
+                                )
+                            raw = extracted.read()
+                            break
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Stream extract failed: {exc}",
+                ) from exc
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Archive member not found")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide source_object, or archive+member",
+        )
+
+    if raw is None or len(raw) == 0:
+        raise HTTPException(status_code=400, detail="Empty source payload")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Source exceeds size limit (~2 GiB)")
+
+    object_name = f"demo-extracts/{int(time.time())}-{uuid.uuid4().hex}/{out_name}"
+    dest = client.bucket(staging).blob(object_name)
+    try:
+        dest.upload_from_string(raw, content_type="application/octet-stream")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to stage extract: {exc}",
+        ) from exc
+
+    try:
+        bands, band_order, native_w, native_h, _pw, _ph = preview_raster_bytes(
+            raw, out_name, max_dim=max(64, int(max_dim))
+        )
+        preview = _preview_rgb_capped(bands, band_order, max(64, int(max_dim) or 1024))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to build preview: {exc}",
+        ) from exc
+
+    preview_h, preview_w = int(preview.shape[0]), int(preview.shape[1])
+    gcs_uri = f"gs://{staging}/{object_name}"
+    return JSONResponse(
+        {
+            "gcsUri": gcs_uri,
+            "bucket": staging,
+            "objectName": object_name,
+            "filename": out_name,
+            "size": len(raw),
+            "downloadUrl": None,
+            "lightPreview": True,
+            "nativeWidth": native_w,
+            "nativeHeight": native_h,
+            "previewWidth": preview_w,
+            "previewHeight": preview_h,
+            "bandOrder": band_order,
+            "previewPngBase64": _png_b64(preview),
         }
     )
 

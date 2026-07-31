@@ -356,8 +356,8 @@ export async function previewStagedGcsObject(input: {
 }
 
 /**
- * Stage a demo member, then (when possible) build a light Cloud Run preview so
- * the browser never downloads the full GeoTIFF for Engine → Cloud Run.
+ * Stage a demo member on Cloud Run (in-region) and return a ≤1024px preview.
+ * Avoids pulling 40–150 MB GeoTIFFs through Vercel just for the Original panel.
  */
 export async function prepareDemoMemberLight(input: {
   kind: 'archive' | 'objects'
@@ -366,6 +366,130 @@ export async function prepareDemoMemberLight(input: {
   bucket?: string
   maxDim?: number
 }): Promise<PreparedDemoMemberWithPreview> {
+  const base = compressApiBase()
+  const staging = gcsUploadBucket()
+  const { resolveDemoBucket } = await import('@/lib/gcsBuckets')
+  const bucketName = resolveDemoBucket(input.bucket)
+  const member = input.member.trim()
+  if (!member) throw new Error('member is required')
+
+  if (base && staging) {
+    try {
+      const form = new FormData()
+      form.set('staging_bucket', staging)
+      form.set('max_dim', String(input.maxDim ?? 1024))
+      form.set('source_bucket', bucketName)
+
+      if (input.kind === 'objects') {
+        form.set('source_object', member)
+        form.set('filename', member.split('/').pop() || member)
+      } else {
+        const objectName = (input.objectName || '').trim()
+        if (!objectName) throw new Error('objectName is required for archive demos')
+        form.set('archive', objectName)
+        form.set('member', member)
+        form.set('filename', member.split('/').pop() || member)
+        // Prefer ranged extract when we already know offsets from the catalog.
+        let entry = lookupManifestEntry(bucketName, objectName, member)
+        if (!entry) {
+          try {
+            await buildDemoCatalog(bucketName)
+            entry = lookupManifestEntry(bucketName, objectName, member)
+          } catch {
+            // continue without offsets
+          }
+        }
+        if (entry) {
+          form.set('offset', String(entry.offset))
+          form.set('size', String(entry.size))
+        }
+      }
+
+      const headers = await cloudRunAuthHeaders(base)
+      const res = await fetch(`${base}/v1/demo/light_prepare`, {
+        method: 'POST',
+        headers,
+        body: form,
+      })
+      const text = await res.text()
+      if (!res.ok) {
+        throw new Error(
+          `Cloud Run light_prepare failed (${res.status}): ${text.slice(0, 400)}`,
+        )
+      }
+      const parsed = JSON.parse(text) as PreparedDemoMemberWithPreview & {
+        objectName?: string
+        bucket?: string
+      }
+      if (!parsed.gcsUri || !parsed.previewPngBase64) {
+        throw new Error('Cloud Run light_prepare missing gcsUri/preview')
+      }
+      // Signed download URL still useful as a fallback path for Browser engine.
+      let downloadUrl = ''
+      try {
+        const storage = storageClientForDemo()
+        const objectName =
+          parsed.objectName ||
+          parsed.gcsUri.replace(/^gs:\/\/[^/]+\//, '')
+        const file = storage
+          .bucket(parsed.bucket || staging)
+          .file(objectName)
+        const expires = Date.now() + 60 * 60 * 1000
+        const [signed] = await file.getSignedUrl({
+          version: 'v4',
+          action: 'read',
+          expires,
+        })
+        downloadUrl = signed
+      } catch {
+        downloadUrl = ''
+      }
+      return {
+        downloadUrl,
+        filename: parsed.filename || member.split('/').pop() || 'member.bin',
+        size: Number(parsed.size || 0),
+        gcsUri: parsed.gcsUri,
+        lightPreview: true,
+        previewPngBase64: parsed.previewPngBase64,
+        nativeWidth: parsed.nativeWidth,
+        nativeHeight: parsed.nativeHeight,
+        previewWidth: parsed.previewWidth,
+        previewHeight: parsed.previewHeight,
+        bandOrder: parsed.bandOrder,
+      }
+    } catch (err) {
+      // Fall through to legacy stage-on-Vercel + /v1/demo/preview path.
+      const previewError = err instanceof Error ? err.message : String(err)
+      try {
+        const prepared = await prepareDemoMember(input)
+        try {
+          const preview = await previewStagedGcsObject({
+            gcsUri: prepared.gcsUri,
+            filename: prepared.filename,
+            maxDim: input.maxDim ?? 1024,
+          })
+          return {
+            ...prepared,
+            ...preview,
+            lightPreview: true,
+            previewError,
+          }
+        } catch (previewErr) {
+          return {
+            ...prepared,
+            lightPreview: false,
+            previewError: `${previewError} | ${
+              previewErr instanceof Error ? previewErr.message : String(previewErr)
+            }`,
+          }
+        }
+      } catch (prepareErr) {
+        throw prepareErr instanceof Error ? prepareErr : new Error(String(prepareErr))
+      }
+    }
+  }
+
+  // No Cloud Run / staging — legacy path.
   const prepared = await prepareDemoMember(input)
   try {
     const preview = await previewStagedGcsObject({

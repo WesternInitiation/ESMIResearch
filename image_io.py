@@ -450,6 +450,75 @@ def load_geotiff(file: BinaryIO) -> LoadedImage:
     )
 
 
+def load_geotiff_preview(
+    data: bytes,
+    *,
+    max_dim: int = 1024,
+) -> tuple[dict[str, np.ndarray], list[str], int, int, int, int]:
+    """
+    Decode a GeoTIFF only at preview resolution via rasterio ``out_shape``.
+
+    Returns ``(bands, band_order, native_w, native_h, preview_w, preview_h)``.
+    Much faster/cheaper than ``load_geotiff`` + downsample for UI previews.
+    """
+    if not HAS_RASTERIO:
+        raise RuntimeError("rasterio is required for GeoTIFF previews")
+    from rasterio.enums import Resampling
+
+    cap = max(64, int(max_dim)) if int(max_dim) > 0 else 1024
+    with MemoryFile(data) as memfile:
+        with memfile.open() as dataset:
+            native_w = int(dataset.width)
+            native_h = int(dataset.height)
+            longest = max(native_w, native_h)
+            if longest > cap:
+                scale = cap / float(longest)
+                preview_w = max(1, int(round(native_w * scale)))
+                preview_h = max(1, int(round(native_h * scale)))
+            else:
+                preview_w, preview_h = native_w, native_h
+            array = dataset.read(
+                out_shape=(dataset.count, preview_h, preview_w),
+                resampling=Resampling.bilinear,
+            )
+            descriptions = dataset.descriptions
+
+    bands: dict[str, np.ndarray] = {}
+    order: list[str] = []
+    for i, desc in enumerate(descriptions):
+        name = (
+            desc.strip().lower().replace(" ", "_")
+            if desc
+            else f"band_{i + 1}"
+        )
+        if name in bands:
+            name = f"{name}_{i + 1}"
+        bands[name] = array[i]
+        order.append(name)
+    _apply_common_band_aliases(bands, order)
+    return bands, order, native_w, native_h, preview_w, preview_h
+
+
+def preview_raster_bytes(
+    data: bytes,
+    filename: str,
+    *,
+    max_dim: int = 1024,
+) -> tuple[dict[str, np.ndarray], list[str], int, int, int, int]:
+    """Load preview-sized bands from image bytes (GeoTIFF preferred)."""
+    lower = filename.lower()
+    if lower.endswith(GEO_TIFF_SUFFIXES) or _looks_like_tiff(data[:16]):
+        try:
+            return load_geotiff_preview(data, max_dim=max_dim)
+        except Exception:
+            # Fall through to full load + caller can downsample.
+            pass
+    loaded = load_image(BytesIO(data), filename)
+    sample = next(iter(loaded.bands.values()))
+    native_h, native_w = int(sample.shape[0]), int(sample.shape[1])
+    return loaded.bands, loaded.band_order, native_w, native_h, native_w, native_h
+
+
 def _read_raster_tags(dataset, band_index: int = 0) -> dict[str, dict[str, str]]:
     """Collect default and namespaced GeoTIFF tags."""
     result = {"": dataset.tags(band_index)}

@@ -1050,7 +1050,7 @@ export default function CompressionLab() {
         // Cloud Run: stage in GCS + server ≤1024px preview (skip full browser download).
         // Browser engine: still download the full file for local codecs.
         if (engine === 'cloud-run') {
-          setStatus(`Staging ${member.split('/').pop() || member}…`)
+          setStatus(`Preparing light preview (Cloud Run, in-region)…`)
           const light = await fetchDemoMemberLight({
             kind: archive.demoRemote.kind,
             objectName: archive.demoRemote.objectName,
@@ -1085,6 +1085,12 @@ export default function CompressionLab() {
             )
           } else {
             // Old Cloud Run image or preview failure — fall back to full download.
+            if (!light.downloadUrl) {
+              throw new Error(
+                light.previewError ||
+                  'Light preview failed and no download URL was returned. Redeploy Cloud Run.',
+              )
+            }
             if (light.previewError) {
               setStatus(`Light preview unavailable — downloading full file…`)
             }
