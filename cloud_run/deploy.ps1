@@ -23,12 +23,16 @@ git pull origin main
 $CommitSha = (git rev-parse --short HEAD).Trim()
 if (-not $CommitSha) { $CommitSha = "manual" }
 
-$MainPy = Get-Content -Raw (Join-Path $Root "cloud_run\main.py")
+$MainPyPath = Join-Path $Root "cloud_run\main.py"
+$MainPy = Get-Content -LiteralPath $MainPyPath -Raw -Encoding UTF8
 if ($MainPy -notmatch '"LZW"') {
-  throw "cloud_run/main.py has no LZW — git pull origin main and retry."
+  throw 'cloud_run/main.py has no LZW - run: git pull origin main'
 }
 if ($MainPy -notmatch 'LZW_SAFE_MAX_DIM') {
-  throw "cloud_run/main.py missing LZW_SAFE_MAX_DIM — git pull origin main and retry."
+  throw 'cloud_run/main.py missing LZW_SAFE_MAX_DIM - run: git pull origin main'
+}
+if ($MainPy -notmatch '/v1/demo/light_prepare') {
+  throw 'cloud_run/main.py missing /v1/demo/light_prepare - run: git pull origin main'
 }
 
 Write-Host "Building gcr.io/$ProjectId/esmi-compress from commit $CommitSha ..."
@@ -55,4 +59,4 @@ Write-Host ""
 Write-Host "Deployed: $Url"
 Write-Host "Commit:   $CommitSha"
 Write-Host "Verify:   curl.exe -s https://esmi-research.vercel.app/api/compress"
-Write-Host "Expect commit=$CommitSha (LZW auto-cap is in this image)."
+Write-Host "Expect commit=$CommitSha"
