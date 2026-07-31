@@ -31,8 +31,8 @@ if ($MainPy -notmatch '"LZW"') {
 if ($MainPy -notmatch 'LZW_SAFE_MAX_DIM') {
   throw 'cloud_run/main.py missing LZW_SAFE_MAX_DIM - run: git pull origin main'
 }
-if ($MainPy -notmatch '/v1/demo/light_prepare') {
-  throw 'cloud_run/main.py missing /v1/demo/light_prepare - run: git pull origin main'
+if ($MainPy -notmatch '/v1/compress/jobs') {
+  throw 'cloud_run/main.py missing /v1/compress/jobs - run: git pull origin main'
 }
 
 Write-Host "Building gcr.io/$ProjectId/esmi-compress from commit $CommitSha ..."
@@ -40,7 +40,7 @@ gcloud config set project $ProjectId
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com storage.googleapis.com
 gcloud builds submit --config cloudbuild.yaml --substitutions="COMMIT_SHA=$CommitSha"
 
-$EnvVars = "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,LZW_SAFE_MAX_DIM=4096,GCS_UPLOAD_BUCKET=$GcsBucket,GCS_DEMO_BUCKET=esmi-research-demo-data,COMMIT_SHA=$CommitSha"
+$EnvVars = "CORS_ORIGINS=*,DEFAULT_MAX_DIM=2048,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,LZW_SAFE_MAX_DIM=4096,GCS_UPLOAD_BUCKET=$GcsBucket,GCS_DEMO_BUCKET=esmi-research-demo-data,COMMIT_SHA=$CommitSha"
 
 Write-Host "Deploying Cloud Run service esmi-compress ..."
 gcloud run deploy esmi-compress `
@@ -49,9 +49,11 @@ gcloud run deploy esmi-compress `
   --platform managed `
   --allow-unauthenticated `
   --memory 4Gi `
-  --cpu 1 `
+  --cpu 2 `
+  --no-cpu-throttling `
   --timeout 600 `
   --max-instances 3 `
+  --concurrency 1 `
   --set-env-vars $EnvVars
 
 $Url = gcloud run services describe esmi-compress --region $Region --format="value(status.url)"

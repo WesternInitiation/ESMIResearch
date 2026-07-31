@@ -40,6 +40,10 @@ if ! grep -q 'LZW_SAFE_MAX_DIM' cloud_run/main.py; then
   echo "error: cloud_run/main.py missing LZW_SAFE_MAX_DIM — run 'git pull origin main' and redeploy." >&2
   exit 1
 fi
+if ! grep -q '/v1/compress/jobs' cloud_run/main.py; then
+  echo "error: cloud_run/main.py missing /v1/compress/jobs — run 'git pull origin main' and redeploy." >&2
+  exit 1
+fi
 
 gcloud builds submit --config cloudbuild.yaml --substitutions=COMMIT_SHA="${COMMIT_SHA}"
 
@@ -50,10 +54,12 @@ gcloud run deploy esmi-compress \
   --platform managed \
   --allow-unauthenticated \
   --memory 4Gi \
-  --cpu 1 \
+  --cpu 2 \
+  --no-cpu-throttling \
   --timeout 600 \
   --max-instances 3 \
-  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,LZW_SAFE_MAX_DIM=4096,GCS_UPLOAD_BUCKET=${GCS_BUCKET},GCS_DEMO_BUCKET=esmi-research-demo-data,COMMIT_SHA=${COMMIT_SHA}"
+  --concurrency 1 \
+  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=2048,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,LZW_SAFE_MAX_DIM=4096,GCS_UPLOAD_BUCKET=${GCS_BUCKET},GCS_DEMO_BUCKET=esmi-research-demo-data,COMMIT_SHA=${COMMIT_SHA}"
 
 URL="$(gcloud run services describe esmi-compress --region "${REGION}" --format='value(status.url)')"
 echo ""
@@ -61,4 +67,4 @@ echo "Deployed: ${URL}"
 echo "Commit:   ${COMMIT_SHA}"
 echo "Verify:"
 echo "  curl.exe -s https://esmi-research.vercel.app/api/compress"
-echo "Expect features.lightPreview=true and a new commit sha (not an old one)."
+echo "Expect features.asyncJobs=true and a new commit sha."

@@ -4,7 +4,9 @@ ESMI compression API for Google Cloud Run (free tier friendly).
 Endpoints:
   GET  /health
   POST /v1/archive/list   — list image members in a TAR / TAR.GZ
-  POST /v1/compress       — run SVD / wavelet / bandwidth / JPEG2000 / LZW
+  POST /v1/compress       — sync compress (may hit Vercel 300s proxy limit)
+  POST /v1/compress/jobs  — start async job (progress via GET …/jobs/{id})
+  GET  /v1/compress/jobs/{job_id}
 
 Build from the repository root:
   docker build -f cloud_run/Dockerfile .
@@ -16,11 +18,14 @@ import base64
 import json
 import os
 import tarfile
+import threading
+import time
+import uuid
 from io import BytesIO
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -55,6 +60,8 @@ MethodName = Literal[
     "LZW",
 ]
 
+ProgressCb = Callable[[float, str, str], None]
+
 app = FastAPI(title="ESMI Compression API", version="1.0.0")
 
 _allowed = os.environ.get("CORS_ORIGINS", "*")
@@ -84,6 +91,10 @@ DELETE_GCS_AFTER_JOB = os.environ.get("DELETE_GCS_AFTER_JOB", "1").strip() not i
     "False",
     "no",
 )
+
+# In-process fallback when GCS status writes fail (single-instance only).
+_JOB_MEMORY: dict[str, dict[str, Any]] = {}
+_JOB_LOCK = threading.Lock()
 
 
 SUPPORTED_METHODS: tuple[str, ...] = (
@@ -115,6 +126,7 @@ def health() -> dict[str, object]:
             "residualPreview": True,
             "lightPreview": True,  # /v1/demo/preview + /v1/demo/light_prepare
             "geotiffExport": True,  # per-band GeoTIFF via rasterio (CRS/transform/NoData)
+            "asyncJobs": True,  # /v1/compress/jobs — avoids Vercel 300s proxy timeout
             "methods": list(SUPPORTED_METHODS),
         },
     }
@@ -896,9 +908,156 @@ async def compress(
     red_band: str | None = Form(None),
     nir_band: str | None = Form(None),
 ) -> JSONResponse:
+    """
+    Synchronous compress. Prefer ``POST /v1/compress/jobs`` from the Vercel lab —
+    the Vercel proxy times out at ~300s (FUNCTION_INVOCATION_TIMEOUT / HTTP 504).
+    """
     if method not in SUPPORTED_METHODS:
         raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
 
+    raw, source_filename, uri, gcs_blob = await _read_compress_source(
+        file=file, gcs_uri=gcs_uri, filename=filename
+    )
+    member = (archive_member or "").strip() or None
+    try:
+        payload = _execute_compress_pipeline(
+            raw=raw,
+            source_filename=source_filename,
+            member=member,
+            method=method,
+            max_dim=max_dim,
+            svd_rank=svd_rank,
+            wavelet_keep_fraction=wavelet_keep_fraction,
+            wavelet_levels=wavelet_levels,
+            wavelet_name=wavelet_name,
+            bandwidth_keep_fraction=bandwidth_keep_fraction,
+            jpeg_rate=jpeg_rate,
+            red_band=red_band,
+            nir_band=nir_band,
+            uri=uri,
+            gcs_blob=gcs_blob,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    try:
+        return JSONResponse(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to serialize compression response: {exc}",
+        ) from exc
+
+
+@app.post("/v1/compress/jobs")
+async def compress_job_start(
+    background_tasks: BackgroundTasks,
+    file: UploadFile | None = File(None),
+    gcs_uri: str | None = Form(None),
+    filename: str | None = Form(None),
+    method: str = Form(...),
+    archive_member: str | None = Form(None),
+    max_dim: int = Form(DEFAULT_MAX_DIM),
+    svd_rank: int = Form(32),
+    wavelet_keep_fraction: float = Form(0.08),
+    wavelet_levels: int = Form(3),
+    wavelet_name: str = Form("db4"),
+    bandwidth_keep_fraction: float = Form(0.12),
+    jpeg_rate: float = Form(0.45),
+    red_band: str | None = Form(None),
+    nir_band: str | None = Form(None),
+) -> JSONResponse:
+    """
+    Start an async compress job and return immediately.
+
+    Poll ``GET /v1/compress/jobs/{job_id}`` for progress. Requires
+    ``GCS_UPLOAD_BUCKET`` (status + result live in GCS). Deploy with
+    ``--no-cpu-throttling`` so work continues after this response.
+    """
+    if method not in SUPPORTED_METHODS:
+        raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
+    staging = _staging_bucket_default()
+    if not staging:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Async jobs require GCS_UPLOAD_BUCKET. "
+                "Redeploy Cloud Run with the upload bucket, or use a smaller "
+                "max_dim with sync /v1/compress."
+            ),
+        )
+
+    raw, source_filename, uri, gcs_blob = await _read_compress_source(
+        file=file, gcs_uri=gcs_uri, filename=filename
+    )
+    # Prefer a durable gs:// source so the background task can re-download if needed.
+    if not uri:
+        uri = _stage_job_source_bytes(raw, source_filename, staging)
+        gcs_blob = None  # staged under jobs/ — do not auto-delete mid-run
+
+    job_id = uuid.uuid4().hex
+    member = (archive_member or "").strip() or None
+    params = {
+        "gcs_uri": uri,
+        "filename": source_filename,
+        "method": method,
+        "archive_member": member,
+        "max_dim": int(max_dim),
+        "svd_rank": int(svd_rank),
+        "wavelet_keep_fraction": float(wavelet_keep_fraction),
+        "wavelet_levels": int(wavelet_levels),
+        "wavelet_name": wavelet_name or "db4",
+        "bandwidth_keep_fraction": float(bandwidth_keep_fraction),
+        "jpeg_rate": float(jpeg_rate),
+        "red_band": red_band,
+        "nir_band": nir_band,
+        "delete_source_blob": False,
+    }
+    _write_job_status(
+        job_id,
+        {
+            "jobId": job_id,
+            "status": "queued",
+            "progress": 1,
+            "phase": "queued",
+            "message": "Job queued on Cloud Run…",
+            "method": method,
+            "createdAt": time.time(),
+        },
+    )
+    background_tasks.add_task(_run_compress_job, job_id, params, gcs_blob)
+    return JSONResponse(
+        {
+            "jobId": job_id,
+            "status": "queued",
+            "progress": 1,
+            "phase": "queued",
+            "message": "Job queued on Cloud Run…",
+            "pollPath": f"/v1/compress/jobs/{job_id}",
+        }
+    )
+
+
+@app.get("/v1/compress/jobs/{job_id}")
+async def compress_job_status(job_id: str) -> JSONResponse:
+    status = _read_job_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail=f"Unknown job: {job_id}")
+    # Attach result payload when finished (stored separately to keep status small).
+    if status.get("status") == "done" and "result" not in status:
+        result = _read_job_result(job_id)
+        if result is not None:
+            status = {**status, "result": result}
+    return JSONResponse(status)
+
+
+async def _read_compress_source(
+    *,
+    file: UploadFile | None,
+    gcs_uri: str | None,
+    filename: str | None,
+) -> tuple[bytes, str, str | None, Any]:
     gcs_blob: Any = None
     uri = (gcs_uri or "").strip() or None
     if uri:
@@ -912,34 +1071,228 @@ async def compress(
                 detail=f"Failed to download gcs_uri: {exc}",
             ) from exc
         source_filename = (filename or "").strip() or gcs_filename
-    else:
-        if file is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Provide either multipart file or gcs_uri",
-            )
-        raw = await file.read()
-        if not raw:
-            raise HTTPException(status_code=400, detail="Empty upload")
-        if len(raw) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Upload exceeds size limit (~2 GiB)")
-        if len(raw) > CLOUD_RUN_HTTP_MAX_BYTES:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    "Cloud Run direct uploads are limited to ~30 MB by the platform. "
-                    "Upload via GCS (gcs_uri) for 80–100+ MB images, or use Engine → Browser."
-                ),
-            )
-        source_filename = file.filename or filename or "upload.bin"
+        return raw, source_filename, uri, gcs_blob
 
-    member = (archive_member or "").strip() or None
+    if file is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either multipart file or gcs_uri",
+        )
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty upload")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload exceeds size limit (~2 GiB)")
+    if len(raw) > CLOUD_RUN_HTTP_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Cloud Run direct uploads are limited to ~30 MB by the platform. "
+                "Upload via GCS (gcs_uri) for 80–100+ MB images, or use Engine → Browser."
+            ),
+        )
+    source_filename = file.filename or filename or "upload.bin"
+    return raw, source_filename, None, None
+
+
+def _stage_job_source_bytes(raw: bytes, filename: str, staging: str) -> str:
+    from google.cloud import storage
+
+    safe = (filename or "upload.bin").split("/")[-1].replace(" ", "_")[:160]
+    object_name = f"jobs/{int(time.time())}-{uuid.uuid4().hex}/source/{safe}"
+    blob = storage.Client().bucket(staging).blob(object_name)
+    blob.upload_from_string(raw, content_type="application/octet-stream")
+    return f"gs://{staging}/{object_name}"
+
+
+def _job_prefix(job_id: str) -> str:
+    return f"jobs/{job_id}"
+
+
+def _write_job_status(job_id: str, payload: dict[str, Any]) -> None:
+    with _JOB_LOCK:
+        _JOB_MEMORY[job_id] = dict(payload)
+    staging = _staging_bucket_default()
+    if not staging:
+        return
+    try:
+        from google.cloud import storage
+
+        blob = storage.Client().bucket(staging).blob(f"{_job_prefix(job_id)}/status.json")
+        blob.upload_from_string(
+            json.dumps(payload) + "\n",
+            content_type="application/json",
+        )
+    except Exception:
+        # Memory fallback still allows polling the same instance.
+        pass
+
+
+def _read_job_status(job_id: str) -> dict[str, Any] | None:
+    staging = _staging_bucket_default()
+    if staging:
+        try:
+            from google.cloud import storage
+
+            blob = storage.Client().bucket(staging).blob(
+                f"{_job_prefix(job_id)}/status.json"
+            )
+            if blob.exists():
+                return json.loads(blob.download_as_text())
+        except Exception:
+            pass
+    with _JOB_LOCK:
+        cached = _JOB_MEMORY.get(job_id)
+        return dict(cached) if cached else None
+
+
+def _write_job_result(job_id: str, payload: dict[str, Any]) -> None:
+    staging = _staging_bucket_default()
+    if not staging:
+        with _JOB_LOCK:
+            cur = dict(_JOB_MEMORY.get(job_id) or {})
+            cur["result"] = payload
+            _JOB_MEMORY[job_id] = cur
+        return
+    try:
+        from google.cloud import storage
+
+        blob = storage.Client().bucket(staging).blob(f"{_job_prefix(job_id)}/result.json")
+        blob.upload_from_string(
+            json.dumps(payload) + "\n",
+            content_type="application/json",
+        )
+    except Exception:
+        with _JOB_LOCK:
+            cur = dict(_JOB_MEMORY.get(job_id) or {})
+            cur["result"] = payload
+            _JOB_MEMORY[job_id] = cur
+
+
+def _read_job_result(job_id: str) -> dict[str, Any] | None:
+    staging = _staging_bucket_default()
+    if staging:
+        try:
+            from google.cloud import storage
+
+            blob = storage.Client().bucket(staging).blob(
+                f"{_job_prefix(job_id)}/result.json"
+            )
+            if blob.exists():
+                return json.loads(blob.download_as_text())
+        except Exception:
+            pass
+    with _JOB_LOCK:
+        cached = _JOB_MEMORY.get(job_id) or {}
+        result = cached.get("result")
+        return dict(result) if isinstance(result, dict) else None
+
+
+def _run_compress_job(
+    job_id: str,
+    params: dict[str, Any],
+    gcs_blob: Any,
+) -> None:
+    def progress(pct: float, phase: str, message: str) -> None:
+        _write_job_status(
+            job_id,
+            {
+                "jobId": job_id,
+                "status": "running",
+                "progress": max(0, min(99, float(pct))),
+                "phase": phase,
+                "message": message,
+                "method": params.get("method"),
+                "updatedAt": time.time(),
+            },
+        )
+
+    try:
+        progress(3, "loading", "Downloading source from Cloud Storage…")
+        raw, gcs_filename, downloaded_blob = _download_gcs(str(params["gcs_uri"]))
+        source_filename = (params.get("filename") or "").strip() or gcs_filename
+        # Prefer the original uploads/ blob for optional cleanup.
+        cleanup_blob = gcs_blob or downloaded_blob
+        progress(8, "loading", "Source downloaded — starting compression…")
+        payload = _execute_compress_pipeline(
+            raw=raw,
+            source_filename=source_filename,
+            member=params.get("archive_member"),
+            method=str(params["method"]),
+            max_dim=int(params.get("max_dim") or DEFAULT_MAX_DIM),
+            svd_rank=int(params.get("svd_rank") or 32),
+            wavelet_keep_fraction=float(params.get("wavelet_keep_fraction") or 0.08),
+            wavelet_levels=int(params.get("wavelet_levels") or 3),
+            wavelet_name=str(params.get("wavelet_name") or "db4"),
+            bandwidth_keep_fraction=float(
+                params.get("bandwidth_keep_fraction") or 0.12
+            ),
+            jpeg_rate=float(params.get("jpeg_rate") or 0.45),
+            red_band=params.get("red_band"),
+            nir_band=params.get("nir_band"),
+            uri=str(params.get("gcs_uri") or "") or None,
+            gcs_blob=cleanup_blob,
+            on_progress=progress,
+        )
+        _write_job_result(job_id, payload)
+        _write_job_status(
+            job_id,
+            {
+                "jobId": job_id,
+                "status": "done",
+                "progress": 100,
+                "phase": "done",
+                "message": "Compression complete",
+                "method": params.get("method"),
+                "updatedAt": time.time(),
+            },
+        )
+    except Exception as exc:
+        _write_job_status(
+            job_id,
+            {
+                "jobId": job_id,
+                "status": "error",
+                "progress": 100,
+                "phase": "error",
+                "message": str(exc),
+                "error": str(exc),
+                "method": params.get("method"),
+                "updatedAt": time.time(),
+            },
+        )
+
+
+def _execute_compress_pipeline(
+    *,
+    raw: bytes,
+    source_filename: str,
+    member: str | None,
+    method: str,
+    max_dim: int,
+    svd_rank: int,
+    wavelet_keep_fraction: float,
+    wavelet_levels: int,
+    wavelet_name: str,
+    bandwidth_keep_fraction: float,
+    jpeg_rate: float,
+    red_band: str | None,
+    nir_band: str | None,
+    uri: str | None,
+    gcs_blob: Any,
+    on_progress: ProgressCb | None = None,
+) -> dict[str, Any]:
+    def progress(pct: float, phase: str, message: str) -> None:
+        if on_progress:
+            on_progress(pct, phase, message)
+
+    progress(10, "decoding", f"Loading {source_filename}…")
     try:
         loaded = _load_from_upload(raw, source_filename, member)
     except ValueError as exc:
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=400, detail=f"Failed to load image: {exc}") from exc
 
@@ -948,20 +1301,34 @@ async def compress(
     source_name = member or source_filename
     native = next(iter(bands.values())).shape
     native_h, native_w = int(native[0]), int(native[1])
-    # max_dim <= 0 → native resolution; otherwise enforce a small lower bound.
     process_cap = 0 if int(max_dim) <= 0 else max(64, int(max_dim))
     lzw_auto_capped = False
     if method == "LZW":
-        # Native Landsat (~8k) + Python LZW previously OOMed Cloud Run → 503.
         longest = max(native_h, native_w)
         if process_cap <= 0 or process_cap > LZW_SAFE_MAX_DIM:
             if longest > LZW_SAFE_MAX_DIM:
                 process_cap = LZW_SAFE_MAX_DIM
                 lzw_auto_capped = True
+
+    progress(
+        20,
+        "preparing",
+        f"Preparing {native_w}×{native_h}"
+        + (
+            " at native resolution…"
+            if process_cap <= 0
+            else f" (process ≤{process_cap}px)…"
+        ),
+    )
     process_bands, scale = _downsample_bands(bands, process_cap)
     sample = next(iter(process_bands.values()))
     process_h, process_w = int(sample.shape[0]), int(sample.shape[1])
 
+    progress(
+        30,
+        "compressing",
+        f"Running {method} at {process_w}×{process_h}…",
+    )
     try:
         result = _run_method(
             method,  # type: ignore[arg-type]
@@ -986,7 +1353,7 @@ async def compress(
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
 
-    # Restore native raster size so clients can compare / download at original dims.
+    progress(55, "restoring", "Restoring output to native dimensions…")
     if scale < 1.0 - 1e-12 or process_w != native_w or process_h != native_h:
         result.reconstructed_bands = _upsample_bands(
             result.reconstructed_bands, native_w, native_h
@@ -1011,7 +1378,7 @@ async def compress(
         }
     width, height = native_w, native_h
 
-    # Per-band scientific GeoTIFFs (rasterio) — staged to GCS for download.
+    progress(65, "exporting", "Writing per-band GeoTIFF exports…")
     geotiff_artifacts: list[dict[str, Any]] = []
     geotiff_error: str | None = None
     if loaded.source_type == "geotiff" or loaded.raster_profile is not None:
@@ -1025,7 +1392,7 @@ async def compress(
         except Exception as exc:
             geotiff_error = str(exc)
 
-    # Previews are capped for JSON transport; width/height above stay native.
+    progress(80, "previews", "Building preview images…")
     original_preview = _preview_rgb_capped(bands, band_order)
     reconstructed_preview = _preview_rgb_capped(
         result.reconstructed_bands, band_order
@@ -1038,6 +1405,7 @@ async def compress(
     except Exception:
         residual_b64 = None
 
+    progress(90, "metrics", "Computing metrics…")
     ndvi_payload: dict[str, float] | None = None
     red_name = red_band if red_band in bands else ("red" if "red" in bands else None)
     nir_name = nir_band if nir_band in bands else ("nir" if "nir" in bands else None)
@@ -1103,11 +1471,5 @@ async def compress(
         "geotiffError": geotiff_error,
     }
     _maybe_delete_gcs_blob(gcs_blob)
-    try:
-        return JSONResponse(payload)
-    except (TypeError, ValueError) as exc:
-        # Last resort: never 500 on metric serialization (e.g. leftover Inf).
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to serialize compression response: {exc}",
-        ) from exc
+    progress(99, "finalizing", "Finalizing response…")
+    return payload

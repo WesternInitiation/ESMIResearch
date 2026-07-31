@@ -338,9 +338,9 @@ export default function CompressionLab() {
   const [ndwiPairLoaded, setNdwiPairLoaded] = useState(false)
   const [pairMode, setPairMode] = useState(false)
   const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
-  // 0 = native resolution (no downsampling). Prefer this for fair comparisons.
-  // Default Native so codecs/downloads stay full resolution; previews stay 1024px.
-  const [maxProcessDim, setMaxProcessDim] = useState<number>(0)
+  // 0 = native. Default 2048 so Cloud Run finishes under Vercel’s old sync limit;
+  // Native remains available for final geospatial exports when needed.
+  const [maxProcessDim, setMaxProcessDim] = useState<number>(2048)
   const [engine, setEngine] = useState<Engine>('cloud-run')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
@@ -357,6 +357,11 @@ export default function CompressionLab() {
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [runProgress, setRunProgress] = useState<{
+    progress: number
+    phase: string
+    message: string
+  } | null>(null)
 
   const [indexKind, setIndexKind] = useState<'ndvi' | 'ndwi'>('ndvi')
   const [indexCompareTarget, setIndexCompareTarget] =
@@ -397,8 +402,24 @@ export default function CompressionLab() {
     return rgbaToDataUrl(image.previewRgba, pw, ph)
   }, [image, serverOriginalPreview])
 
-  // Safer default than Native: full-res Landsat floats can OOM the tab.
+  // Safer default than Native: full-res Landsat floats can OOM the tab / hit Vercel 504.
   // Users can still pick Native explicitly for Cloud Run.
+
+  function applyCompressProgress(
+    update: { progress: number; phase: string; message: string } | string,
+  ) {
+    if (typeof update === 'string') {
+      setStatus(update)
+      setRunProgress((prev) => ({
+        progress: prev?.progress ?? 0,
+        phase: prev?.phase ?? 'status',
+        message: update,
+      }))
+      return
+    }
+    setRunProgress(update)
+    setStatus(update.message)
+  }
 
   const archiveFolderView = useMemo(() => {
     if (!archive) return { folders: [] as string[], images: [] as string[] }
@@ -1278,6 +1299,7 @@ export default function CompressionLab() {
     setError(null)
     setIndexMetrics(null)
     setBusy(true)
+    setRunProgress({ progress: 1, phase: 'start', message: 'Starting…' })
 
     if (engine === 'cloud-run') {
       // Full NDVI/NDWI stacks from several TAR members — compress locally only.
@@ -1305,6 +1327,7 @@ export default function CompressionLab() {
                 'Pick a single archive image to send to Cloud Run (or use Browser for multi-band TAR pairs).',
               )
               setBusy(false)
+              setRunProgress(null)
               return
             }
             if (archive.demoRemote) {
@@ -1316,6 +1339,7 @@ export default function CompressionLab() {
               if (!archive.buffer) {
                 setError('Archive bytes are missing')
                 setBusy(false)
+                setRunProgress(null)
                 return
               }
               setStatus(`Extracting ${memberPath.split('/').pop()} from archive…`)
@@ -1345,11 +1369,13 @@ export default function CompressionLab() {
                 `or switch Engine → Browser.`,
             )
             setBusy(false)
+            setRunProgress(null)
             return
           }
           if (!stagedUri && !uploadFile) {
             setError('No image bytes available for Cloud Run')
             setBusy(false)
+            setRunProgress(null)
             return
           }
 
@@ -1377,7 +1403,7 @@ export default function CompressionLab() {
             redBand,
             nirBand,
             gcsUploads,
-            onProgress: (message) => setStatus(message),
+            onProgress: (message) => applyCompressProgress(message),
           })
           const originalPreview = `data:image/png;base64,${out.originalPreviewPngBase64}`
           setServerOriginalPreview(originalPreview)
@@ -1450,6 +1476,7 @@ export default function CompressionLab() {
               '. NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.',
           )
           setBusy(false)
+          setRunProgress(null)
           return
         } catch (err) {
           const msg =
@@ -1460,6 +1487,7 @@ export default function CompressionLab() {
               `Cloud Run does not support “${method}” yet — running in the browser instead. ` +
                 'Redeploy Cloud Run (`./cloud_run/deploy.sh`) to enable it server-side.',
             )
+            setRunProgress(null)
             // Fall through to the browser path below (busy stays true).
           } else if (/service unavailable|503/i.test(msg)) {
             setError(
@@ -1469,11 +1497,13 @@ export default function CompressionLab() {
             )
             setStatus(null)
             setBusy(false)
+            setRunProgress(null)
             return
           } else {
             setError(msg)
             setStatus(null)
             setBusy(false)
+            setRunProgress(null)
             return
           }
         }
@@ -1526,6 +1556,7 @@ export default function CompressionLab() {
       setStatus(null)
     } finally {
       setBusy(false)
+      setRunProgress(null)
     }
   }
 
@@ -1533,6 +1564,7 @@ export default function CompressionLab() {
     if (!image) return
     setError(null)
     setBusy(true)
+    setRunProgress({ progress: 1, phase: 'compare', message: 'Comparing methods…' })
     // Keep prior Run previews/downloads/residual while the comparison table updates.
 
     const useCloudRun =
@@ -1633,7 +1665,15 @@ export default function CompressionLab() {
               redBand,
               nirBand,
               gcsUploads,
-              onProgress: (message) => setStatus(`${m}: ${message}`),
+              onProgress: (message) =>
+                applyCompressProgress(
+                  typeof message === 'string'
+                    ? `${m}: ${message}`
+                    : {
+                        ...message,
+                        message: `${m}: ${message.message}`,
+                      },
+                ),
             })
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err)
@@ -1696,6 +1736,7 @@ export default function CompressionLab() {
       setError(err instanceof Error ? err.message : 'Comparison failed')
     } finally {
       setBusy(false)
+      setRunProgress(null)
     }
   }
 
@@ -2298,6 +2339,24 @@ export default function CompressionLab() {
             </option>
           </select>
 
+          <label>
+            Max processing size
+            <select
+              value={String(maxProcessDim)}
+              disabled={busy}
+              onChange={(e) => void onMaxDimChange(Number(e.target.value))}
+            >
+              <option value="1024">1024 px (fast)</option>
+              <option value="2048">2048 px (default)</option>
+              <option value="4096">4096 px</option>
+              <option value="0">Native (slow — may take several minutes)</option>
+            </select>
+          </label>
+          <p className="hint">
+            Codecs run at this size on Cloud Run. Previews stay ≤1024px. Native is
+            best for final GeoTIFF downloads but is much slower on large Landsat scenes.
+          </p>
+
           <h2>Method</h2>
           <select
             value={method}
@@ -2420,6 +2479,28 @@ export default function CompressionLab() {
           )}
 
           <div className="actions">
+            {busy && runProgress && (
+              <div
+                className="run-progress"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(runProgress.progress)}
+                aria-label="Cloud Run progress"
+              >
+                <div className="run-progress-meta">
+                  <span>{runProgress.phase}</span>
+                  <span>{Math.round(runProgress.progress)}%</span>
+                </div>
+                <div className="run-progress-track">
+                  <div
+                    className="run-progress-fill"
+                    style={{ width: `${Math.max(2, Math.min(100, runProgress.progress))}%` }}
+                  />
+                </div>
+                <p className="run-progress-message">{runProgress.message}</p>
+              </div>
+            )}
             <button
               type="button"
               disabled={!canRunCompression}
