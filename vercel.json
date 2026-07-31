@@ -10,7 +10,7 @@
       "memory": 1024
     },
     "src/app/api/compress/route.ts": {
-      "maxDuration": 300
+      "maxDuration": 600
     },
     "src/app/api/compress/jobs/route.ts": {
       "maxDuration": 60

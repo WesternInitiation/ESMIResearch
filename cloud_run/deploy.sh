@@ -53,8 +53,8 @@ gcloud run deploy esmi-compress \
   --region "${REGION}" \
   --platform managed \
   --allow-unauthenticated \
-  --memory 4Gi \
-  --cpu 2 \
+  --memory 8Gi \
+  --cpu 4 \
   --no-cpu-throttling \
   --timeout 600 \
   --max-instances 3 \

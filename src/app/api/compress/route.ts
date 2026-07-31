@@ -3,7 +3,8 @@ import { cloudRunAuthHeaders } from '@/lib/cloudRunAuth'
 import { getGcsConfigStatus } from '@/lib/gcs'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
+/** Align with Cloud Run --timeout 600 so sync fallback can finish Native jobs. */
+export const maxDuration = 600
 
 function apiBase(): string | null {
   const url = process.env.COMPRESS_API_URL?.trim()
