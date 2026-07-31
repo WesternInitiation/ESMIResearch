@@ -69,6 +69,10 @@ CLOUD_RUN_HTTP_MAX_BYTES = int(
     os.environ.get("CLOUD_RUN_HTTP_MAX_BYTES", str(30 * 1024 * 1024))
 )
 DEFAULT_MAX_DIM = int(os.environ.get("DEFAULT_MAX_DIM", "1024"))
+# Pure-Python LZW at full Landsat native size historically OOMed the 4 GiB
+# Cloud Run instance (503 Service Unavailable). Cap process size for LZW when
+# the client asks for Native (max_dim<=0).
+LZW_SAFE_MAX_DIM = int(os.environ.get("LZW_SAFE_MAX_DIM", "4096"))
 DELETE_GCS_AFTER_JOB = os.environ.get("DELETE_GCS_AFTER_JOB", "1").strip() not in (
     "0",
     "false",
@@ -715,6 +719,14 @@ async def compress(
     native_h, native_w = int(native[0]), int(native[1])
     # max_dim <= 0 → native resolution; otherwise enforce a small lower bound.
     process_cap = 0 if int(max_dim) <= 0 else max(64, int(max_dim))
+    lzw_auto_capped = False
+    if method == "LZW":
+        # Native Landsat (~8k) + Python LZW previously OOMed Cloud Run → 503.
+        longest = max(native_h, native_w)
+        if process_cap <= 0 or process_cap > LZW_SAFE_MAX_DIM:
+            if longest > LZW_SAFE_MAX_DIM:
+                process_cap = LZW_SAFE_MAX_DIM
+                lzw_auto_capped = True
     process_bands, scale = _downsample_bands(bands, process_cap)
     sample = next(iter(process_bands.values()))
     process_h, process_w = int(sample.shape[0]), int(sample.shape[1])
@@ -730,6 +742,15 @@ async def compress(
             bandwidth_keep_fraction=bandwidth_keep_fraction,
             jpeg_rate=jpeg_rate,
         )
+    except MemoryError as exc:
+        _maybe_delete_gcs_blob(gcs_blob)
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"LZW ran out of memory at {process_w}×{process_h}. "
+                f"Try a smaller image or another method. ({exc})"
+            ),
+        ) from exc
     except Exception as exc:
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
@@ -744,6 +765,18 @@ async def compress(
             "processWidth": process_w,
             "processHeight": process_h,
             "restoredToNative": True,
+        }
+    if lzw_auto_capped:
+        result.metadata = {
+            **result.metadata,
+            "lzwAutoCapped": True,
+            "lzwSafeMaxDim": LZW_SAFE_MAX_DIM,
+            "processWidth": process_w,
+            "processHeight": process_h,
+            "note": (
+                f"LZW auto-capped to ≤{LZW_SAFE_MAX_DIM}px to avoid Cloud Run OOM "
+                f"(native {native_w}×{native_h}); output restored to native for display."
+            ),
         }
     width, height = native_w, native_h
 

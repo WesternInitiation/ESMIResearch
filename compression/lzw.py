@@ -8,12 +8,15 @@ Adapted from the ashmeet13/LZW-Image-Compression approach (and the ESMI
     then dequantizes — same Lempel–Ziv–Welch idea as the reference, without
     the digit/comma string encoding that balloons size and runtime
   - Reports compressed size from the packed LZW code stream
+  - Stores codes in ``array('H')`` (2 bytes each) instead of ``list[int]``
+    so native Landsat-sized rasters do not OOM Cloud Run
 
 Reference: https://github.com/ashmeet13/LZW-Image-Compression
 """
 
 from __future__ import annotations
 
+from array import array
 from time import perf_counter
 
 import numpy as np
@@ -22,16 +25,20 @@ from compression.base import CompressionExecutionResult, build_execution_result
 
 # Cap dictionary growth (12-bit codes) — same spirit as GIF/TIFF LZW.
 MAX_DICT_SIZE = 4096
+# Soft ceiling: beyond this, Cloud Run (4 GiB) historically returned 503 after OOM
+# when codes were stored as Python ints. array('H') is leaner, but huge rasters
+# are still slow — callers should downsample above ~4096px.
+LZW_SOFT_MAX_PIXELS = 4096 * 4096
 
 
-def lzw_compress_bytes(data: bytes) -> list[int]:
-    """Classic LZW over a byte stream → list of integer codes."""
+def lzw_compress_bytes(data: bytes) -> array:
+    """Classic LZW over a byte stream → packed unsigned 16-bit codes."""
     if not data:
-        return []
+        return array("H")
     dictionary: dict[bytes, int] = {bytes([i]): i for i in range(256)}
     dict_size = 256
     w = b""
-    out: list[int] = []
+    out: array = array("H")
     for byte in data:
         c = bytes([byte])
         wc = w + c
@@ -48,15 +55,16 @@ def lzw_compress_bytes(data: bytes) -> list[int]:
     return out
 
 
-def lzw_decompress_codes(codes: list[int]) -> bytes:
+def lzw_decompress_codes(codes: array | list[int]) -> bytes:
     """Inverse of :func:`lzw_compress_bytes`."""
     if not codes:
         return b""
     dictionary: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
     dict_size = 256
-    w = dictionary[codes[0]]
+    w = dictionary[int(codes[0])]
     out = bytearray(w)
-    for code in codes[1:]:
+    for raw_code in codes[1:]:
+        code = int(raw_code)
         if code in dictionary:
             entry = dictionary[code]
         elif code == dict_size:
@@ -91,6 +99,12 @@ def _dequantize_uint8(u8: np.ndarray, lo: float, hi: float, dtype) -> np.ndarray
 
 def compress_band_lzw(band: np.ndarray) -> tuple[np.ndarray, int, dict]:
     """Quantize → LZW → dequantize. Returns reconstructed band, compressed bytes, meta."""
+    if band.size > LZW_SOFT_MAX_PIXELS * 4:
+        # Hard stop well above the soft UI/server cap — prevents multi-GB code buffers.
+        raise ValueError(
+            f"LZW input too large ({band.shape[0]}×{band.shape[1]} = {band.size:,} pixels). "
+            f"Downsample below ~{int(LZW_SOFT_MAX_PIXELS**0.5)}px or use another method."
+        )
     u8, lo, hi = _quantize_uint8(band)
     codes = lzw_compress_bytes(u8.tobytes())
     # Pack codes as 16-bit words (enough for 12-bit LZW codes).

@@ -1432,6 +1432,15 @@ export default function CompressionLab() {
                 'Redeploy Cloud Run (`./cloud_run/deploy.sh`) to enable it server-side.',
             )
             // Fall through to the browser path below (busy stays true).
+          } else if (/service unavailable|503/i.test(msg)) {
+            setError(
+              method === 'LZW'
+                ? 'Cloud Run returned Service Unavailable during LZW — usually an out-of-memory kill on a large native GeoTIFF. Redeploy the latest Cloud Run image (LZW is auto-capped ≤4096px), or try another method.'
+                : 'Cloud Run returned Service Unavailable (503). The instance may have timed out or run out of memory — retry, use a smaller image, or check the Cloud Run logs.',
+            )
+            setStatus(null)
+            setBusy(false)
+            return
           } else {
             setError(msg)
             setStatus(null)
