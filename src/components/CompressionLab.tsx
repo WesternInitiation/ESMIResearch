@@ -83,6 +83,9 @@ type WorkingImage = LoadedImage & {
   nativeWidth: number
   nativeHeight: number
   processScale: number
+  /** Dimensions of previewRgba (may be capped below process size). */
+  previewWidth: number
+  previewHeight: number
 }
 
 function memberLabel(path: string): string {
@@ -227,6 +230,8 @@ function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
       previewSource.width,
       previewSource.height,
     ),
+    previewWidth: previewSource.width,
+    previewHeight: previewSource.height,
     nativeBands,
     nativeWidth,
     nativeHeight,
@@ -302,7 +307,7 @@ export default function CompressionLab() {
   const [pairMode, setPairMode] = useState(false)
   const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
   // 0 = native resolution (no downsampling). Prefer this for fair comparisons.
-  const [maxProcessDim, setMaxProcessDim] = useState<number>(0)
+  const [maxProcessDim, setMaxProcessDim] = useState<number>(1024)
   const [engine, setEngine] = useState<Engine>('cloud-run')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
@@ -351,12 +356,17 @@ export default function CompressionLab() {
   const originalPreview = useMemo(() => {
     if (serverOriginalPreview) return serverOriginalPreview
     if (!image) return null
-    return rgbaToDataUrl(
-      image.previewRgba,
-      image.size.width,
-      image.size.height,
-    )
+    // previewRgba may be capped (e.g. 2048) while process size is native — never
+    // invent a canvas larger than the buffer or the tab will crash.
+    const pw = image.previewWidth || image.size.width
+    const ph = image.previewHeight || image.size.height
+    const expected = pw * ph * 4
+    if (image.previewRgba.length < expected) return null
+    return rgbaToDataUrl(image.previewRgba, pw, ph)
   }, [image, serverOriginalPreview])
+
+  // Safer default than Native: full-res Landsat floats can OOM the tab.
+  // Users can still pick Native explicitly for Cloud Run.
 
   const archiveFolderView = useMemo(() => {
     if (!archive) return { folders: [] as string[], images: [] as string[] }

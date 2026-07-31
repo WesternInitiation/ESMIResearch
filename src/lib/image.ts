@@ -611,13 +611,22 @@ export function rgbaToDataUrl(
   width: number,
   height: number,
 ): string {
+  const w = Math.max(1, Math.floor(width))
+  const h = Math.max(1, Math.floor(height))
+  const expected = w * h * 4
+  if (rgba.length < expected) {
+    throw new Error(
+      `Preview buffer too small for ${w}×${h} (have ${rgba.length} B, need ${expected} B)`,
+    )
+  }
   const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
+  canvas.width = w
+  canvas.height = h
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Could not create canvas context')
-  const pixels = new Uint8ClampedArray(rgba)
-  ctx.putImageData(new ImageData(pixels, width, height), 0, 0)
+  const pixels = new Uint8ClampedArray(expected)
+  pixels.set(rgba.subarray(0, expected))
+  ctx.putImageData(new ImageData(pixels, w, h), 0, 0)
   return canvas.toDataURL('image/png')
 }
 
