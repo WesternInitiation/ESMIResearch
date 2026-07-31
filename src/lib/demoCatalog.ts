@@ -29,6 +29,21 @@ export type PreparedDemoMember = {
   gcsUri: string
 }
 
+export type DemoLightPreview = {
+  previewPngBase64: string
+  nativeWidth: number
+  nativeHeight: number
+  previewWidth: number
+  previewHeight: number
+  bandOrder: string[]
+}
+
+export type PreparedDemoMemberWithPreview = PreparedDemoMember &
+  Partial<DemoLightPreview> & {
+    lightPreview?: boolean
+    previewError?: string
+  }
+
 type ManifestEntry = { name: string; offset: number; size: number }
 
 type ArchiveCache = {
@@ -296,6 +311,75 @@ async function extractViaCloudRun(input: {
     filename: parsed.filename || input.member.split('/').pop() || 'member.bin',
     size: Number(parsed.size || 0),
     gcsUri: `gs://${parsed.bucket}/${parsed.objectName}`,
+  }
+}
+
+/** ≤1024px PNG preview from a staged gs:// object (Cloud Run; no browser full download). */
+export async function previewStagedGcsObject(input: {
+  gcsUri: string
+  filename?: string
+  maxDim?: number
+}): Promise<DemoLightPreview> {
+  const base = compressApiBase()
+  if (!base) {
+    throw new Error('COMPRESS_API_URL is required for Cloud Run light previews')
+  }
+  const form = new FormData()
+  form.set('gcs_uri', input.gcsUri)
+  form.set('max_dim', String(input.maxDim ?? 1024))
+  if (input.filename) form.set('filename', input.filename)
+
+  const headers = await cloudRunAuthHeaders(base)
+  const res = await fetch(`${base}/v1/demo/preview`, {
+    method: 'POST',
+    headers,
+    body: form,
+  })
+  const text = await res.text()
+  if (!res.ok) {
+    throw new Error(`Cloud Run preview failed (${res.status}): ${text.slice(0, 400)}`)
+  }
+  const parsed = JSON.parse(text) as Partial<DemoLightPreview> & { detail?: unknown }
+  if (!parsed.previewPngBase64 || !parsed.nativeWidth || !parsed.nativeHeight) {
+    throw new Error('Cloud Run preview response missing PNG / dimensions')
+  }
+  return {
+    previewPngBase64: parsed.previewPngBase64,
+    nativeWidth: Number(parsed.nativeWidth),
+    nativeHeight: Number(parsed.nativeHeight),
+    previewWidth: Number(parsed.previewWidth || parsed.nativeWidth),
+    previewHeight: Number(parsed.previewHeight || parsed.nativeHeight),
+    bandOrder: Array.isArray(parsed.bandOrder)
+      ? parsed.bandOrder.filter((b): b is string => typeof b === 'string')
+      : ['gray'],
+  }
+}
+
+/**
+ * Stage a demo member, then (when possible) build a light Cloud Run preview so
+ * the browser never downloads the full GeoTIFF for Engine → Cloud Run.
+ */
+export async function prepareDemoMemberLight(input: {
+  kind: 'archive' | 'objects'
+  objectName?: string
+  member: string
+  bucket?: string
+  maxDim?: number
+}): Promise<PreparedDemoMemberWithPreview> {
+  const prepared = await prepareDemoMember(input)
+  try {
+    const preview = await previewStagedGcsObject({
+      gcsUri: prepared.gcsUri,
+      filename: prepared.filename,
+      maxDim: input.maxDim ?? 1024,
+    })
+    return { ...prepared, ...preview, lightPreview: true }
+  } catch (err) {
+    return {
+      ...prepared,
+      lightPreview: false,
+      previewError: err instanceof Error ? err.message : String(err),
+    }
   }
 }
 

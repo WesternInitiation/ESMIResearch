@@ -26,7 +26,7 @@ import {
 } from '@/lib/geotiffExport'
 import { jpegRoundtripBands } from '@/lib/lossyBands'
 import { estimateByteSize } from '@/lib/metrics'
-import { fetchDemoCatalog, fetchDemoMemberFile, fetchGcsBuckets } from '@/lib/demoData'
+import { fetchDemoCatalog, fetchDemoMemberFile, fetchDemoMemberLight, fetchGcsBuckets } from '@/lib/demoData'
 import { cloneBandMap, downsampleBands, upsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression, VERCEL_PROXY_UPLOAD_BYTES } from '@/lib/serverCompress'
 import {
@@ -46,6 +46,7 @@ import {
   isLikelySingleBand,
   loadArchiveMemberImage,
   loadImageFile,
+  loadImageFromPreviewPng,
   mergeNamedBands,
   pairNdwiImages,
   pairRedNirImages,
@@ -1044,36 +1045,93 @@ export default function CompressionLab() {
     )
     try {
       if (archive.demoRemote) {
-        const prepared = await fetchDemoMemberFile({
-          kind: archive.demoRemote.kind,
-          objectName: archive.demoRemote.objectName,
-          member,
-          bucket: archive.demoRemote.bucket,
-          onProgress: (message) => setStatus(message),
-        })
-        // Cloud Run + Native: decode a light preview in the browser; pass the
-        // staged gs:// URI so Cloud Run skips the browser → GCS re-upload.
-        const uiDecodeDim =
-          engine === 'cloud-run' || maxProcessDim === 0
-            ? PREVIEW_MAX_DIM
-            : maxProcessDim
-        setStatus(`Decoding preview (≤${uiDecodeDim}px)…`)
-        const loaded = await loadImageFile(prepared.file, { maxDecodeDim: uiDecodeDim })
-        const memberFilename = member.split('/').pop() || member
-        await applyLoaded(
-          {
-            ...loaded,
-            archiveMember: member,
-            filename: `${archive.archiveName} → ${memberFilename}`,
-          },
-          prepared.file,
-          prepared.gcsUri,
-        )
-        setStatus(
-          engine === 'cloud-run'
-            ? `Ready · preview ≤${uiDecodeDim}px · Cloud Run will read staged object (native ${loaded.fileNativeWidth || loaded.size.width}×${loaded.fileNativeHeight || loaded.size.height})`
-            : `Loaded ${memberFilename}`,
-        )
+        // Cloud Run: stage in GCS + server ≤1024px preview (skip full browser download).
+        // Browser engine: still download the full file for local codecs.
+        if (engine === 'cloud-run') {
+          setStatus(`Staging ${member.split('/').pop() || member}…`)
+          const light = await fetchDemoMemberLight({
+            kind: archive.demoRemote.kind,
+            objectName: archive.demoRemote.objectName,
+            member,
+            bucket: archive.demoRemote.bucket,
+            maxDim: PREVIEW_MAX_DIM,
+            onProgress: (message) => setStatus(message),
+          })
+          if (light.lightPreview && light.previewPngBase64 && light.nativeWidth && light.nativeHeight) {
+            setStatus('Applying light preview…')
+            const loaded = await loadImageFromPreviewPng({
+              pngBase64: light.previewPngBase64,
+              filename: light.filename,
+              originalBytes: light.size,
+              nativeWidth: light.nativeWidth,
+              nativeHeight: light.nativeHeight,
+              bandOrder: light.bandOrder,
+            })
+            const memberFilename = member.split('/').pop() || member
+            await applyLoaded(
+              {
+                ...loaded,
+                archiveMember: member,
+                filename: `${archive.archiveName} → ${memberFilename}`,
+              },
+              null,
+              light.gcsUri,
+            )
+            setServerOriginalPreview(`data:image/png;base64,${light.previewPngBase64}`)
+            setStatus(
+              `Ready · light preview ≤${PREVIEW_MAX_DIM}px · Cloud Run uses native ${light.nativeWidth}×${light.nativeHeight}`,
+            )
+          } else {
+            // Old Cloud Run image or preview failure — fall back to full download.
+            if (light.previewError) {
+              setStatus(`Light preview unavailable — downloading full file…`)
+            }
+            const fileRes = await fetch(light.downloadUrl)
+            if (!fileRes.ok) {
+              throw new Error(`Demo member download failed (HTTP ${fileRes.status})`)
+            }
+            const blob = await fileRes.blob()
+            const file = new File([blob], light.filename, {
+              type: blob.type || 'application/octet-stream',
+            })
+            const loaded = await loadImageFile(file, { maxDecodeDim: PREVIEW_MAX_DIM })
+            const memberFilename = member.split('/').pop() || member
+            await applyLoaded(
+              {
+                ...loaded,
+                archiveMember: member,
+                filename: `${archive.archiveName} → ${memberFilename}`,
+              },
+              file,
+              light.gcsUri,
+            )
+            setStatus(
+              `Ready · preview ≤${PREVIEW_MAX_DIM}px · Cloud Run will read staged object (native ${loaded.fileNativeWidth || loaded.size.width}×${loaded.fileNativeHeight || loaded.size.height})`,
+            )
+          }
+        } else {
+          const prepared = await fetchDemoMemberFile({
+            kind: archive.demoRemote.kind,
+            objectName: archive.demoRemote.objectName,
+            member,
+            bucket: archive.demoRemote.bucket,
+            onProgress: (message) => setStatus(message),
+          })
+          const uiDecodeDim = maxProcessDim === 0 ? PREVIEW_MAX_DIM : maxProcessDim
+          setStatus(`Decoding preview (≤${uiDecodeDim}px)…`)
+          const loaded = await loadImageFile(prepared.file, { maxDecodeDim: uiDecodeDim })
+          const memberFilename = member.split('/').pop() || member
+          await applyLoaded(
+            {
+              ...loaded,
+              archiveMember: member,
+              filename: `${archive.archiveName} → ${memberFilename}`,
+            },
+            prepared.file,
+            prepared.gcsUri,
+          )
+          setStatus(`Loaded ${memberFilename}`)
+        }
       } else {
         const loaded = await loadArchiveMemberImage(archive, member)
         // Prefer extracted member bytes so Cloud Run can run without re-reading the TAR.
@@ -2142,6 +2200,16 @@ export default function CompressionLab() {
                 void onMaxDimChange(2048)
               } else if (next === 'browser' && maxProcessDim > 4096) {
                 void onMaxDimChange(1024)
+              }
+              // Light Cloud Run loads skip the full file — re-fetch bands for Browser.
+              if (
+                next === 'browser' &&
+                archive?.demoRemote &&
+                archiveMember &&
+                !rawFile
+              ) {
+                setStatus('Downloading full image for Browser engine…')
+                void onArchiveMemberChange(archiveMember)
               }
             }}
           >

@@ -215,11 +215,14 @@ gcloud run deploy esmi-compress --image gcr.io/esmi-research/esmi-compress:lates
 
 **Demo / other buckets:** picking a GCS catalog member stages a copy into
 `GCS_UPLOAD_BUCKET` (`demo-extracts/…`) and returns that `gcs_uri` to Cloud Run,
-so the browser does **not** re-upload the object. This works for any bucket the
-Vercel SA can read that is allowed by `GCS_ALLOWED_BUCKETS` (or project listing
-when that env is unset). Cloud Run only needs read access on the staging bucket.
-After-job cleanup deletes only `uploads/` objects (browser signed PUTs), never
-`demo-extracts/` or source catalog paths.
+so the browser does **not** re-upload the object. With Engine → Cloud Run, the
+lab also requests a ≤1024px server preview (`/v1/demo/preview`) so the browser
+skips downloading 40–150&nbsp;MB GeoTIFFs just to show Original — typical loads
+target under ~10&nbsp;s. This works for any bucket the Vercel SA can read that is
+allowed by `GCS_ALLOWED_BUCKETS` (or project listing when that env is unset).
+Cloud Run only needs read access on the staging bucket. After-job cleanup
+deletes only `uploads/` objects (browser signed PUTs), never `demo-extracts/`
+or source catalog paths.
 
 ---
 

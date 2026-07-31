@@ -104,6 +104,7 @@ def health() -> dict[str, object]:
             "lzw": True,
             "nativeRestore": True,  # max_dim<=0 keeps native; else upsample back
             "residualPreview": True,
+            "lightPreview": True,  # /v1/demo/preview — skip browser full-file download
             "methods": list(SUPPORTED_METHODS),
         },
     }
@@ -554,6 +555,65 @@ async def demo_extract(
             "objectName": object_name,
             "filename": filename,
             "size": len(raw),
+        }
+    )
+
+
+@app.post("/v1/demo/preview")
+async def demo_preview(
+    gcs_uri: str = Form(...),
+    max_dim: int = Form(1024),
+    filename: str | None = Form(None),
+) -> JSONResponse:
+    """
+    Build a ≤max_dim PNG preview from a staged gs:// object.
+
+    Used so the browser can skip downloading 40–150 MB GeoTIFFs just to show
+    the Original panel — Cloud Run still compresses the staged native object.
+    Does not delete the GCS object.
+    """
+    uri = (gcs_uri or "").strip()
+    if not uri.startswith("gs://"):
+        raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
+
+    try:
+        raw, gcs_filename, _blob = _download_gcs(uri)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to download gcs_uri for preview: {exc}",
+        ) from exc
+
+    source_filename = (filename or "").strip() or gcs_filename
+    try:
+        bands, band_order, source_name = _load_from_upload(raw, source_filename, None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to load image for preview: {exc}",
+        ) from exc
+
+    native = next(iter(bands.values())).shape
+    native_h, native_w = int(native[0]), int(native[1])
+    cap = max(64, int(max_dim)) if int(max_dim) > 0 else 1024
+    preview = _preview_rgb_capped(bands, band_order, cap)
+    preview_h, preview_w = int(preview.shape[0]), int(preview.shape[1])
+
+    return JSONResponse(
+        {
+            "filename": source_name,
+            "originalBytes": len(raw),
+            "nativeWidth": native_w,
+            "nativeHeight": native_h,
+            "previewWidth": preview_w,
+            "previewHeight": preview_h,
+            "bandOrder": band_order,
+            "previewPngBase64": _png_b64(preview),
+            "gcsUri": uri,
         }
     )
 

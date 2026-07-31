@@ -98,6 +98,82 @@ export type DemoMemberFetchResult = {
   size: number
 }
 
+export type DemoMemberLightResult = {
+  gcsUri: string
+  filename: string
+  size: number
+  downloadUrl: string
+  lightPreview: boolean
+  previewPngBase64?: string
+  nativeWidth?: number
+  nativeHeight?: number
+  previewWidth?: number
+  previewHeight?: number
+  bandOrder?: string[]
+  previewError?: string
+}
+
+/** Stage + optional Cloud Run ≤1024px preview (no full browser download). */
+export async function fetchDemoMemberLight(input: {
+  kind: 'archive' | 'objects'
+  objectName?: string
+  member: string
+  bucket?: string
+  maxDim?: number
+  onProgress?: (message: string) => void
+}): Promise<DemoMemberLightResult> {
+  const label = input.member.split('/').pop() || input.member
+  input.onProgress?.(`Staging ${label} for light preview…`)
+
+  let res: Response
+  try {
+    res = await fetch('/api/demo/member', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: input.kind,
+        objectName: input.objectName,
+        member: input.member,
+        bucket: input.bucket,
+        lightPreview: true,
+        maxDim: input.maxDim ?? 1024,
+      }),
+    })
+  } catch (err) {
+    throw networkError('prepare', err)
+  }
+
+  let data: DemoMemberLightResult & { error?: string }
+  try {
+    data = await readJsonResponse(res, '/api/demo/member')
+  } catch (err) {
+    throw networkError('prepare', err)
+  }
+  if (!res.ok) {
+    throw new Error(data.error || `Demo light prepare failed (HTTP ${res.status})`)
+  }
+  if (!data.gcsUri || !data.gcsUri.startsWith('gs://')) {
+    throw new Error('Demo light prepare returned no staged gcsUri')
+  }
+  if (!data.downloadUrl) {
+    throw new Error('Demo light prepare returned no download URL')
+  }
+  return {
+    gcsUri: data.gcsUri,
+    filename: data.filename || label,
+    size: Number(data.size || 0),
+    downloadUrl: data.downloadUrl,
+    lightPreview: Boolean(data.lightPreview && data.previewPngBase64),
+    previewPngBase64: data.previewPngBase64,
+    nativeWidth: data.nativeWidth,
+    nativeHeight: data.nativeHeight,
+    previewWidth: data.previewWidth,
+    previewHeight: data.previewHeight,
+    bandOrder: data.bandOrder,
+    previewError: data.previewError,
+  }
+}
+
 export async function fetchDemoMemberFile(input: {
   kind: 'archive' | 'objects'
   objectName?: string

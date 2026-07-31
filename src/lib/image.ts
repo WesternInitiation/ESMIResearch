@@ -454,6 +454,60 @@ export async function loadImageFile(
   return loadImageBuffer(buffer, file.name, file.size, options)
 }
 
+/**
+ * Build a UI-only LoadedImage from a Cloud Run light preview PNG.
+ * Band arrays are luma stubs sized to the preview — codecs should use gcsUri.
+ */
+export async function loadImageFromPreviewPng(input: {
+  pngBase64: string
+  filename: string
+  originalBytes: number
+  nativeWidth: number
+  nativeHeight: number
+  bandOrder?: string[]
+}): Promise<LoadedImage> {
+  const binary = atob(input.pngBase64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  const blob = new Blob([bytes], { type: 'image/png' })
+  const bitmap = await createImageBitmap(blob)
+  const width = bitmap.width
+  const height = bitmap.height
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+  if (!ctx) {
+    bitmap.close()
+    throw new Error('Could not create canvas for light preview')
+  }
+  ctx.drawImage(bitmap, 0, 0)
+  bitmap.close()
+  const { data } = ctx.getImageData(0, 0, width, height)
+  const previewRgba = new Uint8ClampedArray(data)
+  const gray = new Float64Array(width * height)
+  for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
+    gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
+  }
+  const bandOrder =
+    input.bandOrder && input.bandOrder.length > 0 ? input.bandOrder : ['gray']
+  const bands: BandMap = {}
+  for (const name of bandOrder) {
+    bands[name] = gray
+  }
+  return {
+    bands,
+    bandOrder,
+    size: { width, height },
+    sourceType: 'raster',
+    originalBytes: input.originalBytes,
+    previewRgba,
+    filename: input.filename,
+    fileNativeWidth: input.nativeWidth,
+    fileNativeHeight: input.nativeHeight,
+  }
+}
+
 export async function loadImageBuffer(
   buffer: ArrayBuffer,
   filename: string,
