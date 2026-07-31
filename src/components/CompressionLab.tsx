@@ -632,7 +632,7 @@ export default function CompressionLab() {
       )
       setNdwiSecondRole(suggestedNdwi.secondRole)
       setStatus(
-        `Demo ready from gs://${catalog.bucket} (${members.length} images). Pick one from the dropdown — only that file is downloaded.`,
+        `gs://${catalog.bucket} · ${members.length} images — pick one to download`,
       )
     } catch (err) {
       if (seq !== demoLoadSeq.current) return
@@ -2322,7 +2322,7 @@ export default function CompressionLab() {
             </label>
           </div>
           <p className="hint">
-            Choosing a bucket loads its catalog automatically (custom names debounce ~0.7s).
+            Catalog loads on bucket change.
           </p>
 
           {(status || error) && (
