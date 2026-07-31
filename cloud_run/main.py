@@ -86,6 +86,11 @@ SUPPORTED_METHODS: tuple[str, ...] = (
 )
 
 
+def _json_float(value: float, *, fallback: float = 0.0) -> float:
+    number = float(value)
+    return number if np.isfinite(number) else fallback
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     return {
@@ -608,10 +613,10 @@ async def compress(
         "channelReports": [
             {
                 "band": report.name,
-                "rmse": report.rmse,
-                "mae": report.mae,
-                "psnrDb": report.psnr,
-                "ssim": report.ssim,
+                "rmse": _json_float(report.rmse),
+                "mae": _json_float(report.mae),
+                "psnrDb": _json_float(report.psnr, fallback=99.0),
+                "ssim": _json_float(report.ssim, fallback=1.0),
             }
             for report in result.channel_reports
         ],
@@ -624,4 +629,11 @@ async def compress(
         "previewPngBase64": _png_b64(reconstructed_preview),
     }
     _maybe_delete_gcs_blob(gcs_blob)
-    return JSONResponse(payload)
+    try:
+        return JSONResponse(payload)
+    except (TypeError, ValueError) as exc:
+        # Last resort: never 500 on metric serialization (e.g. leftover Inf).
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to serialize compression response: {exc}",
+        ) from exc

@@ -69,6 +69,27 @@ class CompressionRoundtripTests(unittest.TestCase):
         self.assertGreater(out.compressed_bytes_estimate, 0)
         self.assertLess(_rmse(bands["gray"], recon), 1.0)
 
+    def test_lzw_perfect_roundtrip_metrics_are_json_safe(self) -> None:
+        # Exact uint8 ladder → LZW reconstructs with RMSE 0; PSNR must stay finite.
+        gray = np.linspace(0, 255, 64 * 64, dtype=np.uint8).reshape(64, 64).astype(
+            np.float64
+        )
+        out = run_lzw_compression({"gray": gray})
+        report = out.channel_reports[0]
+        self.assertEqual(report.rmse, 0.0)
+        self.assertTrue(np.isfinite(report.psnr))
+        self.assertLessEqual(report.psnr, 99.0)
+        import json
+
+        json.dumps(
+            {
+                "rmse": report.rmse,
+                "psnrDb": report.psnr,
+                "ssim": report.ssim,
+            },
+            allow_nan=False,
+        )
+
     def test_jpeg2000_encodes_or_skips(self) -> None:
         bands = _synthetic(32, 32, seed=4)
         try:

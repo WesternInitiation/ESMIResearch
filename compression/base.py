@@ -30,6 +30,12 @@ class CompressionExecutionResult:
     channel_reports: list[ChannelReport]
 
 
+def _finite(value: float, *, fallback: float) -> float:
+    """JSON-safe float (Cloud Run rejects Inf/NaN in JSONResponse)."""
+    number = float(value)
+    return number if np.isfinite(number) else fallback
+
+
 def compute_band_metrics(
     name: str, original: np.ndarray, reconstructed: np.ndarray
 ) -> ChannelReport:
@@ -41,16 +47,36 @@ def compute_band_metrics(
     data_range = float(original_f.max() - original_f.min())
     if data_range <= 0:
         data_range = 1.0
-    psnr = float(
-        peak_signal_noise_ratio(original_f, reconstructed_f, data_range=data_range)
-    )
+    # Perfect reconstructions yield +inf from skimage; clamp for JSON clients.
+    if rmse <= 0.0:
+        psnr = 99.0
+    else:
+        psnr = _finite(
+            float(
+                peak_signal_noise_ratio(
+                    original_f, reconstructed_f, data_range=data_range
+                )
+            ),
+            fallback=99.0,
+        )
     try:
-        ssim = float(
-            structural_similarity(original_f, reconstructed_f, data_range=data_range)
+        ssim = _finite(
+            float(
+                structural_similarity(
+                    original_f, reconstructed_f, data_range=data_range
+                )
+            ),
+            fallback=1.0 if rmse <= 0.0 else 0.0,
         )
     except ValueError:
-        ssim = 0.0
-    return ChannelReport(name=name, rmse=rmse, mae=mae, psnr=psnr, ssim=ssim)
+        ssim = 1.0 if rmse <= 0.0 else 0.0
+    return ChannelReport(
+        name=name,
+        rmse=_finite(rmse, fallback=0.0),
+        mae=_finite(mae, fallback=0.0),
+        psnr=psnr,
+        ssim=ssim,
+    )
 
 
 def build_execution_result(
