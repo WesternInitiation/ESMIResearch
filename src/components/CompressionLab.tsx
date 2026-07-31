@@ -633,7 +633,9 @@ export default function CompressionLab() {
       )
       setNdwiSecondRole(suggestedNdwi.secondRole)
       setStatus(
-        `gs://${catalog.bucket} · ${members.length} images — pick one to download`,
+        catalog.kind === 'archive'
+          ? `gs://${catalog.bucket} · ${members.length} images in ${catalog.archiveName} — pick one`
+          : `gs://${catalog.bucket} · ${members.length} objects — pick one`,
       )
     } catch (err) {
       if (seq !== demoLoadSeq.current) return

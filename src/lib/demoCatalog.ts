@@ -393,11 +393,17 @@ export async function buildDemoCatalog(
   }
   const { resolveDemoBucket } = await import('@/lib/gcsBuckets')
   const bucketName = resolveDemoBucket(requestedBucket)
+  // Drop cross-bucket stale cache from a previous listing on this warm instance.
+  if (manifestCache && manifestCache.bucket !== bucketName) {
+    manifestCache = null
+  }
+
   const storage = storageClientForDemo()
+  // Live list of this bucket only — no cross-bucket mixing.
   const [files] = await storage.bucket(bucketName).getFiles({
     autoPaginate: true,
-    maxResults: 200,
   })
+  const fileNames = new Set(files.map((f) => f.name))
 
   const candidates = files
     .filter((f) => !f.name.endsWith('/'))
@@ -407,7 +413,13 @@ export async function buildDemoCatalog(
       size: Number(f.metadata.size || 0),
     }))
 
-  // Optional lightweight index so listing does not download a huge TAR on Vercel.
+  const looseImages = candidates.filter(
+    (c) => DEMO_LOOSE_IMAGE_EXT.test(c.name) && !DEMO_ARCHIVE_EXT.test(c.name),
+  )
+  const archives = candidates.filter((c) => DEMO_ARCHIVE_EXT.test(c.name))
+
+  // Optional lightweight index — only trust it when the archive object still exists
+  // in *this* bucket (avoids stale manifest.json pointing at deleted/renamed TARs).
   const manifestFile = files.find(
     (f) =>
       f.name === 'manifest.json' ||
@@ -423,7 +435,18 @@ export async function buildDemoCatalog(
         archiveName?: string
         members?: string[]
         kind?: string
+        bucket?: string
         entries?: unknown
+      }
+      // Reject manifests written for a different bucket name.
+      if (
+        typeof parsed.bucket === 'string' &&
+        parsed.bucket.trim() &&
+        parsed.bucket.trim() !== bucketName
+      ) {
+        throw new Error(
+          `manifest bucket mismatch (${parsed.bucket} ≠ ${bucketName})`,
+        )
       }
       const members = Array.isArray(parsed.members)
         ? parsed.members.filter((m) => typeof m === 'string')
@@ -431,15 +454,23 @@ export async function buildDemoCatalog(
       const objectName = parsed.archive || parsed.objectName
       const entries = parseManifestEntries(parsed.entries)
       const imageMembers = members.filter((m) => DEMO_LOOSE_IMAGE_EXT.test(m))
-      if (imageMembers.length && objectName) {
+      if (
+        imageMembers.length &&
+        objectName &&
+        fileNames.has(objectName) &&
+        DEMO_ARCHIVE_EXT.test(objectName)
+      ) {
         const archiveName =
           parsed.archiveName || objectName.split('/').pop() || objectName
+        const imageEntries = entries.filter((e) =>
+          DEMO_LOOSE_IMAGE_EXT.test(e.name),
+        )
         manifestCache = {
           bucket: bucketName,
           objectName,
           archiveName,
           members: [...imageMembers].sort(),
-          entries: entries.filter((e) => DEMO_LOOSE_IMAGE_EXT.test(e.name)),
+          entries: imageEntries,
           loadedAt: Date.now(),
         }
         return {
@@ -448,15 +479,24 @@ export async function buildDemoCatalog(
           objectName,
           archiveName,
           members: manifestCache.members,
-          entries: manifestCache.entries.length ? manifestCache.entries : undefined,
+          entries: imageEntries.length ? imageEntries : undefined,
         }
       }
       if (imageMembers.length && parsed.kind === 'objects') {
-        return {
-          kind: 'objects',
-          bucket: bucketName,
-          members: [...imageMembers].sort(),
-          objects: imageMembers.map((name) => ({ name, size: 0 })),
+        // Only keep members that still exist as objects in this bucket.
+        const existing = imageMembers.filter((name) => fileNames.has(name))
+        if (existing.length) {
+          return {
+            kind: 'objects',
+            bucket: bucketName,
+            members: [...existing].sort(),
+            objects: existing.map((name) => ({
+              name,
+              size: Number(
+                files.find((f) => f.name === name)?.metadata.size || 0,
+              ),
+            })),
+          }
         }
       }
     } catch {
@@ -470,25 +510,10 @@ export async function buildDemoCatalog(
     )
   }
 
-  // Prefer loose rasters when present. Otherwise a leftover empty/docs ZIP/TAR in
-  // the same bucket steals the catalog and fails with "archive does not contain
-  // a supported image" even though the TIFs are still there.
-  const looseImages = candidates.filter(
-    (c) => DEMO_LOOSE_IMAGE_EXT.test(c.name) && !DEMO_ARCHIVE_EXT.test(c.name),
-  )
-  if (looseImages.length) {
-    const objects = [...looseImages].sort((a, b) => a.name.localeCompare(b.name))
-    return {
-      kind: 'objects',
-      bucket: bucketName,
-      members: objects.map((o) => o.name),
-      objects,
-    }
-  }
-
-  const archives = candidates.filter((c) => DEMO_ARCHIVE_EXT.test(c.name))
+  // Prefer real archives when present (e.g. Landsat TAR in demo-data). Only fall
+  // back to loose rasters if every archive is empty/unreadable — otherwise a few
+  // leftover .tif files would hide the scene archive and show "false" catalogs.
   if (archives.length) {
-    // Try largest first, but fall through to smaller archives if one is empty/unreadable.
     const ordered = [...archives].sort((a, b) => b.size - a.size)
     const errors: string[] = []
 
@@ -520,12 +545,21 @@ export async function buildDemoCatalog(
         }
 
         if (built?.members.length) {
+          const imageMembers = built.members.filter((m) =>
+            DEMO_LOOSE_IMAGE_EXT.test(m),
+          )
+          if (!imageMembers.length) {
+            errors.push(`${preferred.name}: archive listed no supported images`)
+            continue
+          }
           manifestCache = {
             bucket: bucketName,
             objectName: preferred.name,
             archiveName,
-            members: [...built.members].sort(),
-            entries: built.entries,
+            members: [...imageMembers].sort(),
+            entries: built.entries.filter((e) =>
+              DEMO_LOOSE_IMAGE_EXT.test(e.name),
+            ),
             loadedAt: Date.now(),
           }
           return {
@@ -534,7 +568,9 @@ export async function buildDemoCatalog(
             objectName: preferred.name,
             archiveName,
             members: manifestCache.members,
-            entries: built.entries.length ? built.entries : undefined,
+            entries: manifestCache.entries.length
+              ? manifestCache.entries
+              : undefined,
           }
         }
         continue
@@ -542,13 +578,16 @@ export async function buildDemoCatalog(
 
       try {
         const cached = await getCachedArchive(bucketName, preferred.name)
-        if (cached.members.length) {
+        const imageMembers = cached.members.filter((m) =>
+          DEMO_LOOSE_IMAGE_EXT.test(m),
+        )
+        if (imageMembers.length) {
           return {
             kind: 'archive',
             bucket: bucketName,
             objectName: preferred.name,
             archiveName: cached.archiveName,
-            members: cached.members,
+            members: [...imageMembers].sort(),
           }
         }
         errors.push(`${preferred.name}: archive listed zero supported images`)
@@ -559,11 +598,31 @@ export async function buildDemoCatalog(
       }
     }
 
+    if (looseImages.length) {
+      const objects = [...looseImages].sort((a, b) => a.name.localeCompare(b.name))
+      return {
+        kind: 'objects',
+        bucket: bucketName,
+        members: objects.map((o) => o.name),
+        objects,
+      }
+    }
+
     throw new Error(
       `No usable archive images found in gs://${bucketName}. ` +
         `Checked ${ordered.map((a) => a.name).join(', ')}. ` +
         `(${errors.join(' | ') || 'no details'})`,
     )
+  }
+
+  if (looseImages.length) {
+    const objects = [...looseImages].sort((a, b) => a.name.localeCompare(b.name))
+    return {
+      kind: 'objects',
+      bucket: bucketName,
+      members: objects.map((o) => o.name),
+      objects,
+    }
   }
 
   throw new Error(
@@ -654,11 +713,13 @@ async function copyObjectToStaging(input: {
 }
 
 function lookupManifestEntry(
+  bucketName: string,
   objectName: string,
   member: string,
 ): ManifestEntry | null {
   if (
     manifestCache &&
+    manifestCache.bucket === bucketName &&
     manifestCache.objectName === objectName &&
     Date.now() - manifestCache.loadedAt < CACHE_TTL_MS
   ) {
@@ -711,12 +772,18 @@ export async function prepareDemoMember(input: {
   }
 
   // Prefer ranged GET using manifest offsets (no full TAR download).
-  let entry = lookupManifestEntry(objectName, member)
-  if (!entry && manifestCache?.objectName !== objectName) {
-    // Rebuild catalog once so manifestCache is warm (cheap when manifest.json exists).
+  let entry = lookupManifestEntry(bucketName, objectName, member)
+  if (
+    !entry &&
+    !(
+      manifestCache?.bucket === bucketName &&
+      manifestCache?.objectName === objectName
+    )
+  ) {
+    // Rebuild catalog once so manifestCache is warm for *this* bucket.
     try {
-      await buildDemoCatalog()
-      entry = lookupManifestEntry(objectName, member)
+      await buildDemoCatalog(bucketName)
+      entry = lookupManifestEntry(bucketName, objectName, member)
     } catch {
       // continue
     }

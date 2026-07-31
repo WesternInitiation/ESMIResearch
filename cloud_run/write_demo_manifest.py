@@ -33,12 +33,16 @@ DEFAULT_BUCKET = "esmi-research-demo-data"
 DEFAULT_ARCHIVE = "LC09_L2SP_016030_20260526_20260527_02_T1.tar"
 
 
-def build_manifest(archive: str, entries: list[dict]) -> dict:
+def build_manifest(
+    archive: str, entries: list[dict], *, bucket: str | None = None
+) -> dict:
     members = sorted(e["name"] for e in entries)
     payload: dict = {
         "archive": archive,
         "members": members,
     }
+    if bucket:
+        payload["bucket"] = bucket
     # Include byte ranges when available (uncompressed .tar) for ranged GETs.
     ranged = [
         {"name": e["name"], "offset": e["offset"], "size": e["size"]}
