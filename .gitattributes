@@ -1,0 +1,3 @@
+# Keep shell scripts LF so bash on Windows does not break on `set -o pipefail`.
+*.sh text eol=lf
+cloud_run/*.sh text eol=lf
