@@ -21,6 +21,16 @@ const DEMO_LOOSE_IMAGE_EXT = IMAGE_EXT_RE
 /** Archives larger than this must use manifest.json or Cloud Run listing. */
 const LARGE_ARCHIVE_BYTES = 40 * 1024 * 1024
 
+/** Cloud Run / lab staging prefixes — not user-facing demo imagery. */
+function isInternalStagingObject(name: string): boolean {
+  const n = name.replace(/^\/+/, '')
+  return (
+    n.startsWith('jobs/') ||
+    n.startsWith('results/') ||
+    n.startsWith('uploads/')
+  )
+}
+
 export type PreparedDemoMember = {
   downloadUrl: string
   filename: string
@@ -532,6 +542,8 @@ export async function buildDemoCatalog(
   const candidates = files
     .filter((f) => !f.name.endsWith('/'))
     .filter((f) => DEMO_IMAGE_EXT.test(f.name))
+    // Hide Cloud Run staging / result prefixes from the lab picker.
+    .filter((f) => !isInternalStagingObject(f.name))
     .map((f) => ({
       name: f.name,
       size: Number(f.metadata.size || 0),

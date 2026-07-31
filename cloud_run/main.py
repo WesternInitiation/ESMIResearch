@@ -1214,20 +1214,40 @@ def _run_compress_job(
         # Prefer the original uploads/ blob for optional cleanup.
         cleanup_blob = gcs_blob or downloaded_blob
         progress(8, "loading", "Source downloaded — starting compression…")
+        # Important: max_dim=0 means Native — must not use ``or DEFAULT`` (0 is falsy).
+        max_dim_raw = params.get("max_dim")
+        if max_dim_raw is None or max_dim_raw == "":
+            max_dim = DEFAULT_MAX_DIM
+        else:
+            max_dim = int(max_dim_raw)
         payload = _execute_compress_pipeline(
             raw=raw,
             source_filename=source_filename,
             member=params.get("archive_member"),
             method=str(params["method"]),
-            max_dim=int(params.get("max_dim") or DEFAULT_MAX_DIM),
-            svd_rank=int(params.get("svd_rank") or 32),
-            wavelet_keep_fraction=float(params.get("wavelet_keep_fraction") or 0.08),
-            wavelet_levels=int(params.get("wavelet_levels") or 3),
+            max_dim=max_dim,
+            svd_rank=int(params["svd_rank"])
+            if params.get("svd_rank") is not None
+            else 32,
+            wavelet_keep_fraction=float(
+                params["wavelet_keep_fraction"]
+                if params.get("wavelet_keep_fraction") is not None
+                else 0.08
+            ),
+            wavelet_levels=int(
+                params["wavelet_levels"]
+                if params.get("wavelet_levels") is not None
+                else 3
+            ),
             wavelet_name=str(params.get("wavelet_name") or "db4"),
             bandwidth_keep_fraction=float(
-                params.get("bandwidth_keep_fraction") or 0.12
+                params["bandwidth_keep_fraction"]
+                if params.get("bandwidth_keep_fraction") is not None
+                else 0.12
             ),
-            jpeg_rate=float(params.get("jpeg_rate") or 0.45),
+            jpeg_rate=float(
+                params["jpeg_rate"] if params.get("jpeg_rate") is not None else 0.45
+            ),
             red_band=params.get("red_band"),
             nir_band=params.get("nir_band"),
             uri=str(params.get("gcs_uri") or "") or None,
