@@ -29,10 +29,25 @@ export type LoadedImage = {
   filename: string
   archiveMember?: string
   /**
+   * Full file dimensions when the raster was decoded below native size for the UI
+   * (e.g. Cloud Run preview path). Codecs on the server still see the original file.
+   */
+  fileNativeWidth?: number
+  fileNativeHeight?: number
+  /**
    * GeoTIFF ground sample distance when available (CRS units / pixel, usually meters).
    * x = pixel width, y = pixel height.
    */
   groundResolution?: { x: number; y: number }
+}
+
+export type LoadImageOptions = {
+  /**
+   * Decode GeoTIFF rasters no larger than this on the longest side.
+   * Use for UI previews so huge Landsat scenes do not OOM the tab;
+   * Cloud Run still receives the original File bytes.
+   */
+  maxDecodeDim?: number
 }
 
 export type ArchiveSelection = {
@@ -152,6 +167,7 @@ export async function inspectUpload(
 export async function loadArchiveMemberImage(
   selection: ArchiveSelection,
   memberName: string,
+  options: LoadImageOptions = {},
 ): Promise<LoadedImage> {
   if (selection.demoRemote) {
     const { fetchDemoMemberFile } = await import('@/lib/demoData')
@@ -161,7 +177,7 @@ export async function loadArchiveMemberImage(
       member: memberName,
       bucket: selection.demoRemote.bucket,
     })
-    const loaded = await loadImageFile(file)
+    const loaded = await loadImageFile(file, options)
     const memberFilename = memberName.split('/').pop() || memberName
     return {
       ...loaded,
@@ -430,15 +446,19 @@ export function suggestNdwiMembers(
   return { green, second: undefined, secondRole: prefer }
 }
 
-export async function loadImageFile(file: File): Promise<LoadedImage> {
+export async function loadImageFile(
+  file: File,
+  options: LoadImageOptions = {},
+): Promise<LoadedImage> {
   const buffer = await file.arrayBuffer()
-  return loadImageBuffer(buffer, file.name, file.size)
+  return loadImageBuffer(buffer, file.name, file.size, options)
 }
 
 export async function loadImageBuffer(
   buffer: ArrayBuffer,
   filename: string,
   originalBytes: number,
+  options: LoadImageOptions = {},
 ): Promise<LoadedImage> {
   const looksTiff = bufferLooksLikeTiff(buffer)
   const looksJp2 = bufferLooksLikeJpeg2000(buffer)
@@ -449,7 +469,7 @@ export async function loadImageBuffer(
   // Landsat-style .TIF and mislabeled members that are still TIFF bytes.
   if (namedTiff || looksTiff) {
     try {
-      return await loadGeoTiff(buffer, filename, originalBytes)
+      return await loadGeoTiff(buffer, filename, originalBytes, options)
     } catch (err) {
       if (namedTiff || !isSupportedImageFilename(filename)) {
         const detail = err instanceof Error ? err.message : String(err)
@@ -493,18 +513,36 @@ async function loadGeoTiff(
   buffer: ArrayBuffer,
   filename: string,
   originalBytes: number,
+  options: LoadImageOptions = {},
 ): Promise<LoadedImage> {
   const tiff = await fromArrayBuffer(buffer)
   const image = await tiff.getImage()
-  const width = image.getWidth()
-  const height = image.getHeight()
-  const raster = await image.readRasters({ interleave: false })
+  const nativeWidth = image.getWidth()
+  const nativeHeight = image.getHeight()
+  const longest = Math.max(nativeWidth, nativeHeight)
+  const maxDecode = options.maxDecodeDim ?? 0
+  const scale =
+    maxDecode > 0 && longest > maxDecode ? maxDecode / longest : 1
+  const width = Math.max(1, Math.round(nativeWidth * scale))
+  const height = Math.max(1, Math.round(nativeHeight * scale))
+
+  const raster =
+    width === nativeWidth && height === nativeHeight
+      ? await image.readRasters({ interleave: false })
+      : await image.readRasters({
+          interleave: false,
+          width,
+          height,
+          resampleMethod: 'bilinear',
+        })
+
   const count = Array.isArray(raster) ? raster.length : 1
   const bandOrder = normalizeBandNames(count)
   const bands: BandMap = {}
+  const pixels = width * height
   for (let i = 0; i < count; i++) {
     const src = (Array.isArray(raster) ? raster[i] : raster) as ArrayLike<number>
-    const arr = new Float64Array(width * height)
+    const arr = new Float64Array(pixels)
     for (let p = 0; p < arr.length; p++) arr[p] = Number(src[p])
     bands[bandOrder[i]] = arr
   }
@@ -523,6 +561,9 @@ async function loadGeoTiff(
     originalBytes,
     previewRgba: toPreviewRgba(bands, order, width, height),
     filename,
+    ...(scale < 1
+      ? { fileNativeWidth: nativeWidth, fileNativeHeight: nativeHeight }
+      : {}),
     ...(groundResolution ? { groundResolution } : {}),
   }
 }

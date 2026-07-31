@@ -198,20 +198,29 @@ const PREVIEW_MAX_DIM = 1024
 type Engine = 'browser' | 'cloud-run'
 
 function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
-  // Prefer an existing native raster when re-sampling a WorkingImage.
+  // Prefer an existing WorkingImage native raster when re-sampling.
   const prior = loaded as WorkingImage
-  const nativeBands =
-    prior.nativeBands && prior.nativeWidth && prior.nativeHeight
-      ? prior.nativeBands
-      : cloneBandMap(loaded.bands, loaded.bandOrder)
-  const nativeWidth = prior.nativeBands ? prior.nativeWidth : loaded.size.width
-  const nativeHeight = prior.nativeBands ? prior.nativeHeight : loaded.size.height
+  const hasPriorNative = Boolean(prior.nativeBands && prior.nativeWidth && prior.nativeHeight)
+
+  const fileNativeWidth = loaded.fileNativeWidth || loaded.size.width
+  const fileNativeHeight = loaded.fileNativeHeight || loaded.size.height
+
+  const sourceBands = hasPriorNative
+    ? prior.nativeBands
+    : cloneBandMap(loaded.bands, loaded.bandOrder)
+  const sourceWidth = hasPriorNative ? prior.nativeWidth : loaded.size.width
+  const sourceHeight = hasPriorNative ? prior.nativeHeight : loaded.size.height
+
+  // When the file was decoded below native for UI memory, keep labels at file native
+  // but only resample the decoded raster for local/browser work.
+  const nativeWidth = hasPriorNative ? prior.nativeWidth : fileNativeWidth
+  const nativeHeight = hasPriorNative ? prior.nativeHeight : fileNativeHeight
 
   const resized = downsampleBands(
-    nativeBands,
+    sourceBands,
     loaded.bandOrder,
-    nativeWidth,
-    nativeHeight,
+    sourceWidth,
+    sourceHeight,
     maxDim,
   )
   // Display preview is always capped; process/native bands stay full size for codecs.
@@ -222,6 +231,8 @@ function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
     resized.height,
     PREVIEW_MAX_DIM,
   )
+  const processScale =
+    nativeWidth > 0 ? resized.width / nativeWidth : resized.scale
   return {
     ...loaded,
     bands: resized.bands,
@@ -234,10 +245,16 @@ function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
     ),
     previewWidth: previewSource.width,
     previewHeight: previewSource.height,
-    nativeBands,
+    // If we never decoded full native floats, keep the best available raster here.
+    nativeBands: hasPriorNative
+      ? prior.nativeBands
+      : cloneBandMap(
+          loaded.fileNativeWidth ? loaded.bands : sourceBands,
+          loaded.bandOrder,
+        ),
     nativeWidth,
     nativeHeight,
-    processScale: resized.scale,
+    processScale,
   }
 }
 
@@ -902,7 +919,18 @@ export default function CompressionLab() {
           )
         }
       } else {
-        const loaded = await loadImageFile(file)
+        const uiDecodeDim =
+          engine === 'cloud-run' || maxProcessDim === 0
+            ? PREVIEW_MAX_DIM
+            : maxProcessDim
+        const loaded = await loadImageFile(
+          file,
+          engine === 'cloud-run' || file.size > 20 * 1024 * 1024
+            ? { maxDecodeDim: uiDecodeDim }
+            : maxProcessDim === 0
+              ? {}
+              : { maxDecodeDim: maxProcessDim },
+        )
         if (isLikelySingleBand(loaded) && !loaded.bands.red && !loaded.bands.nir) {
           // Hold as Red candidate; ask for a second single-band NIR upload.
           setPendingRedSingle(loaded)
@@ -966,9 +994,17 @@ export default function CompressionLab() {
           kind: archive.demoRemote.kind,
           objectName: archive.demoRemote.objectName,
           member,
+          bucket: archive.demoRemote.bucket,
           onProgress: (message) => setStatus(message),
         })
-        const loaded = await loadImageFile(file)
+        // Cloud Run + Native: decode a light preview in the browser; upload the
+        // original File so the server compresses at full resolution without OOM.
+        const uiDecodeDim =
+          engine === 'cloud-run' || maxProcessDim === 0
+            ? PREVIEW_MAX_DIM
+            : maxProcessDim
+        setStatus(`Decoding preview (≤${uiDecodeDim}px)…`)
+        const loaded = await loadImageFile(file, { maxDecodeDim: uiDecodeDim })
         const memberFilename = member.split('/').pop() || member
         await applyLoaded(
           {
@@ -978,6 +1014,11 @@ export default function CompressionLab() {
           },
           file,
         )
+        setStatus(
+          engine === 'cloud-run'
+            ? `Ready · preview ≤${uiDecodeDim}px · Cloud Run will use native ${loaded.fileNativeWidth || loaded.size.width}×${loaded.fileNativeHeight || loaded.size.height}`
+            : `Loaded ${memberFilename}`,
+        )
       } else {
         const loaded = await loadArchiveMemberImage(archive, member)
         await applyLoaded(loaded, rawFile)
@@ -985,6 +1026,9 @@ export default function CompressionLab() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load archive member')
       setStatus(null)
+      setImage(null)
+      // Keep catalog; clear the failed member file so Run stays disabled cleanly.
+      setRawFile(null)
     } finally {
       setBusy(false)
     }
