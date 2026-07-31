@@ -990,138 +990,154 @@ export default function CompressionLab() {
           'Multi-band TAR stack detected — running locally so NDVI/NDWI comparison uses the full pair…',
         )
       } else {
-      try {
-        // Prefer the selected TAR member only — never upload the whole archive.
-        let uploadFile: Blob = rawFile
-        let uploadName = rawFile.name
-        let usedMember: string | null = null
+        try {
+          // Prefer the selected TAR member only — never upload the whole archive.
+          let uploadFile: Blob = rawFile
+          let uploadName = rawFile.name
+          let usedMember: string | null = null
 
-        if (archive) {
-          const memberPath =
-            archiveMember && !archiveMember.includes(' + ')
-              ? archiveMember
-              : image.archiveMember && !image.archiveMember.includes(' + ')
-                ? image.archiveMember
-                : ''
-          if (!memberPath) {
+          if (archive) {
+            const memberPath =
+              archiveMember && !archiveMember.includes(' + ')
+                ? archiveMember
+                : image.archiveMember && !image.archiveMember.includes(' + ')
+                  ? image.archiveMember
+                  : ''
+            if (!memberPath) {
+              setError(
+                'Pick a single archive image to send to Cloud Run (or use Browser for multi-band TAR pairs).',
+              )
+              setBusy(false)
+              return
+            }
+            if (archive.demoRemote) {
+              // rawFile is already the selected demo member download.
+              uploadFile = rawFile
+              uploadName = rawFile.name
+              usedMember = memberPath
+            } else {
+              if (!archive.buffer) {
+                setError('Archive bytes are missing')
+                setBusy(false)
+                return
+              }
+              setStatus(`Extracting ${memberPath.split('/').pop()} from archive…`)
+              const { bytes, memberFilename } = extractArchiveMember(
+                archive.buffer,
+                archive.archiveName,
+                memberPath,
+              )
+              uploadFile = new File([new Uint8Array(bytes)], memberFilename, {
+                type: 'application/octet-stream',
+              })
+              uploadName = memberFilename
+              usedMember = memberPath
+            }
+          }
+
+          // Small files go through Vercel multipart; larger ones use GCS signed PUT.
+          if (uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES && !gcsUploads) {
             setError(
-              'Pick a single archive image to send to Cloud Run (or use Browser for multi-band TAR pairs).',
+              `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB. ` +
+                `Set GCS_UPLOAD_BUCKET on Vercel (see cloud_run/README.md) for 80–100+ MB Cloud Run jobs, ` +
+                `or switch Engine → Browser.`,
             )
             setBusy(false)
             return
           }
-          if (archive.demoRemote) {
-            // rawFile is already the selected demo member download.
-            uploadFile = rawFile
-            uploadName = rawFile.name
-            usedMember = memberPath
-          } else {
-            if (!archive.buffer) {
-              setError('Archive bytes are missing')
-              setBusy(false)
-              return
-            }
-            setStatus(`Extracting ${memberPath.split('/').pop()} from archive…`)
-            const { bytes, memberFilename } = extractArchiveMember(
-              archive.buffer,
-              archive.archiveName,
-              memberPath,
-            )
-            uploadFile = new File([new Uint8Array(bytes)], memberFilename, {
-              type: 'application/octet-stream',
-            })
-            uploadName = memberFilename
-            usedMember = memberPath
-          }
-        }
 
-        // Small files go through Vercel multipart; larger ones use GCS signed PUT.
-        if (uploadFile.size > VERCEL_PROXY_UPLOAD_BYTES && !gcsUploads) {
-          setError(
-            `Selected upload is ${(uploadFile.size / (1024 * 1024)).toFixed(1)} MB. ` +
-              `Set GCS_UPLOAD_BUCKET on Vercel (see cloud_run/README.md) for 80–100+ MB Cloud Run jobs, ` +
-              `or switch Engine → Browser.`,
+          setStatus(
+            usedMember
+              ? `Preparing ${uploadName} for Cloud Run…`
+              : 'Preparing Cloud Run job…',
+          )
+          const out = await runServerCompression({
+            file: uploadFile,
+            filename: uploadName,
+            method,
+            // Member already extracted client-side — do not re-send the TAR.
+            archiveMember: null,
+            maxDim: maxProcessDim,
+            svdRank: params.svdRank,
+            waveletKeepFraction: params.waveletKeepFraction,
+            waveletLevels: params.waveletLevels,
+            waveletName: params.waveletName,
+            bandwidthKeepFraction: params.bandwidthKeepFraction,
+            jpegRate: params.jpegRate,
+            redBand,
+            nirBand,
+            gcsUploads,
+            onProgress: (message) => setStatus(message),
+          })
+          setServerOriginalPreview(
+            `data:image/png;base64,${out.originalPreviewPngBase64}`,
+          )
+          const decompressed = `data:image/png;base64,${out.previewPngBase64}`
+          setDecompressedPreview(decompressed)
+          try {
+            const compressed = await dataUrlToJpegDataUrl(
+              decompressed,
+              jpegQualityForMethod(),
+            )
+            setCompressedArtifactPreview(compressed)
+          } catch {
+            setCompressedArtifactPreview(decompressed)
+          }
+          setResidualPreview(null)
+          setIndexMetrics(null)
+          setResult({
+            method: out.method,
+            bands: {},
+            bandOrder: out.bandOrder,
+            width: out.width,
+            height: out.height,
+            runtimeSeconds: out.runtimeSeconds,
+            originalBytes: out.originalBytes,
+            compressedBytesEstimate: out.compressedBytesEstimate,
+            decompressedBytes:
+              out.width *
+              out.height *
+              Math.max(out.channelReports.length, out.bandOrder.length, 1) *
+              8,
+            compressionRatio: out.compressionRatio,
+            channelReports: out.channelReports,
+            metadata: {
+              ...out.metadata,
+              engine: out.engine,
+              ...(usedMember ? { archiveMemberUploaded: usedMember } : {}),
+            },
+          })
+          setStatus(
+            `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · ${out.width}×${out.height} (native ${out.nativeWidth}×${out.nativeHeight}). NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.`,
           )
           setBusy(false)
           return
+        } catch (err) {
+          const msg =
+            err instanceof Error ? err.message : 'Cloud Run compression failed'
+          // Stale Cloud Run images reject newer methods (e.g. LZW). Fall back locally.
+          if (/unknown method/i.test(msg)) {
+            setStatus(
+              `Cloud Run does not support “${method}” yet — running in the browser instead. ` +
+                'Redeploy Cloud Run (`./cloud_run/deploy.sh`) to enable it server-side.',
+            )
+            // Fall through to the browser path below (busy stays true).
+          } else {
+            setError(msg)
+            setStatus(null)
+            setBusy(false)
+            return
+          }
         }
-
-        setStatus(
-          usedMember
-            ? `Preparing ${uploadName} for Cloud Run…`
-            : 'Preparing Cloud Run job…',
-        )
-        const out = await runServerCompression({
-          file: uploadFile,
-          filename: uploadName,
-          method,
-          // Member already extracted client-side — do not re-send the TAR.
-          archiveMember: null,
-          maxDim: maxProcessDim,
-          svdRank: params.svdRank,
-          waveletKeepFraction: params.waveletKeepFraction,
-          waveletLevels: params.waveletLevels,
-          waveletName: params.waveletName,
-          bandwidthKeepFraction: params.bandwidthKeepFraction,
-          jpegRate: params.jpegRate,
-          redBand,
-          nirBand,
-          gcsUploads,
-          onProgress: (message) => setStatus(message),
-        })
-        setServerOriginalPreview(
-          `data:image/png;base64,${out.originalPreviewPngBase64}`,
-        )
-        const decompressed = `data:image/png;base64,${out.previewPngBase64}`
-        setDecompressedPreview(decompressed)
-        try {
-          const compressed = await dataUrlToJpegDataUrl(
-            decompressed,
-            jpegQualityForMethod(),
-          )
-          setCompressedArtifactPreview(compressed)
-        } catch {
-          setCompressedArtifactPreview(decompressed)
-        }
-        setResidualPreview(null)
-        setIndexMetrics(null)
-        setResult({
-          method: out.method,
-          bands: {},
-          bandOrder: out.bandOrder,
-          width: out.width,
-          height: out.height,
-          runtimeSeconds: out.runtimeSeconds,
-          originalBytes: out.originalBytes,
-          compressedBytesEstimate: out.compressedBytesEstimate,
-          decompressedBytes:
-            out.width *
-            out.height *
-            Math.max(out.channelReports.length, out.bandOrder.length, 1) *
-            8,
-          compressionRatio: out.compressionRatio,
-          channelReports: out.channelReports,
-          metadata: {
-            ...out.metadata,
-            engine: out.engine,
-            ...(usedMember ? { archiveMemberUploaded: usedMember } : {}),
-          },
-        })
-        setStatus(
-          `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · ${out.width}×${out.height} (native ${out.nativeWidth}×${out.nativeHeight}). NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.`,
-        )
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Cloud Run compression failed')
-        setStatus(null)
-      } finally {
-        setBusy(false)
-      }
-      return
       }
     }
 
     clearResultPreviews()
-    setStatus(`Running ${method} in browser worker…`)
+    setStatus((prev) =>
+      prev && /running in the browser instead/i.test(prev)
+        ? prev
+        : `Running ${method} in browser worker…`,
+    )
     try {
       const out = await runCompressionAsync({
         method,
@@ -1209,14 +1225,17 @@ export default function CompressionLab() {
       }
 
       const rows: CompareRow[] = []
+      let usedBrowserFallback = false
       for (const m of COMPRESSION_METHODS) {
         setStatus(
           useCloudRun
             ? `Cloud Run comparing: ${m}…`
             : `Comparing: ${m}…`,
         )
-        const out = useCloudRun && cloudUpload
-          ? await runServerCompression({
+        let out
+        if (useCloudRun && cloudUpload) {
+          try {
+            out = await runServerCompression({
               file: cloudUpload.file,
               filename: cloudUpload.filename,
               method: m,
@@ -1233,7 +1252,15 @@ export default function CompressionLab() {
               gcsUploads,
               onProgress: (message) => setStatus(`${m}: ${message}`),
             })
-          : await runCompressionAsync({
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            // Stale Cloud Run (e.g. missing LZW) — finish that method in the browser.
+            if (!/unknown method/i.test(msg)) throw err
+            usedBrowserFallback = true
+            setStatus(
+              `Cloud Run missing “${m}” — comparing ${m} in the browser…`,
+            )
+            out = await runCompressionAsync({
               method: m,
               bands: image.bands,
               bandOrder: image.bandOrder,
@@ -1242,6 +1269,18 @@ export default function CompressionLab() {
               originalBytes: image.originalBytes,
               params,
             })
+          }
+        } else {
+          out = await runCompressionAsync({
+            method: m,
+            bands: image.bands,
+            bandOrder: image.bandOrder,
+            width: image.size.width,
+            height: image.size.height,
+            originalBytes: image.originalBytes,
+            params,
+          })
+        }
 
         const reports = out.channelReports
         const meanRmse =
@@ -1265,7 +1304,9 @@ export default function CompressionLab() {
       setCompareRows(rows)
       setStatus(
         useCloudRun
-          ? 'Cloud Run comparison complete'
+          ? usedBrowserFallback
+            ? 'Comparison complete (some methods ran in the browser — redeploy Cloud Run for full server support)'
+            : 'Cloud Run comparison complete'
           : 'Comparison complete',
       )
     } catch (err) {
@@ -1939,6 +1980,9 @@ export default function CompressionLab() {
             <p className="hint">
               LZW quantizes each band to 8-bit then runs classic dictionary coding
               (ashmeet13-style, adapted for float satellite bands). No extra knobs.
+              {engine === 'cloud-run'
+                ? ' If Cloud Run returns “Unknown method”, the lab falls back to the browser — redeploy Cloud Run to enable LZW server-side.'
+                : ''}
             </p>
           )}
 
