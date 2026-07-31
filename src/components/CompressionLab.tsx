@@ -1997,15 +1997,6 @@ export default function CompressionLab() {
               ))}
             </select>
           </label>
-          <p className="hint">
-            Outputs are always restored to the native pixel size for comparison
-            {image
-              ? ` (${image.nativeWidth}×${image.nativeHeight})`
-              : ''}
-            . Lower caps only speed up the compressor; choose Native for true
-            full-resolution runs
-            {engine === 'browser' ? ' (large scenes may be slow in-browser)' : ''}.
-          </p>
 
           <h2>Method</h2>
           <select
@@ -2126,15 +2117,6 @@ export default function CompressionLab() {
               />
               <span>{params.jpegRate.toFixed(2)}</span>
             </label>
-          )}
-          {method === 'LZW' && (
-            <p className="hint">
-              LZW quantizes each band to 8-bit then runs classic dictionary coding
-              (ashmeet13-style, adapted for float satellite bands). No extra knobs.
-              {engine === 'cloud-run'
-                ? ' If Cloud Run returns “Unknown method”, the lab falls back to the browser — redeploy Cloud Run to enable LZW server-side.'
-                : ''}
-            </p>
           )}
 
           <div className="actions">
