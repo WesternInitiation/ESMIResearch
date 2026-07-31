@@ -17,6 +17,7 @@ import json
 import os
 import tarfile
 from io import BytesIO
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
 import numpy as np
@@ -31,6 +32,8 @@ from compression.lzw import run_lzw_compression
 from compression.svd import run_svd_compression
 from compression.wavelet import run_wavelet_compression
 from image_io import (
+    LoadedImage,
+    encode_reconstructed_image,
     is_tar_archive,
     list_archive_images,
     list_archive_listing,
@@ -104,6 +107,7 @@ def health() -> dict[str, object]:
             "lzw": True,
             "nativeRestore": True,  # max_dim<=0 keeps native; else upsample back
             "residualPreview": True,
+            "float32Artifact": True,
             "methods": list(SUPPORTED_METHODS),
         },
     }
@@ -227,7 +231,7 @@ def _load_from_upload(
     raw: bytes,
     filename: str,
     archive_member: str | None,
-) -> tuple[dict[str, np.ndarray], list[str], str]:
+) -> tuple[LoadedImage, str]:
     if is_tar_archive(filename):
         if not archive_member:
             raise HTTPException(
@@ -235,9 +239,79 @@ def _load_from_upload(
                 detail="archive_member is required for TAR uploads",
             )
         loaded = load_archive_image(raw, archive_member)
-        return loaded.bands, loaded.band_order, archive_member
+        return loaded, archive_member
     loaded = load_image(BytesIO(raw), filename)
-    return loaded.bands, loaded.band_order, filename
+    return loaded, filename
+
+
+# Inline float32 GeoTIFF into JSON only when small enough for the response path.
+_ARTIFACT_INLINE_MAX_BYTES = int(
+    os.environ.get("ARTIFACT_INLINE_MAX_BYTES", str(3 * 1024 * 1024))
+)
+
+
+def _stage_float32_artifact(
+    loaded: LoadedImage,
+    reconstructed_bands: dict[str, np.ndarray],
+    source_name: str,
+) -> dict[str, Any]:
+    """
+    Write reconstructed bands as float32 GeoTIFF (CRS/transform preserved).
+
+    Small artifacts are returned inline as base64; larger ones are uploaded to
+    GCS_UPLOAD_BUCKET under results/ and returned as a gs:// URI for the
+    Vercel app to sign.
+    """
+    try:
+        artifact_bytes, artifact_filename, artifact_mime = encode_reconstructed_image(
+            loaded, reconstructed_bands
+        )
+    except Exception as exc:
+        return {
+            "artifactAvailable": False,
+            "artifactError": f"Could not encode float32 GeoTIFF: {exc}",
+        }
+
+    stem = PurePosixPath(source_name).stem or "reconstructed"
+    download_name = f"{stem}_reconstructed_float32.tif"
+    meta: dict[str, Any] = {
+        "artifactAvailable": True,
+        "artifactFilename": download_name,
+        "artifactMime": artifact_mime or "image/tiff",
+        "artifactBytes": len(artifact_bytes),
+        "artifactDtype": "float32",
+        "artifactSourceFilename": artifact_filename,
+    }
+
+    if len(artifact_bytes) <= _ARTIFACT_INLINE_MAX_BYTES:
+        meta["artifactBase64"] = base64.b64encode(artifact_bytes).decode("ascii")
+        return meta
+
+    bucket_name = _staging_bucket_default()
+    if not bucket_name:
+        # Too large to inline and no staging bucket — still mark available=false
+        # so the UI can fall back to the RGB preview download.
+        meta["artifactAvailable"] = False
+        meta["artifactError"] = (
+            "Reconstructed float32 GeoTIFF is too large to inline and "
+            "GCS_UPLOAD_BUCKET is not configured on Cloud Run."
+        )
+        return meta
+
+    try:
+        from google.cloud import storage  # lazy
+        import uuid
+
+        object_name = f"results/{uuid.uuid4().hex}_{download_name}"
+        client = storage.Client()
+        blob = client.bucket(bucket_name).blob(object_name)
+        blob.upload_from_string(artifact_bytes, content_type="image/tiff")
+        meta["artifactGcsUri"] = f"gs://{bucket_name}/{object_name}"
+        return meta
+    except Exception as exc:
+        meta["artifactAvailable"] = False
+        meta["artifactError"] = f"Failed to stage float32 GeoTIFF to GCS: {exc}"
+        return meta
 
 
 def _parse_gcs_uri(uri: str) -> tuple[str, str]:
@@ -643,7 +717,8 @@ async def compress(
 
     member = (archive_member or "").strip() or None
     try:
-        bands, band_order, source_name = _load_from_upload(raw, source_filename, member)
+        loaded, source_name = _load_from_upload(raw, source_filename, member)
+        bands, band_order = loaded.bands, loaded.band_order
     except ValueError as exc:
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -725,6 +800,10 @@ async def compress(
         else 0.0
     )
 
+    artifact_meta = _stage_float32_artifact(
+        loaded, result.reconstructed_bands, source_name
+    )
+
     payload = {
         "engine": "cloud-run",
         "method": method,
@@ -757,6 +836,7 @@ async def compress(
         "originalPreviewPngBase64": _png_b64(original_preview),
         "previewPngBase64": _png_b64(reconstructed_preview),
         "residualPreviewPngBase64": residual_b64,
+        **artifact_meta,
     }
     _maybe_delete_gcs_blob(gcs_blob)
     try:

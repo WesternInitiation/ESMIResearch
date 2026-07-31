@@ -338,6 +338,14 @@ export default function CompressionLab() {
   )
   const [decompressedPreview, setDecompressedPreview] = useState<string | null>(null)
   const [residualPreview, setResidualPreview] = useState<string | null>(null)
+  /** Cloud Run float32 GeoTIFF artifact (inline base64 or GCS URI). */
+  const [float32Artifact, setFloat32Artifact] = useState<{
+    filename: string
+    mime: string
+    base64?: string
+    gcsUri?: string
+    bytes?: number
+  } | null>(null)
   const [method, setMethod] = useState<CompressionMethod>('SVD')
   const [params, setParams] = useState<MethodParams>(DEFAULT_PARAMS)
   const [result, setResult] = useState<CompressionResult | null>(null)
@@ -419,6 +427,7 @@ export default function CompressionLab() {
     setDecompressedPreview(null)
     setResidualPreview(null)
     setServerOriginalPreview(null)
+    setFloat32Artifact(null)
   }
 
   function applyBrowserResultPreviews(
@@ -853,6 +862,7 @@ export default function CompressionLab() {
     if (!file) return
     setError(null)
     setResult(null)
+    clearResultPreviews()
     setIndexMetrics(null)
     setCompareRows(null)
     setSharedView(null)
@@ -1294,6 +1304,19 @@ export default function CompressionLab() {
             }
           }
           setIndexMetrics(null)
+          if (out.artifactAvailable) {
+            setFloat32Artifact({
+              filename:
+                out.artifactFilename ||
+                `esmi-reconstructed-float32-${Date.now()}.tif`,
+              mime: out.artifactMime || 'image/tiff',
+              base64: out.artifactBase64,
+              gcsUri: out.artifactGcsUri,
+              bytes: out.artifactBytes,
+            })
+          } else {
+            setFloat32Artifact(null)
+          }
           setResult({
             method: out.method,
             bands: {},
@@ -1307,13 +1330,16 @@ export default function CompressionLab() {
               out.width *
               out.height *
               Math.max(out.channelReports.length, out.bandOrder.length, 1) *
-              8,
+              4,
             compressionRatio: out.compressionRatio,
             channelReports: out.channelReports,
             metadata: {
               ...out.metadata,
               engine: out.engine,
+              artifactDtype: out.artifactDtype || 'float32',
+              artifactAvailable: Boolean(out.artifactAvailable),
               ...(usedMember ? { archiveMemberUploaded: usedMember } : {}),
+              ...(out.artifactError ? { artifactError: out.artifactError } : {}),
             },
           })
           setStatus(
@@ -1322,6 +1348,9 @@ export default function CompressionLab() {
               typeof out.metadata === 'object' &&
               (out.metadata as { processWidth?: number }).processWidth
                 ? ` (compressed at ${(out.metadata as { processWidth: number }).processWidth}×${(out.metadata as { processHeight: number }).processHeight}, restored to native)`
+                : '') +
+              (out.artifactAvailable
+                ? ' · float32 GeoTIFF ready for download'
                 : '') +
               '. NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.',
           )
@@ -1806,14 +1835,68 @@ export default function CompressionLab() {
     setStatus('CSV exported')
   }
 
+  async function downloadFloat32Artifact(artifact: {
+    filename: string
+    mime: string
+    base64?: string
+    gcsUri?: string
+  }): Promise<void> {
+    if (artifact.base64) {
+      const binary = atob(artifact.base64)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+      const blob = new Blob([bytes], { type: artifact.mime || 'image/tiff' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = artifact.filename
+      a.rel = 'noopener'
+      document.body.appendChild(a)
+      a.click()
+      window.setTimeout(() => {
+        a.remove()
+        URL.revokeObjectURL(url)
+      }, 2500)
+      return
+    }
+    if (artifact.gcsUri) {
+      const signRes = await fetch('/api/downloads/sign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gcsUri: artifact.gcsUri }),
+      })
+      const signed = (await signRes.json()) as {
+        error?: string
+        downloadUrl?: string
+      }
+      if (!signRes.ok || !signed.downloadUrl) {
+        throw new Error(signed.error || 'Failed to sign float32 GeoTIFF download')
+      }
+      const a = document.createElement('a')
+      a.href = signed.downloadUrl
+      a.download = artifact.filename
+      a.rel = 'noopener'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      return
+    }
+    throw new Error('Float32 GeoTIFF artifact has no download payload')
+  }
+
   async function onDownloadDecompressedTif() {
     const hasBands = Boolean(result && Object.keys(result.bands).length > 0)
-    if (!hasBands && !decompressedPreview) return
+    if (!hasBands && !decompressedPreview && !float32Artifact) return
     setBusy(true)
     setError(null)
     try {
-      const filename = `esmi-decompressed-${Date.now()}.tif`
-      // Prefer real reconstructed bands (native) when present.
+      // Prefer analysis-ready float32 GeoTIFF (native dims + geo metadata).
+      if (float32Artifact) {
+        await downloadFloat32Artifact(float32Artifact)
+        setStatus(`Downloaded ${float32Artifact.filename} (float32 GeoTIFF)`)
+        return
+      }
+      const filename = `esmi-decompressed-float32-${Date.now()}.tif`
       if (hasBands && result) {
         await downloadBandsAsGeoTiff(
           result.bands,
@@ -1821,7 +1904,9 @@ export default function CompressionLab() {
           result.width,
           result.height,
           filename,
+          image?.geoMetadata ?? null,
         )
+        setStatus(`Downloaded ${filename} (float32 GeoTIFF)`)
       } else if (decompressedPreview) {
         const tw = result?.width || image?.nativeWidth
         const th = result?.height || image?.nativeHeight
@@ -1831,10 +1916,12 @@ export default function CompressionLab() {
           tw,
           th,
         )
+        setStatus(
+          `Downloaded ${filename} (RGB preview fallback — float32 bands unavailable)`,
+        )
       } else {
         throw new Error('No decompressed image available to download')
       }
-      setStatus(`Downloaded ${filename}`)
     } catch (err) {
       if (decompressedPreview) {
         const fallbackName = `esmi-decompressed-${Date.now()}`
@@ -1855,7 +1942,7 @@ export default function CompressionLab() {
     setBusy(true)
     setError(null)
     try {
-      const filename = `esmi-compressed-${Date.now()}.tif`
+      const filename = `esmi-compressed-float32-${Date.now()}.tif`
       if (hasBands && result) {
         // Native float bands → JPEG stand-in at native size for the "compressed" product.
         const compressedBands = await jpegRoundtripBands(
@@ -1871,7 +1958,9 @@ export default function CompressionLab() {
           result.width,
           result.height,
           filename,
+          image?.geoMetadata ?? null,
         )
+        setStatus(`Downloaded ${filename} (float32 GeoTIFF)`)
       } else if (compressedArtifactPreview) {
         const tw = result?.width || image?.nativeWidth
         const th = result?.height || image?.nativeHeight
@@ -1881,10 +1970,12 @@ export default function CompressionLab() {
           tw,
           th,
         )
+        setStatus(
+          `Downloaded ${filename} (RGB preview fallback — float32 bands unavailable)`,
+        )
       } else {
         throw new Error('No compressed image available to download')
       }
-      setStatus(`Downloaded ${filename}`)
     } catch (err) {
       if (compressedArtifactPreview) {
         const fallbackName = `esmi-compressed-${Date.now()}`
@@ -2435,7 +2526,7 @@ export default function CompressionLab() {
                       disabled={busy}
                       onClick={() => void onDownloadDecompressedTif()}
                     >
-                      Download decompressed TIF
+                      Download decompressed float32 TIF
                     </button>
                   </>
                 ) : (

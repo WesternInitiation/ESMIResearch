@@ -65,6 +65,18 @@ function interleaveBands(
   return out
 }
 
+export type GeoTiffMetadata = {
+  /** Native raster size the geo tags were measured against. */
+  nativeWidth: number
+  nativeHeight: number
+  modelPixelScale?: number[]
+  modelTiepoint?: number[]
+  modelTransformation?: number[]
+  geoKeyDirectory?: number[]
+  geoDoubleParams?: number[]
+  geoAsciiParams?: string
+}
+
 type TiffWriteOptions = {
   width: number
   height: number
@@ -76,10 +88,64 @@ type TiffWriteOptions = {
   photometric: 1 | 2
   /** Contiguous pixel-interleaved sample bytes / floats */
   data: Uint8Array | Float32Array
+  geo?: GeoTiffMetadata | null
+}
+
+function scaleGeoForExport(
+  geo: GeoTiffMetadata | null | undefined,
+  width: number,
+  height: number,
+): GeoTiffMetadata | null {
+  if (!geo) return null
+  const nativeW = Math.max(1, Math.floor(geo.nativeWidth) || width)
+  const nativeH = Math.max(1, Math.floor(geo.nativeHeight) || height)
+  const sx = nativeW / width
+  const sy = nativeH / height
+  const out: GeoTiffMetadata = {
+    nativeWidth: width,
+    nativeHeight: height,
+    geoKeyDirectory: geo.geoKeyDirectory ? [...geo.geoKeyDirectory] : undefined,
+    geoDoubleParams: geo.geoDoubleParams ? [...geo.geoDoubleParams] : undefined,
+    geoAsciiParams: geo.geoAsciiParams,
+    modelTiepoint: geo.modelTiepoint ? [...geo.modelTiepoint] : undefined,
+    modelTransformation: geo.modelTransformation
+      ? [...geo.modelTransformation]
+      : undefined,
+  }
+  if (geo.modelPixelScale && geo.modelPixelScale.length >= 2) {
+    out.modelPixelScale = [
+      Number(geo.modelPixelScale[0]) * sx,
+      Number(geo.modelPixelScale[1]) * sy,
+      Number(geo.modelPixelScale[2] ?? 0),
+    ]
+  }
+  // Scale affine transform pixel→map coefficients when present (GDAL ModelTransformation).
+  if (out.modelTransformation && out.modelTransformation.length >= 16) {
+    const t = out.modelTransformation
+    // | a  b  0  x |   a,b scale with pixel size
+    // | c  d  0  y |
+    t[0] *= sx
+    t[1] *= sy
+    t[4] *= sx
+    t[5] *= sy
+  }
+  return out
+}
+
+function writeDoubles(view: DataView, offset: number, values: number[]) {
+  for (let i = 0; i < values.length; i++) {
+    view.setFloat64(offset + i * 8, Number(values[i]), true)
+  }
+}
+
+function writeShorts(view: DataView, offset: number, values: number[]) {
+  for (let i = 0; i < values.length; i++) {
+    view.setUint16(offset + i * 2, Number(values[i]) & 0xffff, true)
+  }
 }
 
 /**
- * Minimal uncompressed little-endian TIFF writer.
+ * Minimal uncompressed little-endian TIFF / GeoTIFF writer.
  *
  * We deliberately do NOT use geotiff.js `writeArrayBuffer` — it treats arrays of
  * TypedArrays as `[band][row][col]` and throws "width of type undefined".
@@ -105,25 +171,108 @@ export function writeClassicTiff(options: TiffWriteOptions): ArrayBuffer {
     )
   }
   const strip = raw.subarray(0, expected)
+  const geo = scaleGeoForExport(options.geo, width, height)
 
-  // Layout (word-aligned sections):
-  // [0..8)     header
-  // [8..)      optional BitsPerSample array (if spp > 1)
-  //            optional SampleFormat array (if spp > 1)
-  //            strip bytes
-  //            IFD
   const needsBitsArray = spp > 1
   const needsFormatArray = spp > 1
   const bitsPerSampleBytes = needsBitsArray ? spp * 2 : 0
   const sampleFormatBytes = needsFormatArray ? spp * 2 : 0
+
+  const geoTags: Array<{
+    tag: number
+    type: number
+    count: number
+    bytes: number
+    write: (view: DataView, offset: number) => void
+  }> = []
+  if (geo?.modelPixelScale && geo.modelPixelScale.length >= 3) {
+    const values = geo.modelPixelScale.slice(0, 3)
+    geoTags.push({
+      tag: 33550,
+      type: 12,
+      count: 3,
+      bytes: 24,
+      write: (v, o) => writeDoubles(v, o, values),
+    })
+  }
+  if (geo?.modelTiepoint && geo.modelTiepoint.length >= 6) {
+    const values = geo.modelTiepoint.slice(
+      0,
+      Math.floor(geo.modelTiepoint.length / 6) * 6,
+    )
+    geoTags.push({
+      tag: 33922,
+      type: 12,
+      count: values.length,
+      bytes: values.length * 8,
+      write: (v, o) => writeDoubles(v, o, values),
+    })
+  }
+  if (geo?.modelTransformation && geo.modelTransformation.length >= 16) {
+    const values = geo.modelTransformation.slice(0, 16)
+    geoTags.push({
+      tag: 34264,
+      type: 12,
+      count: 16,
+      bytes: 128,
+      write: (v, o) => writeDoubles(v, o, values),
+    })
+  }
+  if (geo?.geoKeyDirectory && geo.geoKeyDirectory.length >= 4) {
+    const values = geo.geoKeyDirectory.map((n) => Number(n) & 0xffff)
+    geoTags.push({
+      tag: 34735,
+      type: 3,
+      count: values.length,
+      bytes: values.length * 2,
+      write: (v, o) => writeShorts(v, o, values),
+    })
+  }
+  if (geo?.geoDoubleParams && geo.geoDoubleParams.length > 0) {
+    const values = [...geo.geoDoubleParams]
+    geoTags.push({
+      tag: 34736,
+      type: 12,
+      count: values.length,
+      bytes: values.length * 8,
+      write: (v, o) => writeDoubles(v, o, values),
+    })
+  }
+  if (geo?.geoAsciiParams) {
+    const ascii = `${geo.geoAsciiParams}\0`
+    const encoded = new TextEncoder().encode(ascii)
+    geoTags.push({
+      tag: 34737,
+      type: 2,
+      count: encoded.length,
+      bytes: encoded.length,
+      write: (v, o) => {
+        new Uint8Array(v.buffer).set(encoded, o)
+      },
+    })
+  }
+
+  // Layout (word-aligned sections):
+  // [0..8)     header
+  // [8..)      optional BitsPerSample / SampleFormat arrays
+  //            geo tag payloads
+  //            strip bytes
+  //            IFD
   const bitsOffset = 8
   const sampleFormatOffset = bitsOffset + bitsPerSampleBytes
-  const stripOffset = sampleFormatOffset + sampleFormatBytes
-  // TIFF IFDs must start on a word boundary.
+  let cursor = sampleFormatOffset + sampleFormatBytes
+  const geoOffsets: number[] = []
+  for (const g of geoTags) {
+    if (cursor & 1) cursor += 1
+    geoOffsets.push(cursor)
+    cursor += g.bytes
+  }
+  if (cursor & 1) cursor += 1
+  const stripOffset = cursor
   let ifdOffset = stripOffset + strip.byteLength
   if (ifdOffset & 1) ifdOffset += 1
 
-  const entryCount = 11
+  const entryCount = 11 + geoTags.length
   const ifdSize = 2 + entryCount * 12 + 4
   const total = ifdOffset + ifdSize
   const out = new ArrayBuffer(total)
@@ -144,6 +293,9 @@ export function writeClassicTiff(options: TiffWriteOptions): ArrayBuffer {
     for (let i = 0; i < spp; i++) {
       view.setUint16(sampleFormatOffset + i * 2, options.sampleFormat, true)
     }
+  }
+  for (let i = 0; i < geoTags.length; i++) {
+    geoTags[i].write(view, geoOffsets[i])
   }
 
   // Strip data — little-endian sample bytes (matches II header)
@@ -167,7 +319,7 @@ export function writeClassicTiff(options: TiffWriteOptions): ArrayBuffer {
     p += 12
   }
 
-  // TIFF types: 3=SHORT 4=LONG
+  // TIFF types: 3=SHORT 4=LONG 12=DOUBLE
   // Values ≤4 bytes must be stored inline in the value field (not as an offset).
   writeEntry(256, 4, 1, width) // ImageWidth
   writeEntry(257, 4, 1, height) // ImageLength
@@ -185,19 +337,25 @@ export function writeClassicTiff(options: TiffWriteOptions): ArrayBuffer {
     spp,
     needsFormatArray ? sampleFormatOffset : options.sampleFormat,
   ) // SampleFormat
+  for (let i = 0; i < geoTags.length; i++) {
+    const g = geoTags[i]
+    writeEntry(g.tag, g.type, g.count, geoOffsets[i])
+  }
 
   view.setUint32(p, 0, true) // next IFD = none
   return out
 }
 
 /**
- * Write multi-band float GeoTIFF (uncompressed) from laboratory band maps.
+ * Write multi-band float32 GeoTIFF (uncompressed) from laboratory band maps.
+ * Optionally embeds GeoTIFF tags from the source raster.
  */
 export async function bandsToGeoTiffArrayBuffer(
   bands: BandMap,
   bandOrder: string[],
   width: number,
   height: number,
+  geo?: GeoTiffMetadata | null,
 ): Promise<ArrayBuffer> {
   const names = bandOrder.filter((b) => bands[b])
   if (!names.length) throw new Error('No bands available to write as GeoTIFF')
@@ -223,6 +381,7 @@ export async function bandsToGeoTiffArrayBuffer(
     sampleFormat: 3,
     photometric: looksLikeRgb ? 2 : 1,
     data: interleaved,
+    geo: geo ?? null,
   })
 }
 
@@ -232,8 +391,9 @@ export async function downloadBandsAsGeoTiff(
   width: number,
   height: number,
   filename: string,
+  geo?: GeoTiffMetadata | null,
 ): Promise<void> {
-  const buffer = await bandsToGeoTiffArrayBuffer(bands, bandOrder, width, height)
+  const buffer = await bandsToGeoTiffArrayBuffer(bands, bandOrder, width, height, geo)
   downloadArrayBuffer(buffer, filename, 'image/tiff')
 }
 

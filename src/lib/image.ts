@@ -18,6 +18,7 @@ import {
   mimeForImageFilename,
 } from './imageFormats'
 import type { BandMap, ImageSize } from './types'
+import type { GeoTiffMetadata } from './geotiffExport'
 
 export type LoadedImage = {
   bands: BandMap
@@ -39,6 +40,8 @@ export type LoadedImage = {
    * x = pixel width, y = pixel height.
    */
   groundResolution?: { x: number; y: number }
+  /** Source GeoTIFF tags for float32 analysis exports. */
+  geoMetadata?: GeoTiffMetadata
 }
 
 export type LoadImageOptions = {
@@ -333,6 +336,7 @@ export function pairNamedBandImages(
     ...(anchor.image.groundResolution
       ? { groundResolution: anchor.image.groundResolution }
       : {}),
+    ...(anchor.image.geoMetadata ? { geoMetadata: anchor.image.geoMetadata } : {}),
   }
 }
 
@@ -378,6 +382,7 @@ export function mergeNamedBands(
     filename: `${label} · ${base.filename}`,
     archiveMember: members.length ? members.join(' + ') : base.archiveMember,
     ...(base.groundResolution ? { groundResolution: base.groundResolution } : {}),
+    ...(base.geoMetadata ? { geoMetadata: base.geoMetadata } : {}),
   }
 }
 
@@ -553,6 +558,9 @@ async function loadGeoTiff(
     getResolution?: () => number[] | undefined
     getFileDirectory?: () => Record<string, unknown> | object
   })
+  const geoMetadata = readGeoMetadata(image as {
+    getFileDirectory?: () => Record<string, unknown> | object
+  }, nativeWidth, nativeHeight)
   return {
     bands,
     bandOrder: order,
@@ -565,6 +573,59 @@ async function loadGeoTiff(
       ? { fileNativeWidth: nativeWidth, fileNativeHeight: nativeHeight }
       : {}),
     ...(groundResolution ? { groundResolution } : {}),
+    ...(geoMetadata ? { geoMetadata } : {}),
+  }
+}
+
+function asNumberArray(value: unknown): number[] | undefined {
+  if (!Array.isArray(value) && !(ArrayBuffer.isView(value) && !(value instanceof DataView))) {
+    return undefined
+  }
+  const arr = Array.from(value as ArrayLike<number>, (n) => Number(n))
+  if (!arr.length || arr.some((n) => !Number.isFinite(n))) return undefined
+  return arr
+}
+
+function readGeoMetadata(
+  image: {
+    getFileDirectory?: () => Record<string, unknown> | object
+  },
+  nativeWidth: number,
+  nativeHeight: number,
+): GeoTiffMetadata | undefined {
+  try {
+    const dir = (image.getFileDirectory?.() || {}) as Record<string, unknown>
+    const modelPixelScale = asNumberArray(dir.ModelPixelScale)
+    const modelTiepoint = asNumberArray(dir.ModelTiepoint)
+    const modelTransformation = asNumberArray(dir.ModelTransformation)
+    const geoKeyDirectory = asNumberArray(dir.GeoKeyDirectory)
+    const geoDoubleParams = asNumberArray(dir.GeoDoubleParams)
+    let geoAsciiParams: string | undefined
+    if (typeof dir.GeoAsciiParams === 'string') {
+      geoAsciiParams = dir.GeoAsciiParams
+    } else if (Array.isArray(dir.GeoAsciiParams)) {
+      geoAsciiParams = dir.GeoAsciiParams.map(String).join('')
+    }
+    if (
+      !modelPixelScale &&
+      !modelTiepoint &&
+      !modelTransformation &&
+      !geoKeyDirectory
+    ) {
+      return undefined
+    }
+    return {
+      nativeWidth,
+      nativeHeight,
+      ...(modelPixelScale ? { modelPixelScale } : {}),
+      ...(modelTiepoint ? { modelTiepoint } : {}),
+      ...(modelTransformation ? { modelTransformation } : {}),
+      ...(geoKeyDirectory ? { geoKeyDirectory } : {}),
+      ...(geoDoubleParams ? { geoDoubleParams } : {}),
+      ...(geoAsciiParams ? { geoAsciiParams } : {}),
+    }
+  } catch {
+    return undefined
   }
 }
 
