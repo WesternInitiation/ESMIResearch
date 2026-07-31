@@ -91,7 +91,7 @@ def main() -> int:
     with blob.open("rb") as handle:
         entries = scan_archive_image_entries(handle, filename=args.archive)
 
-    manifest = build_manifest(args.archive, entries)
+    manifest = build_manifest(args.archive, entries, bucket=args.bucket)
     text = json.dumps(manifest, indent=2) + "\n"
     print(f"Found {len(manifest['members'])} image members.", flush=True)
     if args.dry_run:
