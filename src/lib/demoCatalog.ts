@@ -12,10 +12,12 @@ import {
   serviceAccountCredentialsForDemo,
   storageClientForDemo,
 } from '@/lib/gcs'
-import { DEMO_OBJECT_EXT_RE, ARCHIVE_EXT_RE, SUPPORTED_IMAGE_LABEL } from '@/lib/imageFormats'
+import { DEMO_OBJECT_EXT_RE, ARCHIVE_EXT_RE, IMAGE_EXT_RE, SUPPORTED_IMAGE_LABEL } from '@/lib/imageFormats'
 
 const DEMO_IMAGE_EXT = DEMO_OBJECT_EXT_RE
 const DEMO_ARCHIVE_EXT = ARCHIVE_EXT_RE
+/** Standalone rasters in a bucket (not archives). */
+const DEMO_LOOSE_IMAGE_EXT = IMAGE_EXT_RE
 /** Archives larger than this must use manifest.json or Cloud Run listing. */
 const LARGE_ARCHIVE_BYTES = 40 * 1024 * 1024
 
@@ -344,15 +346,16 @@ export async function buildDemoCatalog(
         : []
       const objectName = parsed.archive || parsed.objectName
       const entries = parseManifestEntries(parsed.entries)
-      if (members.length && objectName) {
+      const imageMembers = members.filter((m) => DEMO_LOOSE_IMAGE_EXT.test(m))
+      if (imageMembers.length && objectName) {
         const archiveName =
           parsed.archiveName || objectName.split('/').pop() || objectName
         manifestCache = {
           bucket: bucketName,
           objectName,
           archiveName,
-          members: [...members].sort(),
-          entries,
+          members: [...imageMembers].sort(),
+          entries: entries.filter((e) => DEMO_LOOSE_IMAGE_EXT.test(e.name)),
           loadedAt: Date.now(),
         }
         return {
@@ -361,15 +364,15 @@ export async function buildDemoCatalog(
           objectName,
           archiveName,
           members: manifestCache.members,
-          entries: entries.length ? entries : undefined,
+          entries: manifestCache.entries.length ? manifestCache.entries : undefined,
         }
       }
-      if (members.length && parsed.kind === 'objects') {
+      if (imageMembers.length && parsed.kind === 'objects') {
         return {
           kind: 'objects',
           bucket: bucketName,
-          members: [...members].sort(),
-          objects: members.map((name) => ({ name, size: 0 })),
+          members: [...imageMembers].sort(),
+          objects: imageMembers.map((name) => ({ name, size: 0 })),
         }
       }
     } catch {
@@ -383,77 +386,105 @@ export async function buildDemoCatalog(
     )
   }
 
+  // Prefer loose rasters when present. Otherwise a leftover empty/docs ZIP/TAR in
+  // the same bucket steals the catalog and fails with "archive does not contain
+  // a supported image" even though the TIFs are still there.
+  const looseImages = candidates.filter(
+    (c) => DEMO_LOOSE_IMAGE_EXT.test(c.name) && !DEMO_ARCHIVE_EXT.test(c.name),
+  )
+  if (looseImages.length) {
+    const objects = [...looseImages].sort((a, b) => a.name.localeCompare(b.name))
+    return {
+      kind: 'objects',
+      bucket: bucketName,
+      members: objects.map((o) => o.name),
+      objects,
+    }
+  }
+
   const archives = candidates.filter((c) => DEMO_ARCHIVE_EXT.test(c.name))
   if (archives.length) {
-    const preferred = [...archives].sort((a, b) => b.size - a.size)[0]
-    // Large archives: Cloud Run build-manifest, else GCS ranged header scan (no full TAR).
-    if (preferred.size > LARGE_ARCHIVE_BYTES) {
+    // Try largest first, but fall through to smaller archives if one is empty/unreadable.
+    const ordered = [...archives].sort((a, b) => b.size - a.size)
+    const errors: string[] = []
+
+    for (const preferred of ordered) {
       const archiveName = preferred.name.split('/').pop() || preferred.name
-      const errors: string[] = []
 
-      let built: { members: string[]; entries: ManifestEntry[] } | null = null
-      try {
-        built = await buildManifestViaCloudRun(bucketName, preferred.name)
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : String(err))
-      }
-
-      if (!built?.members.length) {
+      if (preferred.size > LARGE_ARCHIVE_BYTES) {
+        let built: { members: string[]; entries: ManifestEntry[] } | null = null
         try {
-          built = await buildManifestViaGcsRangeScan(
-            bucketName,
-            preferred.name,
-            preferred.size,
-          )
+          built = await buildManifestViaCloudRun(bucketName, preferred.name)
         } catch (err) {
-          errors.push(err instanceof Error ? err.message : String(err))
+          errors.push(
+            `${preferred.name}: ${err instanceof Error ? err.message : String(err)}`,
+          )
         }
+
+        if (!built?.members.length) {
+          try {
+            built = await buildManifestViaGcsRangeScan(
+              bucketName,
+              preferred.name,
+              preferred.size,
+            )
+          } catch (err) {
+            errors.push(
+              `${preferred.name}: ${err instanceof Error ? err.message : String(err)}`,
+            )
+          }
+        }
+
+        if (built?.members.length) {
+          manifestCache = {
+            bucket: bucketName,
+            objectName: preferred.name,
+            archiveName,
+            members: [...built.members].sort(),
+            entries: built.entries,
+            loadedAt: Date.now(),
+          }
+          return {
+            kind: 'archive',
+            bucket: bucketName,
+            objectName: preferred.name,
+            archiveName,
+            members: manifestCache.members,
+            entries: built.entries.length ? built.entries : undefined,
+          }
+        }
+        continue
       }
 
-      if (built?.members.length) {
-        manifestCache = {
-          bucket: bucketName,
-          objectName: preferred.name,
-          archiveName,
-          members: [...built.members].sort(),
-          entries: built.entries,
-          loadedAt: Date.now(),
+      try {
+        const cached = await getCachedArchive(bucketName, preferred.name)
+        if (cached.members.length) {
+          return {
+            kind: 'archive',
+            bucket: bucketName,
+            objectName: preferred.name,
+            archiveName: cached.archiveName,
+            members: cached.members,
+          }
         }
-        return {
-          kind: 'archive',
-          bucket: bucketName,
-          objectName: preferred.name,
-          archiveName,
-          members: manifestCache.members,
-          entries: built.entries.length ? built.entries : undefined,
-        }
+        errors.push(`${preferred.name}: archive listed zero supported images`)
+      } catch (err) {
+        errors.push(
+          `${preferred.name}: ${err instanceof Error ? err.message : String(err)}`,
+        )
       }
+    }
 
-      throw new Error(
-        `Demo archive ${preferred.name} is ${(preferred.size / (1024 * 1024)).toFixed(0)} MB. ` +
-          `Could not build a member list without downloading the whole TAR. ` +
-          `Run ./cloud_run/write_demo_manifest.sh from Cloud Shell, or grant the Vercel SA ` +
-          `storage.objects.get on the demo bucket. ` +
-          `(${errors.join(' | ') || 'no details'})`,
-      )
-    }
-    const cached = await getCachedArchive(bucketName, preferred.name)
-    return {
-      kind: 'archive',
-      bucket: bucketName,
-      objectName: preferred.name,
-      archiveName: cached.archiveName,
-      members: cached.members,
-    }
+    throw new Error(
+      `No usable archive images found in gs://${bucketName}. ` +
+        `Checked ${ordered.map((a) => a.name).join(', ')}. ` +
+        `(${errors.join(' | ') || 'no details'})`,
+    )
   }
 
-  const objects = [...candidates].sort((a, b) => a.name.localeCompare(b.name))
-  return {
-    kind: 'objects',
-    bucket: bucketName,
-    members: objects.map((o) => o.name),
-    objects,
-  }
+  throw new Error(
+    `No demo images found in gs://${bucketName}. Upload ${SUPPORTED_IMAGE_LABEL} or a .tar / .tar.gz / .zip.`,
+  )
 }
 
 function safeName(filename: string): string {

@@ -68,14 +68,17 @@ function parseOctal(bytes: Uint8Array, start: number, length: number): number {
 /** Validate ustar/old-tar header checksum so image payloads aren't scanned as members. */
 function isValidTarHeader(header: Uint8Array): boolean {
   if (header.every((b) => b === 0)) return false
-  let sum = 0
+  let unsignedSum = 0
+  let signedSum = 0
   for (let i = 0; i < 512; i++) {
-    sum += i >= 148 && i < 156 ? 0x20 : header[i]
+    const b = i >= 148 && i < 156 ? 0x20 : header[i]
+    unsignedSum += b
+    signedSum += b > 127 ? b - 256 : b
   }
   const stored = parseOctal(header, 148, 8)
-  // Exact checksum match covers ustar and old pre-ustar headers. Reject
-  // anything else so TIFF/JPEG payloads are never treated as headers.
-  return stored === sum
+  // Exact checksum match covers ustar and old pre-ustar headers. Some historic
+  // writers used a signed sum — accept either so real scene TARs still index.
+  return stored === unsignedSum || stored === signedSum
 }
 
 function expandTarBytes(buffer: ArrayBuffer, filename: string): Uint8Array {
@@ -204,7 +207,7 @@ function listZipListing(buffer: ArrayBuffer): ArchiveListing {
             'The ZIP archive contains too many members to index. Upload a scene folder ZIP, or individual .TIF files.',
           )
         }
-        const name = normalizeArchivePath(file.name).replace(/\/$/, '')
+        const name = normalizeArchivePath(file.name).replace(/\/$/, '').trim()
         if (!name || isJunkArchivePath(name)) return false
         if (file.name.endsWith('/')) {
           folderSet.add(name)
@@ -243,7 +246,7 @@ function listTarListing(buffer: ArrayBuffer, filename: string): ArchiveListing {
   const seen = new Set<string>()
 
   for (const entry of iterateTar(data)) {
-    const name = normalizeArchivePath(entry.name).replace(/\/$/, '')
+    const name = normalizeArchivePath(entry.name).replace(/\/$/, '').trim()
     if (!name || isJunkArchivePath(name)) continue
 
     if (isDirectoryType(entry.typeFlag)) {
@@ -421,8 +424,10 @@ export async function scanUncompressedTarImageEntries(
     }
 
     if (pendingLongName) {
-      fullName = pendingLongName.replace(/^\.\//, '')
+      fullName = pendingLongName.replace(/^\.\//, '').trim()
       pendingLongName = null
+    } else {
+      fullName = fullName.trim()
     }
 
     if (
