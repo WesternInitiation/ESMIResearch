@@ -32,6 +32,7 @@ export type ServerCompressResponse = {
   } | null
   originalPreviewPngBase64: string
   previewPngBase64: string
+  residualPreviewPngBase64?: string | null
 }
 
 /** Soft limit for multipart bodies through the Vercel /api/compress proxy. */

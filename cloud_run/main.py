@@ -103,6 +103,7 @@ def health() -> dict[str, object]:
         "features": {
             "lzw": True,
             "nativeRestore": True,  # max_dim<=0 keeps native; else upsample back
+            "residualPreview": True,
             "methods": list(SUPPORTED_METHODS),
         },
     }
@@ -172,6 +173,54 @@ def _preview_rgb_capped(bands: dict[str, np.ndarray], band_order: list[str], max
         image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR),
         dtype=np.uint8,
     )
+
+
+def _residual_rgb_capped(
+    original: dict[str, np.ndarray],
+    reconstructed: dict[str, np.ndarray],
+    band_order: list[str],
+    max_side: int = 1024,
+) -> np.ndarray:
+    """Warm residual map |original − reconstructed|, capped for UI transport."""
+    names = [n for n in band_order if n in original and n in reconstructed]
+    if not names:
+        names = [n for n in original if n in reconstructed]
+    if not names:
+        raise ValueError("No overlapping bands for residual preview")
+
+    sample = original[names[0]]
+    height, width = int(sample.shape[0]), int(sample.shape[1])
+    err = np.zeros((height, width), dtype=np.float64)
+    for name in names:
+        a = original[name].astype(np.float64, copy=False)
+        b = reconstructed[name].astype(np.float64, copy=False)
+        if a.shape != sample.shape or b.shape != sample.shape:
+            continue
+        err += np.abs(a - b)
+    err /= max(len(names), 1)
+    max_err = float(err.max()) if err.size else 0.0
+    if not np.isfinite(max_err) or max_err <= 1e-12:
+        # Near-lossless: still emit a readable dark panel instead of failing.
+        t = np.zeros_like(err)
+    else:
+        t = np.sqrt(np.clip(err / max_err, 0.0, 1.0))
+
+    rgb = np.empty((height, width, 3), dtype=np.uint8)
+    rgb[..., 0] = np.round(40 + t * 215).astype(np.uint8)
+    rgb[..., 1] = np.round(20 + t * 140).astype(np.uint8)
+    rgb[..., 2] = np.round(10 + t * 40).astype(np.uint8)
+
+    longest = max(height, width)
+    if max_side > 0 and longest > max_side:
+        scale = max_side / float(longest)
+        new_w = max(1, int(round(width * scale)))
+        new_h = max(1, int(round(height * scale)))
+        image = Image.fromarray(rgb, mode="RGB")
+        rgb = np.asarray(
+            image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR),
+            dtype=np.uint8,
+        )
+    return rgb
 
 
 def _load_from_upload(
@@ -635,6 +684,13 @@ async def compress(
     reconstructed_preview = _preview_rgb_capped(
         result.reconstructed_bands, band_order
     )
+    try:
+        residual_preview = _residual_rgb_capped(
+            bands, result.reconstructed_bands, band_order
+        )
+        residual_b64 = _png_b64(residual_preview)
+    except Exception:
+        residual_b64 = None
 
     ndvi_payload: dict[str, float] | None = None
     red_name = red_band if red_band in bands else ("red" if "red" in bands else None)
@@ -692,6 +748,7 @@ async def compress(
         "ndvi": ndvi_payload,
         "originalPreviewPngBase64": _png_b64(original_preview),
         "previewPngBase64": _png_b64(reconstructed_preview),
+        "residualPreviewPngBase64": residual_b64,
     }
     _maybe_delete_gcs_blob(gcs_blob)
     try:

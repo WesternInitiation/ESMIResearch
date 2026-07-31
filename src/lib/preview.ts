@@ -54,11 +54,27 @@ export function residualPreviewRgba(
       ? ['red', 'green', 'blue'].filter((b) => original[b] && decompressed[b])
       : bandOrder.filter((b) => original[b] && decompressed[b])
 
+  if (!names.length) {
+    // No overlapping bands — return a flat dark panel rather than crashing.
+    const rgba = new Uint8ClampedArray(n * 4)
+    for (let i = 0; i < n; i++) {
+      const o = i * 4
+      rgba[o] = 40
+      rgba[o + 1] = 20
+      rgba[o + 2] = 10
+      rgba[o + 3] = 255
+    }
+    return rgba
+  }
+
   for (let i = 0; i < n; i++) {
     let acc = 0
     let count = 0
     for (const name of names) {
-      acc += Math.abs(decompressed[name][i] - original[name][i])
+      const a = original[name]
+      const b = decompressed[name]
+      if (!a || !b || i >= a.length || i >= b.length) continue
+      acc += Math.abs(b[i] - a[i])
       count++
     }
     const v = count ? acc / count : 0

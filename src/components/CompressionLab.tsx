@@ -426,23 +426,47 @@ export default function CompressionLab() {
     source: WorkingImage,
   ) {
     // Downloads keep full native bands on `out`; on-screen previews are 1024px.
+    // Use the *actual* buffer dimensions for each BandMap — after a light UI decode,
+    // source.nativeBands are preview-sized even though nativeWidth is the file size.
     const previewMax = PREVIEW_MAX_DIM
+    const reconW = out.width
+    const reconH = out.height
+    const origW = source.size.width
+    const origH = source.size.height
+
     const reconPrev = downsampleBands(
       out.bands,
       out.bandOrder,
-      out.width,
-      out.height,
+      reconW,
+      reconH,
       previewMax,
     )
-    const origPrev = downsampleBands(
+    // Align original to the same preview grid as the reconstruction for residual.
+    const origForResidual = downsampleBands(
       source.nativeBands,
       out.bandOrder,
-      out.width,
-      out.height,
+      origW,
+      origH,
       previewMax,
     )
-    const width = reconPrev.width
-    const height = reconPrev.height
+    // If decode size ≠ reconstructed size, resample original preview onto recon grid.
+    let origBands = origForResidual.bands
+    let width = reconPrev.width
+    let height = reconPrev.height
+    if (
+      origForResidual.width !== reconPrev.width ||
+      origForResidual.height !== reconPrev.height
+    ) {
+      origBands = upsampleBands(
+        origForResidual.bands,
+        out.bandOrder,
+        origForResidual.width,
+        origForResidual.height,
+        reconPrev.width,
+        reconPrev.height,
+      )
+    }
+
     const decompressed = bandsToDecompressedPreview(
       reconPrev.bands,
       out.bandOrder,
@@ -458,7 +482,7 @@ export default function CompressionLab() {
     )
     const residual = rgbaToPngDataUrl(
       residualPreviewRgba(
-        origPrev.bands,
+        origBands,
         reconPrev.bands,
         out.bandOrder,
         width,
@@ -1227,15 +1251,22 @@ export default function CompressionLab() {
           } catch {
             setCompressedArtifactPreview(decompressed)
           }
-          // Cloud Run returns display PNGs, not float bands — residual from previews.
-          try {
-            const residual = await residualPreviewFromDataUrls(
-              originalPreview,
-              decompressed,
+          // Prefer server-built residual (float-band accurate). Fall back to PNG diff.
+          if (out.residualPreviewPngBase64) {
+            setResidualPreview(
+              `data:image/png;base64,${out.residualPreviewPngBase64}`,
             )
-            setResidualPreview(residual)
-          } catch {
-            setResidualPreview(null)
+          } else {
+            try {
+              const residual = await residualPreviewFromDataUrls(
+                originalPreview,
+                decompressed,
+              )
+              setResidualPreview(residual)
+            } catch (residErr) {
+              console.warn('Residual preview failed', residErr)
+              setResidualPreview(null)
+            }
           }
           setIndexMetrics(null)
           setResult({
@@ -2403,7 +2434,7 @@ export default function CompressionLab() {
               ) : (
                 <div className="empty">
                   {result
-                    ? 'Residual unavailable for this run (could not compare original vs decompressed pixels).'
+                    ? 'Residual unavailable — re-run compression (Cloud Run needs a fresh deploy for server residual maps).'
                     : 'Waiting for residual map — run compression first.'}
                 </div>
               )}
