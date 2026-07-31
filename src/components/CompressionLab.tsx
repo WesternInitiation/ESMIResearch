@@ -2117,30 +2117,6 @@ export default function CompressionLab() {
               Cloud Run {cloudRunOk ? '(online)' : cloudRunConfigured ? '(unreachable)' : '(not configured)'}
             </option>
           </select>
-          {!cloudRunConfigured && (
-            <p className="hint">
-              Set <code>COMPRESS_API_URL</code> + <code>GOOGLE_SERVICE_ACCOUNT_JSON</code> on
-              Vercel (private Cloud Run). See <code>cloud_run/README.md</code>.
-            </p>
-          )}
-
-          <label>
-            Max processing size (codecs; Native = full resolution)
-            <select
-              value={maxProcessDim}
-              disabled={busy}
-              onChange={(e) => void onMaxDimChange(Number(e.target.value))}
-            >
-              {(engine === 'cloud-run'
-                ? PROCESS_DIM_OPTIONS_SERVER
-                : PROCESS_DIM_OPTIONS_BROWSER
-              ).map((d) => (
-                <option key={d} value={d}>
-                  {d === 0 ? 'Native (full resolution)' : `${d}px`}
-                </option>
-              ))}
-            </select>
-          </label>
 
           <h2>Method</h2>
           <select
