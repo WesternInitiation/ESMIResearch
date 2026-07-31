@@ -23,6 +23,23 @@ export type CompressionResult = {
   compressionRatio: number
   channelReports: ChannelReport[]
   metadata: Record<string, unknown>
+  /**
+   * Cloud Run rasterio exports: one GeoTIFF per band with CRS/transform/NoData.
+   * Prefer these over browser classic-TIFF / RGB-preview downloads.
+   */
+  reconstructedBandGeotiffs?: Array<{
+    band: string
+    label: string
+    filename: string
+    gcsUri: string
+    size: number
+    dtype: string
+    width: number
+    height: number
+    crs?: string | null
+    transform?: number[] | null
+    nodata?: number | null
+  }>
 }
 
 export type CompressionMethod =

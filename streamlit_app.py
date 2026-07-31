@@ -893,7 +893,7 @@ col4.metric("Bands", band_count)
 col5.metric("Estimated compressed size", f"{result.compressed_bytes_estimate:,} B")
 
 st.download_button(
-    "Download compressed image",
+    "Download reconstructed GeoTIFF bands (ZIP)",
     data=stored_run["artifact_bytes"],
     file_name=stored_run["artifact_filename"],
     mime=stored_run["artifact_mime"],
@@ -901,8 +901,9 @@ st.download_button(
 )
 st.caption(
     f"Download size: {len(stored_run['artifact_bytes']):,} B. "
-    "The algorithm size above estimates its compact representation; the download "
-    "contains the reconstructed pixels in a portable image format."
+    "GeoTIFF sources export one single-band GeoTIFF per band (B2–B5, …) "
+    "with CRS, transform, NoData, and native dimensions preserved via rasterio. "
+    "The algorithm size above estimates its compact representation."
 )
 
 st.subheader("Save & share with Supabase")

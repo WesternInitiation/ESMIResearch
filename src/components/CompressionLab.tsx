@@ -22,6 +22,7 @@ import { downloadCsv } from '@/lib/csv'
 import {
   downloadBandsAsGeoTiff,
   downloadPreviewDataUrl,
+  downloadReconstructedBandGeotiffs,
   downloadRgbPreviewAsGeoTiff,
 } from '@/lib/geotiffExport'
 import { jpegRoundtripBands } from '@/lib/lossyBands'
@@ -649,7 +650,7 @@ export default function CompressionLab() {
       setStatus(
         catalog.kind === 'archive'
           ? `gs://${catalog.bucket} · ${members.length} images in ${catalog.archiveName} — pick one`
-          : `gs://${catalog.bucket} · ${members.length} objects — pick one`,
+          : `gs://${catalog.bucket} · ${members.length} objects — pick one from the list to load preview`,
       )
     } catch (err) {
       if (seq !== demoLoadSeq.current) return
@@ -1429,8 +1430,11 @@ export default function CompressionLab() {
               ...out.metadata,
               engine: out.engine,
               ...(usedMember ? { archiveMemberUploaded: usedMember } : {}),
+              ...(out.geotiffError ? { geotiffError: out.geotiffError } : {}),
             },
+            reconstructedBandGeotiffs: out.reconstructedBandGeotiffs || [],
           })
+          const geoCount = out.reconstructedBandGeotiffs?.length || 0
           setStatus(
             `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · output ${out.width}×${out.height}` +
               (out.metadata &&
@@ -1438,6 +1442,11 @@ export default function CompressionLab() {
               (out.metadata as { processWidth?: number }).processWidth
                 ? ` (compressed at ${(out.metadata as { processWidth: number }).processWidth}×${(out.metadata as { processHeight: number }).processHeight}, restored to native)`
                 : '') +
+              (geoCount
+                ? ` · ${geoCount} GeoTIFF band${geoCount === 1 ? '' : 's'} ready (CRS/transform preserved)`
+                : out.geotiffError
+                  ? ` · GeoTIFF export skipped: ${out.geotiffError}`
+                  : '') +
               '. NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.',
           )
           setBusy(false)
@@ -1931,11 +1940,21 @@ export default function CompressionLab() {
   }
 
   async function onDownloadDecompressedTif() {
+    const geoArtifacts = result?.reconstructedBandGeotiffs || []
+    const hasGeo = geoArtifacts.length > 0
     const hasBands = Boolean(result && Object.keys(result.bands).length > 0)
-    if (!hasBands && !decompressedPreview) return
+    if (!hasGeo && !hasBands && !decompressedPreview) return
     setBusy(true)
     setError(null)
     try {
+      // Prefer Cloud Run rasterio GeoTIFFs (CRS / transform / NoData / native dims).
+      if (hasGeo) {
+        const saved = await downloadReconstructedBandGeotiffs(geoArtifacts)
+        setStatus(
+          `Downloaded ${saved.length} GeoTIFF band${saved.length === 1 ? '' : 's'}: ${saved.join(', ')}`,
+        )
+        return
+      }
       const filename = `esmi-decompressed-${Date.now()}.tif`
       // Prefer real reconstructed bands (native) when present.
       if (hasBands && result) {
@@ -1960,7 +1979,9 @@ export default function CompressionLab() {
       }
       setStatus(`Downloaded ${filename}`)
     } catch (err) {
-      if (decompressedPreview) {
+      if (hasGeo) {
+        setError(err instanceof Error ? err.message : 'GeoTIFF download failed')
+      } else if (decompressedPreview) {
         const fallbackName = `esmi-decompressed-${Date.now()}`
         await downloadPreviewDataUrl(decompressedPreview, fallbackName)
         setStatus(`Downloaded preview fallback (TIFF encode unavailable)`)
@@ -2602,7 +2623,9 @@ export default function CompressionLab() {
                       disabled={busy}
                       onClick={() => void onDownloadDecompressedTif()}
                     >
-                      Download decompressed TIF
+                      {(result?.reconstructedBandGeotiffs?.length || 0) > 0
+                        ? `Download GeoTIFF bands (${result!.reconstructedBandGeotiffs!.length})`
+                        : 'Download decompressed TIF'}
                     </button>
                   </>
                 ) : (

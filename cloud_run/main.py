@@ -31,14 +31,18 @@ from compression.lzw import run_lzw_compression
 from compression.svd import run_svd_compression
 from compression.wavelet import run_wavelet_compression
 from image_io import (
+    downsample_bands_rasterio,
+    encode_reconstructed_band_geotiffs,
     is_tar_archive,
     list_archive_images,
     list_archive_listing,
     load_archive_image,
     load_image,
     preview_raster_bytes,
+    resize_bands_rasterio,
     scan_archive_image_entries,
     to_display_rgb,
+    LoadedImage,
 )
 from ndvi import compare_ndvi, compute_ndvi
 from svd_compression import ChannelCompressionConfig, CompressionConfig
@@ -110,12 +114,14 @@ def health() -> dict[str, object]:
             "nativeRestore": True,  # max_dim<=0 keeps native; else upsample back
             "residualPreview": True,
             "lightPreview": True,  # /v1/demo/preview + /v1/demo/light_prepare
+            "geotiffExport": True,  # per-band GeoTIFF via rasterio (CRS/transform/NoData)
             "methods": list(SUPPORTED_METHODS),
         },
     }
 
 
 def _png_b64(rgb: np.ndarray) -> str:
+    """UI preview only — Pillow is fine for 8-bit RGB thumbnails, not GeoTIFFs."""
     image = Image.fromarray(rgb.astype(np.uint8))
     buffer = BytesIO()
     image.save(buffer, format="PNG", optimize=True)
@@ -126,21 +132,8 @@ def _downsample_bands(
     bands: dict[str, np.ndarray],
     max_dim: int,
 ) -> tuple[dict[str, np.ndarray], float]:
-    sample = next(iter(bands.values()))
-    height, width = sample.shape[:2]
-    longest = max(height, width)
-    # max_dim <= 0 means native resolution (no downsampling).
-    if max_dim <= 0 or longest <= max_dim:
-        return bands, 1.0
-    scale = max_dim / float(longest)
-    new_w = max(1, int(round(width * scale)))
-    new_h = max(1, int(round(height * scale)))
-    out: dict[str, np.ndarray] = {}
-    for name, band in bands.items():
-        image = Image.fromarray(band.astype(np.float32), mode="F")
-        resized = image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
-        out[name] = np.asarray(resized, dtype=band.dtype)
-    return out, scale
+    """Scientific downsample via rasterio (not Pillow)."""
+    return downsample_bands_rasterio(bands, max_dim)
 
 
 def _upsample_bands(
@@ -148,20 +141,12 @@ def _upsample_bands(
     target_width: int,
     target_height: int,
 ) -> dict[str, np.ndarray]:
-    """Bilinear upsample so reconstructed bands match the native raster size."""
+    """Restore native raster size via rasterio so exports keep pixel alignment."""
     sample = next(iter(bands.values()))
     height, width = int(sample.shape[0]), int(sample.shape[1])
     if width == target_width and height == target_height:
         return bands
-    out: dict[str, np.ndarray] = {}
-    for name, band in bands.items():
-        image = Image.fromarray(band.astype(np.float32), mode="F")
-        resized = image.resize(
-            (target_width, target_height),
-            resample=Image.Resampling.BILINEAR,
-        )
-        out[name] = np.asarray(resized, dtype=band.dtype)
-    return out
+    return resize_bands_rasterio(bands, target_height, target_width)
 
 
 def _preview_rgb_capped(bands: dict[str, np.ndarray], band_order: list[str], max_side: int = 1024) -> np.ndarray:
@@ -233,17 +218,15 @@ def _load_from_upload(
     raw: bytes,
     filename: str,
     archive_member: str | None,
-) -> tuple[dict[str, np.ndarray], list[str], str]:
+) -> LoadedImage:
     if is_tar_archive(filename):
         if not archive_member:
             raise HTTPException(
                 status_code=400,
                 detail="archive_member is required for TAR uploads",
             )
-        loaded = load_archive_image(raw, archive_member)
-        return loaded.bands, loaded.band_order, archive_member
-    loaded = load_image(BytesIO(raw), filename)
-    return loaded.bands, loaded.band_order, filename
+        return load_archive_image(raw, archive_member)
+    return load_image(BytesIO(raw), filename)
 
 
 def _parse_gcs_uri(uri: str) -> tuple[str, str]:
@@ -379,6 +362,96 @@ def _demo_bucket_default() -> str:
 def _staging_bucket_default() -> str | None:
     name = os.environ.get("GCS_UPLOAD_BUCKET", "").strip()
     return name or None
+
+
+def _stage_reconstructed_geotiffs(
+    loaded: LoadedImage,
+    reconstructed_bands: dict[str, np.ndarray],
+    *,
+    source_filename: str,
+    method: str,
+) -> list[dict[str, Any]]:
+    """
+    Encode one GeoTIFF per band with rasterio (CRS/transform/NoData) and stage
+    them under ``results/`` in the upload bucket for browser download.
+    """
+    import time
+    import uuid
+
+    from google.cloud import storage
+
+    staging = _staging_bucket_default()
+    if not staging:
+        raise RuntimeError(
+            "GCS_UPLOAD_BUCKET is not set — cannot stage reconstructed GeoTIFF bands"
+        )
+
+    sample = next(iter(loaded.bands.values()))
+    dtype_mode = "source" if sample.dtype == np.uint16 else "float32"
+    artifacts = encode_reconstructed_band_geotiffs(
+        loaded,
+        reconstructed_bands,
+        source_filename=source_filename,
+        dtype_mode=dtype_mode,  # type: ignore[arg-type]
+    )
+
+    client = storage.Client()
+    prefix = f"results/{int(time.time())}-{uuid.uuid4().hex}"
+    staged: list[dict[str, Any]] = []
+    for item in artifacts:
+        object_name = f"{prefix}/{item['filename']}"
+        blob = client.bucket(staging).blob(object_name)
+        blob.upload_from_string(item["bytes"], content_type="image/tiff")
+        nodata = item.get("nodata")
+        if isinstance(nodata, float) and not np.isfinite(nodata):
+            nodata = None
+        staged.append(
+            {
+                "band": item["band"],
+                "label": item["label"],
+                "filename": item["filename"],
+                "gcsUri": f"gs://{staging}/{object_name}",
+                "bucket": staging,
+                "objectName": object_name,
+                "size": item["size"],
+                "dtype": item["dtype"],
+                "width": item["width"],
+                "height": item["height"],
+                "crs": item["crs"],
+                "transform": item["transform"],
+                "nodata": nodata,
+                "method": method,
+            }
+        )
+        # Free encoded bytes promptly (Landsat bands are large).
+        item["bytes"] = b""
+    return staged
+
+
+def _geospatial_summary(loaded: LoadedImage) -> dict[str, Any]:
+    meta = loaded.metadata or {}
+    profile = loaded.raster_profile or {}
+    transform = meta.get("transform") or profile.get("transform")
+    if transform is not None and not isinstance(transform, (tuple, list)):
+        try:
+            transform = tuple(transform)
+        except TypeError:
+            transform = None
+    pixel_size = None
+    if transform is not None and len(transform) >= 6:
+        # Affine: (a, b, c, d, e, f) → pixel width |a|, height |e|
+        pixel_size = {
+            "x": abs(float(transform[0])),
+            "y": abs(float(transform[4])),
+        }
+    return {
+        "crs": meta.get("crs") or (str(profile["crs"]) if profile.get("crs") else None),
+        "transform": transform,
+        "nodata": profile.get("nodata"),
+        "pixelSize": pixel_size,
+        "sourceType": loaded.source_type,
+        "sourceDtype": str(next(iter(loaded.bands.values())).dtype),
+    }
 
 
 def _build_demo_manifest(archive: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -862,7 +935,7 @@ async def compress(
 
     member = (archive_member or "").strip() or None
     try:
-        bands, band_order, source_name = _load_from_upload(raw, source_filename, member)
+        loaded = _load_from_upload(raw, source_filename, member)
     except ValueError as exc:
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -870,6 +943,9 @@ async def compress(
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=400, detail=f"Failed to load image: {exc}") from exc
 
+    bands = loaded.bands
+    band_order = loaded.band_order
+    source_name = member or source_filename
     native = next(iter(bands.values())).shape
     native_h, native_w = int(native[0]), int(native[1])
     # max_dim <= 0 → native resolution; otherwise enforce a small lower bound.
@@ -935,6 +1011,20 @@ async def compress(
         }
     width, height = native_w, native_h
 
+    # Per-band scientific GeoTIFFs (rasterio) — staged to GCS for download.
+    geotiff_artifacts: list[dict[str, Any]] = []
+    geotiff_error: str | None = None
+    if loaded.source_type == "geotiff" or loaded.raster_profile is not None:
+        try:
+            geotiff_artifacts = _stage_reconstructed_geotiffs(
+                loaded,
+                result.reconstructed_bands,
+                source_filename=source_name,
+                method=method,
+            )
+        except Exception as exc:
+            geotiff_error = str(exc)
+
     # Previews are capped for JSON transport; width/height above stay native.
     original_preview = _preview_rgb_capped(bands, band_order)
     reconstructed_preview = _preview_rgb_capped(
@@ -973,6 +1063,7 @@ async def compress(
         else 0.0
     )
 
+    geo = _geospatial_summary(loaded)
     payload = {
         "engine": "cloud-run",
         "method": method,
@@ -1000,11 +1091,16 @@ async def compress(
         "metadata": {
             **result.metadata,
             **({"gcsUri": uri} if uri else {}),
+            "geospatial": geo,
+            "geotiffExport": True,
+            "geotiffBandCount": len(geotiff_artifacts),
         },
         "ndvi": ndvi_payload,
         "originalPreviewPngBase64": _png_b64(original_preview),
         "previewPngBase64": _png_b64(reconstructed_preview),
         "residualPreviewPngBase64": residual_b64,
+        "reconstructedBandGeotiffs": geotiff_artifacts,
+        "geotiffError": geotiff_error,
     }
     _maybe_delete_gcs_blob(gcs_blob)
     try:

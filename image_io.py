@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import re
 import tarfile
 import zipfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import PurePosixPath
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Literal
 
 import numpy as np
 from PIL import Image
 
 try:
     import rasterio
+    from rasterio.enums import Resampling as RioResampling
     from rasterio.io import MemoryFile
+    from rasterio.transform import Affine
 
     HAS_RASTERIO = True
 except ImportError:
     HAS_RASTERIO = False
+    RioResampling = None  # type: ignore[misc, assignment]
+    Affine = None  # type: ignore[misc, assignment]
 
 
 @dataclass
@@ -392,6 +397,7 @@ def load_geotiff(file: BinaryIO) -> LoadedImage:
                 raise ValueError("The decoded GeoTIFF is too large to process.")
             array = dataset.read()
             descriptions = dataset.descriptions
+            band_count = int(dataset.count)
             profile = dataset.profile.copy()
             crs = str(dataset.crs) if dataset.crs else None
             transform = tuple(dataset.transform)
@@ -415,7 +421,7 @@ def load_geotiff(file: BinaryIO) -> LoadedImage:
         name = (
             desc.strip().lower().replace(" ", "_")
             if desc
-            else f"band_{i + 1}"
+            else ("gray" if band_count == 1 else f"band_{i + 1}")
         )
         if name in bands:
             name = f"{name}_{i + 1}"
@@ -530,9 +536,12 @@ def _read_raster_tags(dataset, band_index: int = 0) -> dict[str, dict[str, str]]
 def _apply_common_band_aliases(bands: dict[str, np.ndarray], order: list[str]) -> None:
     """Map common satellite band names to red/nir when possible."""
     alias_map = {
+        "b2": "blue",
+        "b3": "green",
         "b4": "red",
         "red": "red",
         "r": "red",
+        "b5": "nir",
         "b8": "nir",
         "nir": "nir",
         "near_infrared": "nir",
@@ -619,6 +628,7 @@ def to_display_rgb(bands: dict[str, np.ndarray], order: list[str]) -> np.ndarray
 
 
 def array_to_png_bytes(array: np.ndarray) -> bytes:
+    """Encode an 8-bit display preview as PNG (UI only — not scientific export)."""
     if array.ndim == 2:
         image = Image.fromarray(array)
     else:
@@ -628,6 +638,341 @@ def array_to_png_bytes(array: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+_LANDSAT_BAND_RE = re.compile(
+    r"(?:^|[_./\\-])(?:SR_|ST_|TOA_|BND_)?B0*(\d{1,2})(?:\b|[_./\\-]|$)",
+    re.IGNORECASE,
+)
+
+# OLI / MSI role → Landsat 8-style labels (B2–B5 are the core optical set).
+_ROLE_TO_LANDSAT = {
+    "blue": "B2",
+    "coastal": "B1",
+    "coastal_aerosol": "B1",
+    "green": "B3",
+    "red": "B4",
+    "nir": "B5",
+    "near_infrared": "B5",
+    "swir1": "B6",
+    "swir_1": "B6",
+    "swir2": "B7",
+    "swir_2": "B7",
+    "cirrus": "B9",
+    "tirs1": "B10",
+    "tirs2": "B11",
+}
+
+
+def landsat_band_label(
+    band_key: str,
+    *,
+    description: str | None = None,
+    source_filename: str | None = None,
+    band_index: int = 1,
+) -> str:
+    """
+    Prefer Landsat-style labels (B2–B5, …) from description, key, or filename.
+    Falls back to role aliases, then ``B{index}``.
+    """
+    for text in (description, band_key, source_filename):
+        if not text:
+            continue
+        match = _LANDSAT_BAND_RE.search(str(text).replace(" ", "_"))
+        if match:
+            return f"B{int(match.group(1))}"
+    role = _ROLE_TO_LANDSAT.get(str(band_key).strip().lower())
+    if role:
+        return role
+    return f"B{max(1, int(band_index))}"
+
+
+def resize_band_rasterio(
+    band: np.ndarray,
+    out_height: int,
+    out_width: int,
+    *,
+    resampling: str = "bilinear",
+) -> np.ndarray:
+    """
+    Resize a 2D scientific band with rasterio (``out_shape``), not Pillow.
+
+    Pillow strips geospatial context and is the wrong tool for satellite rasters.
+    This keeps dtype semantics suitable for compression pipelines.
+    """
+    if not HAS_RASTERIO:
+        raise RuntimeError("rasterio is required to resize satellite bands")
+    out_h = max(1, int(out_height))
+    out_w = max(1, int(out_width))
+    src_h, src_w = int(band.shape[0]), int(band.shape[1])
+    if src_h == out_h and src_w == out_w:
+        return band
+    method = getattr(RioResampling, resampling, RioResampling.bilinear)
+    # Write a tiny in-memory GeoTIFF then read at the target shape. Using a
+    # unit affine keeps pixel alignment consistent for process/preview sizes;
+    # final scientific exports always restore the source CRS + transform.
+    profile = {
+        "driver": "GTiff",
+        "height": src_h,
+        "width": src_w,
+        "count": 1,
+        "dtype": "float32",
+        "crs": None,
+        "transform": Affine.identity(),
+    }
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as dataset:
+            dataset.write(np.asarray(band, dtype=np.float32), 1)
+        with memfile.open() as dataset:
+            resized = dataset.read(
+                1,
+                out_shape=(out_h, out_w),
+                resampling=method,
+            )
+    return np.asarray(resized, dtype=np.float32)
+
+
+def resize_bands_rasterio(
+    bands: dict[str, np.ndarray],
+    out_height: int,
+    out_width: int,
+    *,
+    resampling: str = "bilinear",
+) -> dict[str, np.ndarray]:
+    """Resize every band with rasterio (scientific path — not Pillow)."""
+    return {
+        name: resize_band_rasterio(
+            band, out_height, out_width, resampling=resampling
+        )
+        for name, band in bands.items()
+    }
+
+
+def downsample_bands_rasterio(
+    bands: dict[str, np.ndarray],
+    max_dim: int,
+) -> tuple[dict[str, np.ndarray], float]:
+    """Downsample scientific bands when the longest side exceeds ``max_dim``."""
+    sample = next(iter(bands.values()))
+    height, width = int(sample.shape[0]), int(sample.shape[1])
+    longest = max(height, width)
+    if max_dim <= 0 or longest <= max_dim:
+        return bands, 1.0
+    scale = max_dim / float(longest)
+    new_w = max(1, int(round(width * scale)))
+    new_h = max(1, int(round(height * scale)))
+    return resize_bands_rasterio(bands, new_h, new_w), scale
+
+
+def _cast_scientific_band(
+    original: np.ndarray,
+    reconstructed: np.ndarray,
+    *,
+    dtype_mode: Literal["float32", "source"] = "float32",
+) -> np.ndarray:
+    """
+    Cast reconstructed pixels for GeoTIFF export.
+
+    Default is float32 (scientific). When ``dtype_mode='source'`` and the
+    original band was integer (e.g. Landsat uint16 DN), round/clip to that dtype.
+    """
+    arr = np.asarray(reconstructed, dtype=np.float64)
+    if dtype_mode == "source" and np.issubdtype(original.dtype, np.integer):
+        info = np.iinfo(original.dtype)
+        return np.clip(np.rint(arr), info.min, info.max).astype(original.dtype)
+    if dtype_mode == "source" and original.dtype == np.float32:
+        return arr.astype(np.float32)
+    return arr.astype(np.float32)
+
+
+def _single_band_export_profile(
+    loaded: LoadedImage,
+    *,
+    height: int,
+    width: int,
+    dtype: np.dtype,
+) -> dict[str, Any]:
+    if not HAS_RASTERIO:
+        raise RuntimeError("rasterio is required to export GeoTIFF results")
+    if loaded.raster_profile is not None:
+        profile = loaded.raster_profile.copy()
+    else:
+        profile = {
+            "driver": "GTiff",
+            "crs": None,
+            "transform": Affine.identity() if Affine is not None else None,
+            "nodata": None,
+        }
+    profile.update(
+        driver="GTiff",
+        count=1,
+        height=int(height),
+        width=int(width),
+        dtype=dtype,
+        compress="deflate",
+        photometric="minisblack",
+    )
+    # Strip tiling so GDAL writes a simple strip layout at the native grid.
+    profile.pop("blockxsize", None)
+    profile.pop("blockysize", None)
+    profile.pop("tiled", None)
+    profile.pop("interleave", None)
+    return profile
+
+
+def encode_reconstructed_band_geotiffs(
+    loaded: LoadedImage,
+    reconstructed_bands: dict[str, np.ndarray],
+    *,
+    source_filename: str | None = None,
+    dtype_mode: Literal["float32", "source"] = "float32",
+) -> list[dict[str, Any]]:
+    """
+    Write **one GeoTIFF per reconstructed band** for Landsat-comparable output.
+
+    Preserves from the source (when available):
+      - original dimensions (must match reconstructed arrays)
+      - CRS
+      - affine transform / pixel size / pixel alignment
+      - NoData
+      - scales / offsets / units / tags / mask / GCPs / RPCs (per band when present)
+
+    Pixel values are float32 by default, or the original integer dtype when
+    ``dtype_mode='source'`` (typical for Landsat uint16 DN / scaled reflectance).
+
+    Returns a list of dicts with keys:
+      ``bytes``, ``filename``, ``mime``, ``band``, ``label``, ``dtype``,
+      ``width``, ``height``, ``crs``, ``transform``, ``nodata``.
+    """
+    if not HAS_RASTERIO:
+        raise RuntimeError("rasterio is required to export GeoTIFF results")
+    if loaded.source_type != "geotiff" and loaded.raster_profile is None:
+        raise ValueError(
+            "GeoTIFF geospatial export requires a GeoTIFF source (rasterio profile)."
+        )
+
+    artifacts: list[dict[str, Any]] = []
+    for index, name in enumerate(loaded.band_order, start=1):
+        if name not in reconstructed_bands:
+            continue
+        original = loaded.bands[name]
+        reconstructed = reconstructed_bands[name]
+        if reconstructed.shape != original.shape:
+            raise ValueError(
+                f"Band {name} shape {reconstructed.shape} != original {original.shape}; "
+                "restore native dimensions before GeoTIFF export."
+            )
+        data = _cast_scientific_band(
+            original, reconstructed, dtype_mode=dtype_mode
+        )
+        # Landsat uint16 sources stay uint16 when requested; else float32.
+        if (
+            dtype_mode == "float32"
+            and original.dtype == np.uint16
+            and np.issubdtype(data.dtype, np.floating)
+        ):
+            # Still prefer float32 for lossy reconstructions (explicit default).
+            pass
+        elif dtype_mode == "source" and original.dtype == np.uint16:
+            data = _cast_scientific_band(
+                original, reconstructed, dtype_mode="source"
+            )
+
+        description = (
+            loaded.raster_descriptions[index - 1]
+            if loaded.raster_descriptions and index - 1 < len(loaded.raster_descriptions)
+            else None
+        )
+        label = landsat_band_label(
+            name,
+            description=description,
+            source_filename=source_filename,
+            band_index=index,
+        )
+        profile = _single_band_export_profile(
+            loaded,
+            height=int(data.shape[0]),
+            width=int(data.shape[1]),
+            dtype=data.dtype,
+        )
+        with MemoryFile() as memfile:
+            with memfile.open(**profile) as dataset:
+                dataset.write(data, 1)
+                dataset.set_band_description(1, description or label)
+                if loaded.raster_scales is not None and index - 1 < len(
+                    loaded.raster_scales
+                ):
+                    dataset.scales = (loaded.raster_scales[index - 1],)
+                if loaded.raster_offsets is not None and index - 1 < len(
+                    loaded.raster_offsets
+                ):
+                    dataset.offsets = (loaded.raster_offsets[index - 1],)
+                if loaded.raster_units is not None and index - 1 < len(
+                    loaded.raster_units
+                ):
+                    dataset.units = (loaded.raster_units[index - 1],)
+                if loaded.raster_mask is not None:
+                    dataset.write_mask(loaded.raster_mask)
+                if loaded.raster_gcps is not None and loaded.raster_gcps[0]:
+                    dataset.gcps = loaded.raster_gcps
+                if loaded.raster_rpcs is not None:
+                    dataset.rpcs = loaded.raster_rpcs
+                _write_raster_tags_for_band(dataset, loaded, source_band_index=index)
+                dataset.update_tags(
+                    ESMI_BAND=name,
+                    ESMI_BAND_LABEL=label,
+                    ESMI_RECONSTRUCTED="1",
+                )
+            payload = memfile.read()
+
+        crs = profile.get("crs")
+        transform = profile.get("transform")
+        artifacts.append(
+            {
+                "bytes": payload,
+                "filename": f"reconstructed_{label}.tif",
+                "mime": "image/tiff",
+                "band": name,
+                "label": label,
+                "dtype": str(np.dtype(data.dtype)),
+                "width": int(data.shape[1]),
+                "height": int(data.shape[0]),
+                "crs": str(crs) if crs else None,
+                "transform": (
+                    tuple(transform) if transform is not None else None
+                ),
+                "nodata": profile.get("nodata"),
+                "size": len(payload),
+            }
+        )
+    if not artifacts:
+        raise ValueError("No reconstructed bands available to encode as GeoTIFF")
+    return artifacts
+
+
+def encode_reconstructed_bands_zip(
+    loaded: LoadedImage,
+    reconstructed_bands: dict[str, np.ndarray],
+    *,
+    source_filename: str | None = None,
+    dtype_mode: Literal["float32", "source"] = "float32",
+) -> tuple[bytes, str, str]:
+    """Zip one GeoTIFF per band (B2–B5, …) for a single download."""
+    artifacts = encode_reconstructed_band_geotiffs(
+        loaded,
+        reconstructed_bands,
+        source_filename=source_filename,
+        dtype_mode=dtype_mode,
+    )
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in artifacts:
+            zf.writestr(item["filename"], item["bytes"])
+    return (
+        buffer.getvalue(),
+        "reconstructed_bands.zip",
+        "application/zip",
+    )
+
+
 def encode_reconstructed_image(
     loaded: LoadedImage,
     reconstructed_bands: dict[str, np.ndarray],
@@ -635,59 +980,23 @@ def encode_reconstructed_image(
     """
     Encode reconstructed pixels as a downloadable image.
 
-    GeoTIFF inputs retain their raster profile and are stored with lossless DEFLATE.
-    Other inputs are exported as lossless PNG files.
+    GeoTIFF inputs are exported as a ZIP of one single-band GeoTIFF per band
+    (CRS / transform / NoData / native dims preserved via rasterio).
+    Other inputs are exported as lossless PNG files (display only).
     """
     ordered = [reconstructed_bands[name] for name in loaded.band_order]
 
-    if loaded.source_type == "geotiff":
-        if not HAS_RASTERIO:
-            raise RuntimeError("rasterio is required to export GeoTIFF results")
-        if loaded.raster_profile is None:
-            raise ValueError("The source GeoTIFF profile is unavailable.")
-
-        profile = loaded.raster_profile.copy()
-        profile.update(
-            driver="GTiff",
-            count=len(ordered),
-            height=ordered[0].shape[0],
-            width=ordered[0].shape[1],
-            dtype=ordered[0].dtype,
-            compress="deflate",
+    if loaded.source_type == "geotiff" or loaded.raster_profile is not None:
+        # Prefer uint16 when the source was Landsat-style integer DN.
+        sample = next(iter(loaded.bands.values()))
+        dtype_mode: Literal["float32", "source"] = (
+            "source" if sample.dtype == np.uint16 else "float32"
         )
-        profile.pop("blockxsize", None)
-        profile.pop("blockysize", None)
-        profile.pop("tiled", None)
-
-        with MemoryFile() as memfile:
-            with memfile.open(**profile) as dataset:
-                dataset.write(np.stack(ordered, axis=0))
-                for index, name in enumerate(loaded.band_order, start=1):
-                    original_description = (
-                        loaded.raster_descriptions[index - 1]
-                        if loaded.raster_descriptions
-                        else None
-                    )
-                    dataset.set_band_description(
-                        index, original_description or name
-                    )
-                if loaded.raster_scales is not None:
-                    dataset.scales = loaded.raster_scales
-                if loaded.raster_offsets is not None:
-                    dataset.offsets = loaded.raster_offsets
-                if loaded.raster_units is not None:
-                    dataset.units = loaded.raster_units
-                if loaded.raster_colorinterp is not None:
-                    dataset.colorinterp = loaded.raster_colorinterp
-                if loaded.raster_mask is not None:
-                    dataset.write_mask(loaded.raster_mask)
-                if loaded.raster_gcps is not None and loaded.raster_gcps[0]:
-                    dataset.gcps = loaded.raster_gcps
-                if loaded.raster_rpcs is not None:
-                    dataset.rpcs = loaded.raster_rpcs
-                _write_raster_tags(dataset, loaded)
-            output = memfile.read()
-        return output, "compressed_image.tif", "image/tiff"
+        return encode_reconstructed_bands_zip(
+            loaded,
+            reconstructed_bands,
+            dtype_mode=dtype_mode,
+        )
 
     if len(ordered) == 1:
         array = ordered[0]
@@ -702,7 +1011,7 @@ def encode_reconstructed_image(
 
 
 def _write_raster_tags(dataset, loaded: LoadedImage) -> None:
-    """Restore dataset-level and per-band GeoTIFF tags."""
+    """Restore dataset-level and per-band GeoTIFF tags (multi-band write)."""
     for namespace, tags in (loaded.raster_dataset_tags or {}).items():
         if namespace:
             dataset.update_tags(ns=namespace, **tags)
@@ -714,3 +1023,27 @@ def _write_raster_tags(dataset, loaded: LoadedImage) -> None:
                 dataset.update_tags(band_index, ns=namespace, **tags)
             else:
                 dataset.update_tags(band_index, **tags)
+
+
+def _write_raster_tags_for_band(
+    dataset,
+    loaded: LoadedImage,
+    *,
+    source_band_index: int,
+) -> None:
+    """Restore dataset tags + tags for one source band onto export band 1."""
+    for namespace, tags in (loaded.raster_dataset_tags or {}).items():
+        if namespace:
+            dataset.update_tags(ns=namespace, **tags)
+        else:
+            dataset.update_tags(**tags)
+    if not loaded.raster_band_tags:
+        return
+    if source_band_index < 1 or source_band_index > len(loaded.raster_band_tags):
+        return
+    tag_groups = loaded.raster_band_tags[source_band_index - 1]
+    for namespace, tags in tag_groups.items():
+        if namespace:
+            dataset.update_tags(1, ns=namespace, **tags)
+        else:
+            dataset.update_tags(1, **tags)

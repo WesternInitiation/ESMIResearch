@@ -5,40 +5,23 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
-from PIL import Image
 
 from compression.lzw import run_lzw_compression
+from image_io import downsample_bands_rasterio, resize_bands_rasterio
 
 
 def downsample_bands(bands: dict[str, np.ndarray], max_dim: int) -> tuple[dict[str, np.ndarray], float]:
-    sample = next(iter(bands.values()))
-    height, width = sample.shape[:2]
-    longest = max(height, width)
-    if max_dim <= 0 or longest <= max_dim:
-        return bands, 1.0
-    scale = max_dim / float(longest)
-    new_w = max(1, int(round(width * scale)))
-    new_h = max(1, int(round(height * scale)))
-    out: dict[str, np.ndarray] = {}
-    for name, band in bands.items():
-        image = Image.fromarray(band.astype(np.float32), mode="F")
-        resized = image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
-        out[name] = np.asarray(resized, dtype=band.dtype)
-    return out, scale
+    return downsample_bands_rasterio(bands, max_dim)
 
 
 def upsample_bands(
     bands: dict[str, np.ndarray], target_width: int, target_height: int
 ) -> dict[str, np.ndarray]:
-    out: dict[str, np.ndarray] = {}
-    for name, band in bands.items():
-        image = Image.fromarray(band.astype(np.float32), mode="F")
-        resized = image.resize(
-            (target_width, target_height),
-            resample=Image.Resampling.BILINEAR,
-        )
-        out[name] = np.asarray(resized, dtype=band.dtype)
-    return out
+    sample = next(iter(bands.values()))
+    height, width = int(sample.shape[0]), int(sample.shape[1])
+    if width == target_width and height == target_height:
+        return bands
+    return resize_bands_rasterio(bands, target_height, target_width)
 
 
 def run_with_restore(bands: dict[str, np.ndarray], max_dim: int):
@@ -78,8 +61,8 @@ class NativeRestoreTests(unittest.TestCase):
         # Regression: legacy code did max(64, max_dim), turning Native into 64px.
         band = np.ones((200, 300), dtype=np.float64)
         _, native, process, restored = run_with_restore({"gray": band}, 0)
-        self.assertEqual(process, native)
-        self.assertNotEqual(process[0], 64)
+        self.assertEqual(native, (300, 200))
+        self.assertEqual(process, (300, 200))
         self.assertFalse(restored)
 
 

@@ -234,12 +234,13 @@ class ArchiveImageTests(unittest.TestCase):
             "dtype": "uint16",
             "crs": "EPSG:4326",
             "transform": transform,
+            "nodata": 0,
         }
         with MemoryFile() as memfile:
             with memfile.open(**profile) as dataset:
                 dataset.write(np.ones((2, 8, 8), dtype=np.uint16))
                 dataset.set_band_description(1, "B4")
-                dataset.set_band_description(2, "B8")
+                dataset.set_band_description(2, "B5")
                 dataset.scales = (0.01, 0.02)
                 dataset.offsets = (1.0, 2.0)
                 dataset.units = ("reflectance", "reflectance")
@@ -259,21 +260,40 @@ class ArchiveImageTests(unittest.TestCase):
         )
 
         self.assertEqual(loaded.band_order, ["red", "nir"])
-        self.assertEqual(filename, "compressed_image.tif")
-        self.assertEqual(mime, "image/tiff")
-        with MemoryFile(output) as memfile:
-            with memfile.open() as dataset:
-                self.assertEqual(dataset.count, 2)
-                self.assertEqual(dataset.crs.to_string(), "EPSG:4326")
-                self.assertEqual(dataset.transform, transform)
-                self.assertEqual(dataset.compression.name.lower(), "deflate")
-                self.assertEqual(dataset.descriptions, ("B4", "B8"))
-                self.assertEqual(dataset.scales, (0.01, 0.02))
-                self.assertEqual(dataset.offsets, (1.0, 2.0))
-                self.assertEqual(dataset.units, ("reflectance", "reflectance"))
-                self.assertEqual(dataset.tags()["PRODUCT"], "test-scene")
-                self.assertEqual(dataset.tags(1)["BAND_ROLE"], "red")
-                self.assertEqual(dataset.dataset_mask()[0, 0], 0)
+        self.assertEqual(filename, "reconstructed_bands.zip")
+        self.assertEqual(mime, "application/zip")
+        with zipfile.ZipFile(io.BytesIO(output)) as zf:
+            names = sorted(zf.namelist())
+            self.assertEqual(names, ["reconstructed_B4.tif", "reconstructed_B5.tif"])
+            for entry, expected_desc, expected_scale, expected_offset in (
+                ("reconstructed_B4.tif", "B4", 0.01, 1.0),
+                ("reconstructed_B5.tif", "B5", 0.02, 2.0),
+            ):
+                with MemoryFile(zf.read(entry)) as memfile:
+                    with memfile.open() as dataset:
+                        self.assertEqual(dataset.count, 1)
+                        self.assertEqual(dataset.width, 8)
+                        self.assertEqual(dataset.height, 8)
+                        self.assertEqual(dataset.crs.to_string(), "EPSG:4326")
+                        self.assertEqual(dataset.transform, transform)
+                        self.assertEqual(dataset.nodata, 0)
+                        self.assertEqual(dataset.dtypes[0], "uint16")
+                        self.assertEqual(dataset.compression.name.lower(), "deflate")
+                        self.assertEqual(dataset.descriptions, (expected_desc,))
+                        self.assertEqual(dataset.scales, (expected_scale,))
+                        self.assertEqual(dataset.offsets, (expected_offset,))
+                        self.assertEqual(dataset.units, ("reflectance",))
+                        self.assertEqual(dataset.tags()["PRODUCT"], "test-scene")
+                        self.assertEqual(dataset.dataset_mask()[0, 0], 0)
+
+    @unittest.skipUnless(HAS_RASTERIO, "rasterio is not installed")
+    def test_rasterio_resize_changes_shape_not_pil(self) -> None:
+        from image_io import resize_band_rasterio
+
+        band = np.arange(100, dtype=np.float32).reshape(10, 10)
+        out = resize_band_rasterio(band, 5, 5)
+        self.assertEqual(out.shape, (5, 5))
+        self.assertEqual(out.dtype, np.float32)
 
 
 if __name__ == "__main__":

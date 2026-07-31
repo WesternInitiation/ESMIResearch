@@ -1,5 +1,22 @@
 import { readJsonResponse } from '@/lib/httpJson'
 
+export type ReconstructedBandGeotiff = {
+  band: string
+  label: string
+  filename: string
+  gcsUri: string
+  bucket?: string
+  objectName?: string
+  size: number
+  dtype: string
+  width: number
+  height: number
+  crs?: string | null
+  transform?: number[] | null
+  nodata?: number | null
+  method?: string
+}
+
 export type ServerCompressResponse = {
   engine: string
   method: string
@@ -33,6 +50,9 @@ export type ServerCompressResponse = {
   originalPreviewPngBase64: string
   previewPngBase64: string
   residualPreviewPngBase64?: string | null
+  /** One rasterio GeoTIFF per band (CRS/transform/NoData), staged in GCS. */
+  reconstructedBandGeotiffs?: ReconstructedBandGeotiff[]
+  geotiffError?: string | null
 }
 
 /** Soft limit for multipart bodies through the Vercel /api/compress proxy. */

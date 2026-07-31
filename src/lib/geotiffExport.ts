@@ -16,6 +16,50 @@ function downloadBlob(blob: Blob, filename: string) {
   }, 2500)
 }
 
+/** Download staged Cloud Run GeoTIFF band files (rasterio, geospatial). */
+export async function downloadReconstructedBandGeotiffs(
+  artifacts: Array<{ gcsUri: string; filename: string; label?: string }>,
+): Promise<string[]> {
+  if (!artifacts.length) {
+    throw new Error('No reconstructed GeoTIFF bands available')
+  }
+  const res = await fetch('/api/results/sign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      gcsUris: artifacts.map((a) => a.gcsUri),
+    }),
+  })
+  const data = (await res.json()) as {
+    error?: string
+    downloads?: Array<{ downloadUrl: string; filename: string; gcsUri: string }>
+  }
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to sign GeoTIFF download URLs')
+  }
+  const downloads = data.downloads || []
+  if (!downloads.length) {
+    throw new Error('No signed download URLs returned')
+  }
+  const saved: string[] = []
+  for (const item of downloads) {
+    const fileRes = await fetch(item.downloadUrl)
+    if (!fileRes.ok) {
+      throw new Error(
+        `Failed to download ${item.filename} (HTTP ${fileRes.status})`,
+      )
+    }
+    const blob = await fileRes.blob()
+    const match = artifacts.find((a) => a.gcsUri === item.gcsUri)
+    const filename = match?.filename || item.filename || 'reconstructed.tif'
+    downloadBlob(blob, filename)
+    saved.push(filename)
+    // Stagger slightly so multiple browsers downloads don't collide.
+    await new Promise((r) => window.setTimeout(r, 350))
+  }
+  return saved
+}
+
 function downloadArrayBuffer(buffer: ArrayBuffer, filename: string, mime: string) {
   downloadBlob(new Blob([buffer], { type: mime }), filename)
 }

@@ -203,3 +203,66 @@ export async function createGcsSignedUpload(input: {
     expiresAt: new Date(expires).toISOString(),
   }
 }
+
+function parseGcsUri(uri: string): { bucket: string; objectName: string } {
+  const trimmed = uri.trim()
+  if (!trimmed.startsWith('gs://')) {
+    throw new Error('gcsUri must start with gs://')
+  }
+  const rest = trimmed.slice(5)
+  const slash = rest.indexOf('/')
+  if (slash <= 0 || slash === rest.length - 1) {
+    throw new Error('Invalid gcsUri')
+  }
+  return {
+    bucket: rest.slice(0, slash),
+    objectName: rest.slice(slash + 1),
+  }
+}
+
+/**
+ * Sign a short-lived read URL for a staged result object (reconstructed GeoTIFFs).
+ * Only allows objects under uploads/ or results/ in the configured upload bucket
+ * (or the same project staging bucket named in the URI).
+ */
+export async function createGcsSignedDownload(input: {
+  gcsUri: string
+  expiresMs?: number
+}): Promise<{
+  downloadUrl: string
+  gcsUri: string
+  filename: string
+  expiresAt: string
+}> {
+  const { bucket, objectName } = parseGcsUri(input.gcsUri)
+  const uploadBucket = gcsUploadBucket()
+  if (uploadBucket && bucket !== uploadBucket) {
+    throw new Error(
+      `Download signing is limited to bucket ${uploadBucket} (got gs://${bucket}/…)`,
+    )
+  }
+  if (
+    !objectName.startsWith('results/') &&
+    !objectName.startsWith('uploads/') &&
+    !objectName.startsWith('demo-extracts/')
+  ) {
+    throw new Error(
+      'Download signing is limited to results/, uploads/, or demo-extracts/ objects',
+    )
+  }
+  const expires = Date.now() + (input.expiresMs ?? 60 * 60 * 1000)
+  const storage = storageClient()
+  const file = storage.bucket(bucket).file(objectName)
+  const [downloadUrl] = await file.getSignedUrl({
+    version: 'v4',
+    action: 'read',
+    expires,
+  })
+  const filename = objectName.split('/').pop() || 'download.tif'
+  return {
+    downloadUrl,
+    gcsUri: input.gcsUri,
+    filename,
+    expiresAt: new Date(expires).toISOString(),
+  }
+}
