@@ -20,8 +20,14 @@ gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregi
 
 IMAGE="gcr.io/${PROJECT_ID}/esmi-compress"
 
-echo "Building ${IMAGE} …"
-gcloud builds submit --config cloudbuild.yaml --substitutions=COMMIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo manual)"
+COMMIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo manual)"
+echo "Building ${IMAGE} from commit ${COMMIT_SHA} …"
+# Ensure local tree includes LZW / latest methods before shipping the image.
+if ! grep -q '"LZW"' cloud_run/main.py; then
+  echo "error: cloud_run/main.py has no LZW — run 'git pull origin main' and redeploy." >&2
+  exit 1
+fi
+gcloud builds submit --config cloudbuild.yaml --substitutions=COMMIT_SHA="${COMMIT_SHA}"
 
 echo "Deploying Cloud Run service esmi-compress …"
 gcloud run deploy esmi-compress \
@@ -33,7 +39,7 @@ gcloud run deploy esmi-compress \
   --cpu 1 \
   --timeout 600 \
   --max-instances 3 \
-  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,GCS_UPLOAD_BUCKET=${GCS_BUCKET},GCS_DEMO_BUCKET=esmi-research-demo-data"
+  --set-env-vars "CORS_ORIGINS=*,DEFAULT_MAX_DIM=1024,MAX_UPLOAD_BYTES=2147483648,DELETE_GCS_AFTER_JOB=1,GCS_UPLOAD_BUCKET=${GCS_BUCKET},GCS_DEMO_BUCKET=esmi-research-demo-data,COMMIT_SHA=${COMMIT_SHA}"
 
 URL="$(gcloud run services describe esmi-compress --region "${REGION}" --format='value(status.url)')"
 echo ""

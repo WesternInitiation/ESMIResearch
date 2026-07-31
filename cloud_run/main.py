@@ -77,12 +77,23 @@ DELETE_GCS_AFTER_JOB = os.environ.get("DELETE_GCS_AFTER_JOB", "1").strip() not i
 )
 
 
+SUPPORTED_METHODS: tuple[str, ...] = (
+    "SVD",
+    "Wavelet transformation",
+    "Bandwidth transformation",
+    "JPEG2000",
+    "LZW",
+)
+
+
 @app.get("/health")
-def health() -> dict[str, str | bool]:
+def health() -> dict[str, object]:
     return {
         "status": "ok",
         "service": "esmi-compress",
         "gcs": True,
+        "methods": list(SUPPORTED_METHODS),
+        "commit": os.environ.get("COMMIT_SHA", "").strip() or None,
     }
 
 
@@ -484,13 +495,7 @@ async def compress(
     red_band: str | None = Form(None),
     nir_band: str | None = Form(None),
 ) -> JSONResponse:
-    if method not in (
-        "SVD",
-        "Wavelet transformation",
-        "Bandwidth transformation",
-        "JPEG2000",
-        "LZW",
-    ):
+    if method not in SUPPORTED_METHODS:
         raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
 
     gcs_blob: Any = None
