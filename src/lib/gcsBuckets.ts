@@ -5,6 +5,26 @@ import {
   storageClientForDemo,
 } from '@/lib/gcs'
 
+/**
+ * GCP / tooling buckets that are not imagery catalogs. The lab lists every
+ * project bucket when GCS_ALLOWED_BUCKETS is unset; without this filter,
+ * picking e.g. `{project}_cloudbuild` tries to open Cloud Build source
+ * .tar.gz archives (app code) and fails with "archive does not contain a
+ * supported image".
+ */
+export function isNonImagerySystemBucket(name: string): boolean {
+  const n = name.trim().toLowerCase()
+  if (!n) return true
+  if (n.endsWith('_cloudbuild')) return true
+  if (n.endsWith('.appspot.com')) return true
+  if (n.startsWith('artifacts.') && n.endsWith('.appspot.com')) return true
+  if (n.includes('cloudbuild-logs')) return true
+  if (n.startsWith('gcf-sources-')) return true
+  if (n.startsWith('gcf-v2-')) return true
+  if (n.startsWith('run-sources-')) return true
+  return false
+}
+
 /** Buckets the Vercel SA may browse for demo/data loading. */
 export function allowedGcsBuckets(): string[] {
   const raw = process.env.GCS_ALLOWED_BUCKETS?.trim()
@@ -22,6 +42,12 @@ export function assertBucketAllowed(bucket: string): string {
   if (!name) throw new Error('bucket is required')
   if (!/^[a-z0-9][a-z0-9._-]{1,220}$/i.test(name)) {
     throw new Error(`Invalid GCS bucket name: ${name}`)
+  }
+  if (isNonImagerySystemBucket(name)) {
+    throw new Error(
+      `Bucket "${name}" is a GCP system/build bucket (not imagery). ` +
+        `Use a demo/data bucket such as ${gcsDemoBucket()}.`,
+    )
   }
   if (process.env.GCS_ALLOWED_BUCKETS?.trim()) {
     const allow = allowedGcsBuckets()
@@ -49,6 +75,7 @@ export async function listProjectBuckets(): Promise<{
   if (process.env.GCS_ALLOWED_BUCKETS?.trim()) {
     const buckets: Array<{ name: string; location?: string }> = []
     for (const name of allow) {
+      if (isNonImagerySystemBucket(name)) continue
       try {
         const [meta] = await storage.bucket(name).getMetadata()
         buckets.push({
@@ -70,6 +97,7 @@ export async function listProjectBuckets(): Promise<{
         location:
           typeof b.metadata?.location === 'string' ? b.metadata.location : undefined,
       }))
+      .filter((b) => !isNonImagerySystemBucket(b.name))
       .sort((a, b) => a.name.localeCompare(b.name))
     return {
       buckets: buckets.length ? buckets : allow.map((name) => ({ name })),
