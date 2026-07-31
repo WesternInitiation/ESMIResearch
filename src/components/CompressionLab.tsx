@@ -14,6 +14,7 @@ import {
   bandsToCompressedArtifactPreview,
   bandsToDecompressedPreview,
   dataUrlToJpegDataUrl,
+  residualPreviewFromDataUrls,
   residualPreviewRgba,
   rgbaToPngDataUrl,
 } from '@/lib/preview'
@@ -1069,9 +1070,8 @@ export default function CompressionLab() {
             gcsUploads,
             onProgress: (message) => setStatus(message),
           })
-          setServerOriginalPreview(
-            `data:image/png;base64,${out.originalPreviewPngBase64}`,
-          )
+          const originalPreview = `data:image/png;base64,${out.originalPreviewPngBase64}`
+          setServerOriginalPreview(originalPreview)
           const decompressed = `data:image/png;base64,${out.previewPngBase64}`
           setDecompressedPreview(decompressed)
           try {
@@ -1083,7 +1083,16 @@ export default function CompressionLab() {
           } catch {
             setCompressedArtifactPreview(decompressed)
           }
-          setResidualPreview(null)
+          // Cloud Run returns display PNGs, not float bands — residual from previews.
+          try {
+            const residual = await residualPreviewFromDataUrls(
+              originalPreview,
+              decompressed,
+            )
+            setResidualPreview(residual)
+          } catch {
+            setResidualPreview(null)
+          }
           setIndexMetrics(null)
           setResult({
             method: out.method,
@@ -1176,8 +1185,7 @@ export default function CompressionLab() {
     if (!image) return
     setError(null)
     setBusy(true)
-    // Keep prior Run previews/downloads; only clear the residual (method-specific).
-    setResidualPreview(null)
+    // Keep prior Run previews/downloads/residual while the comparison table updates.
 
     const useCloudRun =
       engine === 'cloud-run' && !isMultiMemberStack(image) && Boolean(rawFile)
@@ -2213,7 +2221,11 @@ export default function CompressionLab() {
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={residualPreview} alt="Compression residual map" />
               ) : (
-                <div className="empty">Waiting for residual map</div>
+                <div className="empty">
+                  {result
+                    ? 'Residual unavailable for this run (could not compare original vs decompressed pixels).'
+                    : 'Waiting for residual map — run compression first.'}
+                </div>
               )}
             </div>
           </section>
