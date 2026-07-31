@@ -190,8 +190,6 @@ const DEFAULT_PARAMS: MethodParams = {
   jpegRate: 0.45,
 }
 
-const PROCESS_DIM_OPTIONS_BROWSER = [0, 512, 768, 1024, 1536, 2048, 3072, 4096] as const
-const PROCESS_DIM_OPTIONS_SERVER = [0, 1024, 1536, 2048, 3072, 4096, 6144, 8192] as const
 /** On-screen Original / Compressed / Decompressed previews only — never the codec size. */
 const PREVIEW_MAX_DIM = 1024
 
