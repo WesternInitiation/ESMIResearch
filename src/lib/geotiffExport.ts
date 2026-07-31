@@ -240,10 +240,14 @@ export async function downloadBandsAsGeoTiff(
 /**
  * Decode a PNG/JPEG data URL and write an 8-bit RGB GeoTIFF.
  * Used when Cloud Run results have no in-browser band arrays.
+ * Optional targetWidth/Height upscales the display preview to native size
+ * so downloads match the original raster dimensions.
  */
 export async function downloadRgbPreviewAsGeoTiff(
   dataUrl: string,
   filename: string,
+  targetWidth?: number,
+  targetHeight?: number,
 ): Promise<void> {
   const img = await new Promise<HTMLImageElement>((resolve, reject) => {
     const el = new Image()
@@ -251,15 +255,24 @@ export async function downloadRgbPreviewAsGeoTiff(
     el.onerror = () => reject(new Error('Failed to decode preview for GeoTIFF export'))
     el.src = dataUrl
   })
-  const width = assertPositiveInt('preview width', img.naturalWidth || img.width)
-  const height = assertPositiveInt('preview height', img.naturalHeight || img.height)
+  const srcW = assertPositiveInt('preview width', img.naturalWidth || img.width)
+  const srcH = assertPositiveInt('preview height', img.naturalHeight || img.height)
+  const width =
+    targetWidth && targetWidth > 0
+      ? assertPositiveInt('target width', targetWidth)
+      : srcW
+  const height =
+    targetHeight && targetHeight > 0
+      ? assertPositiveInt('target height', targetHeight)
+      : srcH
 
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
   if (!ctx) throw new Error('Could not create canvas context')
-  ctx.drawImage(img, 0, 0)
+  ctx.imageSmoothingEnabled = true
+  ctx.drawImage(img, 0, 0, width, height)
   const rgba = ctx.getImageData(0, 0, width, height).data
   const n = width * height
   const r = new Uint8Array(n)

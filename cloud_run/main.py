@@ -157,8 +157,8 @@ def _upsample_bands(
     return out
 
 
-def _preview_rgb_capped(bands: dict[str, np.ndarray], band_order: list[str], max_side: int = 2048) -> np.ndarray:
-    """Display RGB, capped so Cloud Run JSON responses stay transportable."""
+def _preview_rgb_capped(bands: dict[str, np.ndarray], band_order: list[str], max_side: int = 1024) -> np.ndarray:
+    """Display RGB only — codecs keep native size; previews stay small for the UI."""
     rgb = to_display_rgb(bands, band_order)
     h, w = rgb.shape[:2]
     longest = max(h, w)

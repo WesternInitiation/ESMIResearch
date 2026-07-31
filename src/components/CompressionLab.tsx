@@ -192,6 +192,8 @@ const DEFAULT_PARAMS: MethodParams = {
 
 const PROCESS_DIM_OPTIONS_BROWSER = [0, 512, 768, 1024, 1536, 2048, 3072, 4096] as const
 const PROCESS_DIM_OPTIONS_SERVER = [0, 1024, 1536, 2048, 3072, 4096, 6144, 8192] as const
+/** On-screen Original / Compressed / Decompressed previews only — never the codec size. */
+const PREVIEW_MAX_DIM = 1024
 
 type Engine = 'browser' | 'cloud-run'
 
@@ -212,13 +214,13 @@ function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
     nativeHeight,
     maxDim,
   )
-  // Cap the on-screen preview independently so Native 8k scenes stay interactive.
+  // Display preview is always capped; process/native bands stay full size for codecs.
   const previewSource = downsampleBands(
     resized.bands,
     loaded.bandOrder,
     resized.width,
     resized.height,
-    2048,
+    PREVIEW_MAX_DIM,
   )
   return {
     ...loaded,
@@ -307,7 +309,8 @@ export default function CompressionLab() {
   const [pairMode, setPairMode] = useState(false)
   const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
   // 0 = native resolution (no downsampling). Prefer this for fair comparisons.
-  const [maxProcessDim, setMaxProcessDim] = useState<number>(1024)
+  // Default Native so codecs/downloads stay full resolution; previews stay 1024px.
+  const [maxProcessDim, setMaxProcessDim] = useState<number>(0)
   const [engine, setEngine] = useState<Engine>('cloud-run')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
@@ -356,8 +359,7 @@ export default function CompressionLab() {
   const originalPreview = useMemo(() => {
     if (serverOriginalPreview) return serverOriginalPreview
     if (!image) return null
-    // previewRgba may be capped (e.g. 2048) while process size is native — never
-    // invent a canvas larger than the buffer or the tab will crash.
+    // previewRgba is always capped (PREVIEW_MAX_DIM) while codecs use native/process size.
     const pw = image.previewWidth || image.size.width
     const ph = image.previewHeight || image.size.height
     const expected = pw * ph * 4
@@ -406,8 +408,8 @@ export default function CompressionLab() {
     out: CompressionResult,
     source: WorkingImage,
   ) {
-    // Downloads keep full native bands on `out`; on-screen previews are capped.
-    const previewMax = 2048
+    // Downloads keep full native bands on `out`; on-screen previews are 1024px.
+    const previewMax = PREVIEW_MAX_DIM
     const reconPrev = downsampleBands(
       out.bands,
       out.bandOrder,
@@ -1695,7 +1697,7 @@ export default function CompressionLab() {
     setError(null)
     try {
       const filename = `esmi-decompressed-${Date.now()}.tif`
-      // Prefer real reconstructed bands when present; otherwise encode the preview.
+      // Prefer real reconstructed bands (native) when present.
       if (hasBands && result) {
         await downloadBandsAsGeoTiff(
           result.bands,
@@ -1705,7 +1707,14 @@ export default function CompressionLab() {
           filename,
         )
       } else if (decompressedPreview) {
-        await downloadRgbPreviewAsGeoTiff(decompressedPreview, filename)
+        const tw = result?.width || image?.nativeWidth
+        const th = result?.height || image?.nativeHeight
+        await downloadRgbPreviewAsGeoTiff(
+          decompressedPreview,
+          filename,
+          tw,
+          th,
+        )
       } else {
         throw new Error('No decompressed image available to download')
       }
@@ -1731,10 +1740,8 @@ export default function CompressionLab() {
     setError(null)
     try {
       const filename = `esmi-compressed-${Date.now()}.tif`
-      // Preview-based RGB GeoTIFF is the most reliable path for "compressed" artifact.
-      if (compressedArtifactPreview) {
-        await downloadRgbPreviewAsGeoTiff(compressedArtifactPreview, filename)
-      } else if (hasBands && result) {
+      if (hasBands && result) {
+        // Native float bands → JPEG stand-in at native size for the "compressed" product.
         const compressedBands = await jpegRoundtripBands(
           result.bands,
           result.bandOrder,
@@ -1748,6 +1755,15 @@ export default function CompressionLab() {
           result.width,
           result.height,
           filename,
+        )
+      } else if (compressedArtifactPreview) {
+        const tw = result?.width || image?.nativeWidth
+        const th = result?.height || image?.nativeHeight
+        await downloadRgbPreviewAsGeoTiff(
+          compressedArtifactPreview,
+          filename,
+          tw,
+          th,
         )
       } else {
         throw new Error('No compressed image available to download')
@@ -1991,7 +2007,7 @@ export default function CompressionLab() {
           )}
 
           <label>
-            Max processing size (Native keeps original resolution)
+            Max processing size (codecs; Native = full resolution)
             <select
               value={maxProcessDim}
               disabled={busy}
@@ -2232,10 +2248,11 @@ export default function CompressionLab() {
             <h2>Preview</h2>
             {image && (
               <p className="hint size-meta-line">
-                Processing {pixelsLabel(image.size.width, image.size.height)}
+                Native {pixelsLabel(image.nativeWidth, image.nativeHeight)}
                 {image.processScale < 0.999
-                  ? ` · native ${pixelsLabel(image.nativeWidth, image.nativeHeight)}`
-                  : ''}
+                  ? ` · compressing at ${pixelsLabel(image.size.width, image.size.height)}`
+                  : ' · compressing at native'}
+                {` · preview ≤${PREVIEW_MAX_DIM}px`}
                 {groundResolutionLabel(image.groundResolution)
                   ? ` · ${groundResolutionLabel(image.groundResolution)}`
                   : ''}
@@ -2253,13 +2270,10 @@ export default function CompressionLab() {
                       {image
                         ? sizeWithPixels(
                             image.originalBytes,
-                            image.size.width,
-                            image.size.height,
+                            image.nativeWidth,
+                            image.nativeHeight,
                           )
                         : '—'}
-                      {image?.processScale != null && image.processScale < 0.999
-                        ? ` · native ${Math.round(image.nativeWidth)}×${Math.round(image.nativeHeight)} px`
-                        : ''}
                     </p>
                   </>
                 ) : (
@@ -2285,7 +2299,7 @@ export default function CompressionLab() {
                             result.height,
                           )
                         : image
-                          ? `${pixelsLabel(image.size.width, image.size.height)}`
+                          ? `${pixelsLabel(image.nativeWidth, image.nativeHeight)}`
                           : '—'}
                     </p>
                     <button
@@ -2320,7 +2334,7 @@ export default function CompressionLab() {
                             result.height,
                           )
                         : image
-                          ? `${pixelsLabel(image.size.width, image.size.height)}`
+                          ? `${pixelsLabel(image.nativeWidth, image.nativeHeight)}`
                           : '—'}
                     </p>
                     <button
