@@ -32,7 +32,7 @@ export async function readJsonResponse<T = Record<string, unknown>>(
     ) {
       throw new Error(
         `${label} timed out (HTTP ${res.status}, FUNCTION_INVOCATION_TIMEOUT). ` +
-          `Vercel’s proxy limit is ~5 minutes. Redeploy Cloud Run for async jobs, ` +
+          `Vercel’s proxy limit is ~10 minutes. Prefer async Cloud Run jobs, ` +
           `or lower Max processing size to 2048/1024.`,
       )
     }

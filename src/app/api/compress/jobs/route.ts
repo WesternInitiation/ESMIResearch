@@ -12,7 +12,7 @@ function apiBase(): string | null {
 }
 
 /**
- * Start an async Cloud Run compress job (avoids Vercel 300s FUNCTION_INVOCATION_TIMEOUT).
+ * Start an async Cloud Run compress job (avoids long Vercel proxy waits).
  */
 export async function POST(request: NextRequest) {
   const base = apiBase()

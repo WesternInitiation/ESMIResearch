@@ -374,7 +374,7 @@ export async function runServerCompression(input: {
       progress: 15,
       phase: 'sync',
       message:
-        'Async jobs unavailable on this Cloud Run image — using sync compress (may hit Vercel 5‑minute limit). Redeploy Cloud Run for progress + long jobs.',
+        'Async jobs unavailable on this Cloud Run image — using sync compress (Vercel proxy allows ~10 minutes). Redeploy Cloud Run for progress + long jobs.',
     })
     const res = await fetch('/api/compress', { method: 'POST', body: buildForm() })
     const data = await readJsonResponse<{
@@ -391,7 +391,7 @@ export async function runServerCompression(input: {
             : data.error || 'Cloud Run compression failed'
       if (/FUNCTION_INVOCATION_TIMEOUT|504/i.test(message) || res.status === 504) {
         throw new Error(
-          'Vercel timed out after ~5 minutes while waiting on Cloud Run (FUNCTION_INVOCATION_TIMEOUT). ' +
+          'Vercel timed out while waiting on Cloud Run (FUNCTION_INVOCATION_TIMEOUT). ' +
             'Redeploy Cloud Run for async jobs, or lower Max processing size to 2048/1024.',
         )
       }
