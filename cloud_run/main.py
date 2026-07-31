@@ -99,6 +99,12 @@ def health() -> dict[str, object]:
         "gcs": True,
         "methods": list(SUPPORTED_METHODS),
         "commit": os.environ.get("COMMIT_SHA", "").strip() or None,
+        # Feature flags so deploys are easy to verify from /api/compress.
+        "features": {
+            "lzw": True,
+            "nativeRestore": True,  # max_dim<=0 keeps native; else upsample back
+            "methods": list(SUPPORTED_METHODS),
+        },
     }
 
 
@@ -254,6 +260,8 @@ def _run_method(
             keep_fraction=float(np.clip(bandwidth_keep_fraction, 0.001, 1.0)),
         )
     if method == "LZW":
+        # Same sizing path as every other method: caller may have downsampled
+        # `bands`; compress/decompress here, then caller upsamples back to native.
         return run_lzw_compression(bands)
     if method != "JPEG2000":
         raise ValueError(f"Unknown method: {method}")
