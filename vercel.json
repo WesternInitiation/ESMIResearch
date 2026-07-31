@@ -11,6 +11,12 @@
     },
     "src/app/api/compress/route.ts": {
       "maxDuration": 300
+    },
+    "src/app/api/compress/jobs/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/compress/jobs/[id]/route.ts": {
+      "maxDuration": 30
     }
   }
 }

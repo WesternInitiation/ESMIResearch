@@ -1247,6 +1247,22 @@ def _run_compress_job(
                 "updatedAt": time.time(),
             },
         )
+    except HTTPException as exc:
+        detail = exc.detail
+        message = detail if isinstance(detail, str) else str(detail)
+        _write_job_status(
+            job_id,
+            {
+                "jobId": job_id,
+                "status": "error",
+                "progress": 100,
+                "phase": "error",
+                "message": message,
+                "error": message,
+                "method": params.get("method"),
+                "updatedAt": time.time(),
+            },
+        )
     except Exception as exc:
         _write_job_status(
             job_id,
