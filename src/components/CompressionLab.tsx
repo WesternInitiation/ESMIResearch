@@ -702,6 +702,27 @@ export default function CompressionLab() {
     setStatus('Image ready')
   }
 
+  const cloudRunSourceReady = Boolean(
+    sourceGcsUri ||
+      rawFile ||
+      (archive?.buffer && archiveMember && !archiveMember.includes(' + ')),
+  )
+  const canRunCompression =
+    Boolean(image) &&
+    !busy &&
+    (engine !== 'cloud-run' ||
+      isMultiMemberStack(image) ||
+      cloudRunSourceReady)
+  const runDisabledReason = !image
+    ? 'Select and finish loading an image first'
+    : busy
+      ? 'Wait for the current load/job to finish'
+      : engine === 'cloud-run' &&
+          !isMultiMemberStack(image) &&
+          !cloudRunSourceReady
+        ? 'Image bands are loaded, but file bytes are missing for Cloud Run — re-select the image'
+        : undefined
+
   async function loadArchiveNdviPair(redMember: string, nirMember: string) {
     if (!archive) return
     if (!redMember || !nirMember) {
@@ -1055,7 +1076,21 @@ export default function CompressionLab() {
         )
       } else {
         const loaded = await loadArchiveMemberImage(archive, member)
-        await applyLoaded(loaded, rawFile, null)
+        // Prefer extracted member bytes so Cloud Run can run without re-reading the TAR.
+        let memberFile: File | null = null
+        if (archive.buffer) {
+          const { bytes, memberFilename } = extractArchiveMember(
+            archive.buffer,
+            archive.archiveName,
+            member,
+          )
+          memberFile = new File([new Uint8Array(bytes)], memberFilename, {
+            type: 'application/octet-stream',
+          })
+        } else {
+          memberFile = rawFile
+        }
+        await applyLoaded(loaded, memberFile, null)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load archive member')
@@ -2238,7 +2273,12 @@ export default function CompressionLab() {
           )}
 
           <div className="actions">
-            <button type="button" disabled={!image || (!rawFile && !sourceGcsUri) || busy} onClick={() => void onRun()}>
+            <button
+              type="button"
+              disabled={!canRunCompression}
+              title={runDisabledReason}
+              onClick={() => void onRun()}
+            >
               {busy
                 ? 'Working…'
                 : engine === 'cloud-run' && !isMultiMemberStack(image)
@@ -2248,13 +2288,14 @@ export default function CompressionLab() {
             <button
               type="button"
               className="secondary"
-              disabled={!image || busy || (engine === 'cloud-run' && !rawFile && !sourceGcsUri)}
-              onClick={() => void onCompareAll()}
+              disabled={!canRunCompression}
               title={
-                engine === 'cloud-run'
+                runDisabledReason ||
+                (engine === 'cloud-run'
                   ? 'Runs all methods on Cloud Run'
-                  : 'Runs all methods in the browser worker'
+                  : 'Runs all methods in the browser worker')
               }
+              onClick={() => void onCompareAll()}
             >
               Compare all methods
             </button>

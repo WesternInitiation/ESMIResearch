@@ -94,7 +94,7 @@ export async function fetchDemoCatalog(
 export type DemoMemberFetchResult = {
   file: File
   /** Staged gs:// URI in GCS_UPLOAD_BUCKET for Cloud Run (skips browser re-upload). */
-  gcsUri: string
+  gcsUri: string | null
   size: number
 }
 
@@ -142,9 +142,6 @@ export async function fetchDemoMemberFile(input: {
   if (!data.downloadUrl) {
     throw new Error('Demo prepare returned no download URL')
   }
-  if (!data.gcsUri || !data.gcsUri.startsWith('gs://')) {
-    throw new Error('Demo prepare returned no staged gcsUri for Cloud Run')
-  }
 
   input.onProgress?.(
     `Downloading preview of ${data.filename || label}${
@@ -163,11 +160,15 @@ export async function fetchDemoMemberFile(input: {
   }
   const blob = await fileRes.blob()
   const filename = data.filename || label
+  const gcsUri =
+    typeof data.gcsUri === 'string' && data.gcsUri.startsWith('gs://')
+      ? data.gcsUri
+      : null
   return {
     file: new File([blob], filename, {
       type: blob.type || 'application/octet-stream',
     }),
-    gcsUri: data.gcsUri,
+    gcsUri,
     size: Number(data.size || blob.size),
   }
 }
