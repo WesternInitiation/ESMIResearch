@@ -200,10 +200,16 @@ def _run_method(
         )
     if method == "LZW":
         return run_lzw_compression(bands)
-    # JPEG2000 — Pillow may lack OpenJPEG; fall back to JPEG quality proxy.
-    rate = max(1, int(round(float(np.clip(jpeg_rate, 0.05, 1.0)) * 100)))
+    if method != "JPEG2000":
+        raise ValueError(f"Unknown method: {method}")
+
+    # UI jpeg_rate is quality-like in (0, 1] (same as the browser JPEG stand-in).
+    # OpenJPEG quality_mode="rates": larger layer values → stronger compression.
+    # Map high quality → low rate so the slider direction matches the browser.
+    quality = float(np.clip(jpeg_rate, 0.05, 0.95))
+    openjpeg_rate = max(1, int(round((1.0 - quality) * 40 + 1)))
     try:
-        return run_jpeg2000_compression(bands, rate=max(1, rate // 10 or 1))
+        return run_jpeg2000_compression(bands, rate=openjpeg_rate)
     except Exception:
         from compression.base import build_execution_result
         from time import perf_counter
@@ -211,7 +217,6 @@ def _run_method(
         start = perf_counter()
         reconstructed: dict[str, np.ndarray] = {}
         encoded_total = 0
-        quality = float(np.clip(jpeg_rate, 0.05, 0.95))
         for name, band in bands.items():
             band_f = band.astype(np.float64)
             lo, hi = float(band_f.min()), float(band_f.max())
@@ -230,7 +235,11 @@ def _run_method(
             reconstructed_bands=reconstructed,
             compressed_bytes_estimate=encoded_total,
             runtime_seconds=perf_counter() - start,
-            metadata={"codec": "jpeg-fallback", "quality": quality},
+            metadata={
+                "codec": "jpeg-fallback",
+                "quality": quality,
+                "requested_openjpeg_rate": openjpeg_rate,
+            },
         )
 
 

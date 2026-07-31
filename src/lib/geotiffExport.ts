@@ -119,7 +119,9 @@ export function writeClassicTiff(options: TiffWriteOptions): ArrayBuffer {
   const bitsOffset = 8
   const sampleFormatOffset = bitsOffset + bitsPerSampleBytes
   const stripOffset = sampleFormatOffset + sampleFormatBytes
-  const ifdOffset = stripOffset + strip.byteLength
+  // TIFF IFDs must start on a word boundary.
+  let ifdOffset = stripOffset + strip.byteLength
+  if (ifdOffset & 1) ifdOffset += 1
 
   const entryCount = 11
   const ifdSize = 2 + entryCount * 12 + 4
@@ -208,13 +210,18 @@ export async function bandsToGeoTiffArrayBuffer(
   })
 
   const interleaved = interleaveBands(samples, width, height, true)
+  // Scientific float stacks are MinIsBlack; only true 3-band RGB uses photometric RGB.
+  const looksLikeRgb =
+    samples.length === 3 &&
+    names.length === 3 &&
+    names.every((n) => /^(r|red|g|green|b|blue)$/i.test(n))
   return writeClassicTiff({
     width,
     height,
     samplesPerPixel: samples.length,
     bitsPerSample: 32,
     sampleFormat: 3,
-    photometric: samples.length >= 3 ? 2 : 1,
+    photometric: looksLikeRgb ? 2 : 1,
     data: interleaved,
   })
 }
@@ -279,17 +286,29 @@ export async function downloadRgbPreviewAsGeoTiff(
 }
 
 /**
- * Fallback PNG download when the caller already has a preview data URL.
+ * Fallback download for a PNG/JPEG (or other) preview data URL.
+ * Uses a Blob so large previews are not limited by data-URL href length, and
+ * picks the file extension from the MIME type (compressed previews are JPEG).
  */
+export async function downloadPreviewDataUrl(
+  dataUrl: string,
+  filename: string,
+): Promise<void> {
+  const res = await fetch(dataUrl)
+  const blob = await res.blob()
+  const mime = (blob.type || '').toLowerCase()
+  const ext = mime.includes('jpeg') || mime.includes('jpg')
+    ? 'jpg'
+    : mime.includes('png')
+      ? 'png'
+      : mime.includes('tif')
+        ? 'tif'
+        : 'bin'
+  const base = filename.replace(/\.(png|jpe?g|tiff?|bin)$/i, '')
+  downloadBlob(blob, `${base}.${ext}`)
+}
+
+/** @deprecated Prefer downloadPreviewDataUrl — kept for callers that expect sync PNG naming. */
 export function downloadPngDataUrl(dataUrl: string, filename: string) {
-  const a = document.createElement('a')
-  a.href = dataUrl
-  a.download = filename.endsWith('.png')
-    ? filename
-    : `${filename.replace(/\.tiff?$/i, '')}.png`
-  a.rel = 'noopener'
-  a.style.display = 'none'
-  document.body.appendChild(a)
-  a.click()
-  window.setTimeout(() => a.remove(), 500)
+  void downloadPreviewDataUrl(dataUrl, filename)
 }

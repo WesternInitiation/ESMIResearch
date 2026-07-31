@@ -440,11 +440,13 @@ def _run_selected_method(
         )
     elif method == "LZW":
         raw_result = run_lzw_compression(working_bands)
-    else:
+    elif method == "JPEG2000":
         raw_result = run_jpeg2000_compression(
             working_bands,
             rate=jpeg2000_rate,
         )
+    else:
+        raise ValueError(f"Unknown compression method: {method}")
 
     restored_bands = _recover_original_band_space(
         raw_result.reconstructed_bands, weight_matrix, band_order
@@ -725,7 +727,7 @@ with st.sidebar:
     elif method == "Wavelet transformation":
         wavelet_name = st.selectbox(
             "Wavelet family",
-            options=["db4", "db2", "haar", "sym4", "sym2", "db1"],
+            options=["db4", "db2", "haar", "sym4", "sym2"],
             index=0,
         )
         wavelet_level = st.slider("Wavelet decomposition level", min_value=1, max_value=5, value=2)
@@ -751,11 +753,11 @@ with st.sidebar:
         )
     else:
         jpeg2000_rate = st.slider(
-            "JPEG2000 rate",
+            "JPEG2000 compression ratio (OpenJPEG rates)",
             min_value=5,
             max_value=100,
             value=20,
-            help="Larger values generally preserve more detail but use more bytes.",
+            help="Higher rate = stronger compression (fewer bytes, lower fidelity).",
         )
 
 if not channel_configs:

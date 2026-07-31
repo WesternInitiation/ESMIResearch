@@ -21,7 +21,8 @@ function haarForward(row: Float64Array): Float64Array {
     out[i] = (a + b) / 2
     out[half + i] = (a - b) / 2
   }
-  if (n % 2 === 1) out[half] = row[n - 1]
+  // Keep the unpaired sample at the end — never overwrite the first detail at `half`.
+  if (n % 2 === 1) out[n - 1] = row[n - 1]
   return out
 }
 
@@ -35,7 +36,7 @@ function haarInverse(row: Float64Array): Float64Array {
     out[i * 2] = approx + detail
     if (i * 2 + 1 < n) out[i * 2 + 1] = approx - detail
   }
-  if (n % 2 === 1) out[n - 1] = row[half] ?? out[n - 2]
+  if (n % 2 === 1) out[n - 1] = row[n - 1]
   return out
 }
 

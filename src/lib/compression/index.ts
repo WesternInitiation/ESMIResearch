@@ -53,7 +53,7 @@ export async function runCompression(
     )
   } else if (method === 'LZW') {
     result = runLzwCompression(bands, bandOrder)
-  } else {
+  } else if (method === 'JPEG2000') {
     result = await runJpeg2000Compression(
       bands,
       bandOrder,
@@ -61,6 +61,8 @@ export async function runCompression(
       height,
       params.jpegRate,
     )
+  } else {
+    throw new Error(`Unknown compression method: ${method as string}`)
   }
 
   const runtimeSeconds = (performance.now() - started) / 1000

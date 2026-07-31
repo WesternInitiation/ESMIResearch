@@ -20,7 +20,7 @@ import {
 import { downloadCsv } from '@/lib/csv'
 import {
   downloadBandsAsGeoTiff,
-  downloadPngDataUrl,
+  downloadPreviewDataUrl,
   downloadRgbPreviewAsGeoTiff,
 } from '@/lib/geotiffExport'
 import { jpegRoundtripBands } from '@/lib/lossyBands'
@@ -1150,7 +1150,17 @@ export default function CompressionLab() {
         onProgress: (message) => setStatus(message),
       })
       setResult(out)
-      applyBrowserResultPreviews(out, image)
+      try {
+        applyBrowserResultPreviews(out, image)
+      } catch (previewErr) {
+        // Bands are still available for float TIFF download even if canvas preview fails.
+        clearResultPreviews()
+        setStatus(
+          `Done in ${out.runtimeSeconds.toFixed(2)}s · ratio ${fmt(out.compressionRatio, 3)} · ${out.width}×${out.height} (preview unavailable)`,
+        )
+        console.warn(previewErr)
+        return
+      }
       setStatus(
         `Done in ${out.runtimeSeconds.toFixed(2)}s · ratio ${fmt(out.compressionRatio, 3)} · ${out.width}×${out.height}`,
       )
@@ -1166,7 +1176,8 @@ export default function CompressionLab() {
     if (!image) return
     setError(null)
     setBusy(true)
-    clearResultPreviews()
+    // Keep prior Run previews/downloads; only clear the residual (method-specific).
+    setResidualPreview(null)
 
     const useCloudRun =
       engine === 'cloud-run' && !isMultiMemberStack(image) && Boolean(rawFile)
@@ -1540,13 +1551,14 @@ export default function CompressionLab() {
   }
 
   async function onDownloadDecompressedTif() {
-    if (!result && !decompressedPreview) return
+    const hasBands = Boolean(result && Object.keys(result.bands).length > 0)
+    if (!hasBands && !decompressedPreview) return
     setBusy(true)
     setError(null)
     try {
       const filename = `esmi-decompressed-${Date.now()}.tif`
       // Prefer real reconstructed bands when present; otherwise encode the preview.
-      if (result && Object.keys(result.bands).length > 0) {
+      if (hasBands && result) {
         await downloadBandsAsGeoTiff(
           result.bands,
           result.bandOrder,
@@ -1562,9 +1574,9 @@ export default function CompressionLab() {
       setStatus(`Downloaded ${filename}`)
     } catch (err) {
       if (decompressedPreview) {
-        const pngName = `esmi-decompressed-${Date.now()}.png`
-        downloadPngDataUrl(decompressedPreview, pngName)
-        setStatus(`Downloaded ${pngName} (TIFF encode unavailable)`)
+        const fallbackName = `esmi-decompressed-${Date.now()}`
+        await downloadPreviewDataUrl(decompressedPreview, fallbackName)
+        setStatus(`Downloaded preview fallback (TIFF encode unavailable)`)
         setError(null)
       } else {
         setError(err instanceof Error ? err.message : 'Download failed')
@@ -1575,7 +1587,8 @@ export default function CompressionLab() {
   }
 
   async function onDownloadCompressedTif() {
-    if (!result && !compressedArtifactPreview) return
+    const hasBands = Boolean(result && Object.keys(result.bands).length > 0)
+    if (!compressedArtifactPreview && !hasBands) return
     setBusy(true)
     setError(null)
     try {
@@ -1583,7 +1596,7 @@ export default function CompressionLab() {
       // Preview-based RGB GeoTIFF is the most reliable path for "compressed" artifact.
       if (compressedArtifactPreview) {
         await downloadRgbPreviewAsGeoTiff(compressedArtifactPreview, filename)
-      } else if (result && Object.keys(result.bands).length > 0) {
+      } else if (hasBands && result) {
         const compressedBands = await jpegRoundtripBands(
           result.bands,
           result.bandOrder,
@@ -1604,9 +1617,9 @@ export default function CompressionLab() {
       setStatus(`Downloaded ${filename}`)
     } catch (err) {
       if (compressedArtifactPreview) {
-        const pngName = `esmi-compressed-${Date.now()}.png`
-        downloadPngDataUrl(compressedArtifactPreview, pngName)
-        setStatus(`Downloaded ${pngName} (TIFF encode unavailable)`)
+        const fallbackName = `esmi-compressed-${Date.now()}`
+        await downloadPreviewDataUrl(compressedArtifactPreview, fallbackName)
+        setStatus(`Downloaded preview fallback (TIFF encode unavailable)`)
         setError(null)
       } else {
         setError(err instanceof Error ? err.message : 'Download failed')
@@ -2125,10 +2138,15 @@ export default function CompressionLab() {
               </figure>
               <figure>
                 <figcaption>Compressed</figcaption>
-                {compressedArtifactPreview ? (
+                {compressedArtifactPreview ||
+                (result && Object.keys(result.bands).length > 0) ? (
                   <>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
+                    {compressedArtifactPreview ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={compressedArtifactPreview} alt="Compressed artifact preview" />
+                    ) : (
+                      <div className="empty">Preview unavailable — download still works</div>
+                    )}
                     <p className="size-meta">
                       {result
                         ? sizeWithPixels(
@@ -2155,10 +2173,15 @@ export default function CompressionLab() {
               </figure>
               <figure>
                 <figcaption>Decompressed</figcaption>
-                {decompressedPreview ? (
+                {decompressedPreview ||
+                (result && Object.keys(result.bands).length > 0) ? (
                   <>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={decompressedPreview} alt="Decompressed preview" />
+                    {decompressedPreview ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={decompressedPreview} alt="Decompressed preview" />
+                    ) : (
+                      <div className="empty">Preview unavailable — download still works</div>
+                    )}
                     <p className="size-meta">
                       {result
                         ? sizeWithPixels(

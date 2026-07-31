@@ -23,16 +23,25 @@ def compress_band(
     band_f = band.astype(np.float64)
     spectrum = np.fft.fftshift(np.fft.fft2(band_f))
     height, width = band.shape
-    half_h = max(1, int(round((height * keep_fraction) / 2)))
-    half_w = max(1, int(round((width * keep_fraction) / 2)))
-    center_h = height // 2
-    center_w = width // 2
+    keep = float(np.clip(keep_fraction, 0.0, 1.0))
 
     mask = np.zeros_like(spectrum, dtype=bool)
-    mask[
-        max(0, center_h - half_h) : min(height, center_h + half_h),
-        max(0, center_w - half_w) : min(width, center_w + half_w),
-    ] = True
+    if keep >= 1.0 - 1e-12:
+        # Full spectrum — required for near-lossless round-trips on odd sizes.
+        mask[:] = True
+    else:
+        keep_h = max(1, int(np.ceil(height * keep)))
+        keep_w = max(1, int(np.ceil(width * keep)))
+        center_h = height // 2
+        center_w = width // 2
+        row0 = max(0, center_h - keep_h // 2)
+        col0 = max(0, center_w - keep_w // 2)
+        row1 = min(height, row0 + keep_h)
+        col1 = min(width, col0 + keep_w)
+        # If ceil pushed the window past the edge, shift back so we keep the count.
+        row0 = max(0, row1 - keep_h)
+        col0 = max(0, col1 - keep_w)
+        mask[row0:row1, col0:col1] = True
 
     filtered = np.where(mask, spectrum, 0.0)
     reconstructed = np.fft.ifft2(np.fft.ifftshift(filtered)).real
