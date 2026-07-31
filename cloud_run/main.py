@@ -116,6 +116,7 @@ def _downsample_bands(
     sample = next(iter(bands.values()))
     height, width = sample.shape[:2]
     longest = max(height, width)
+    # max_dim <= 0 means native resolution (no downsampling).
     if max_dim <= 0 or longest <= max_dim:
         return bands, 1.0
     scale = max_dim / float(longest)
@@ -127,6 +128,44 @@ def _downsample_bands(
         resized = image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR)
         out[name] = np.asarray(resized, dtype=band.dtype)
     return out, scale
+
+
+def _upsample_bands(
+    bands: dict[str, np.ndarray],
+    target_width: int,
+    target_height: int,
+) -> dict[str, np.ndarray]:
+    """Bilinear upsample so reconstructed bands match the native raster size."""
+    sample = next(iter(bands.values()))
+    height, width = int(sample.shape[0]), int(sample.shape[1])
+    if width == target_width and height == target_height:
+        return bands
+    out: dict[str, np.ndarray] = {}
+    for name, band in bands.items():
+        image = Image.fromarray(band.astype(np.float32), mode="F")
+        resized = image.resize(
+            (target_width, target_height),
+            resample=Image.Resampling.BILINEAR,
+        )
+        out[name] = np.asarray(resized, dtype=band.dtype)
+    return out
+
+
+def _preview_rgb_capped(bands: dict[str, np.ndarray], band_order: list[str], max_side: int = 2048) -> np.ndarray:
+    """Display RGB, capped so Cloud Run JSON responses stay transportable."""
+    rgb = to_display_rgb(bands, band_order)
+    h, w = rgb.shape[:2]
+    longest = max(h, w)
+    if max_side <= 0 or longest <= max_side:
+        return rgb
+    scale = max_side / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    image = Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+    return np.asarray(
+        image.resize((new_w, new_h), resample=Image.Resampling.BILINEAR),
+        dtype=np.uint8,
+    )
 
 
 def _load_from_upload(
@@ -549,14 +588,16 @@ async def compress(
 
     native = next(iter(bands.values())).shape
     native_h, native_w = int(native[0]), int(native[1])
-    bands, scale = _downsample_bands(bands, max(64, int(max_dim)))
-    sample = next(iter(bands.values()))
-    height, width = int(sample.shape[0]), int(sample.shape[1])
+    # max_dim <= 0 → native resolution; otherwise enforce a small lower bound.
+    process_cap = 0 if int(max_dim) <= 0 else max(64, int(max_dim))
+    process_bands, scale = _downsample_bands(bands, process_cap)
+    sample = next(iter(process_bands.values()))
+    process_h, process_w = int(sample.shape[0]), int(sample.shape[1])
 
     try:
         result = _run_method(
             method,  # type: ignore[arg-type]
-            bands,
+            process_bands,
             svd_rank=svd_rank,
             wavelet_keep_fraction=wavelet_keep_fraction,
             wavelet_levels=wavelet_levels,
@@ -568,8 +609,24 @@ async def compress(
         _maybe_delete_gcs_blob(gcs_blob)
         raise HTTPException(status_code=500, detail=f"Compression failed: {exc}") from exc
 
-    original_preview = to_display_rgb(bands, band_order)
-    reconstructed_preview = to_display_rgb(result.reconstructed_bands, band_order)
+    # Restore native raster size so clients can compare / download at original dims.
+    if scale < 1.0 - 1e-12 or process_w != native_w or process_h != native_h:
+        result.reconstructed_bands = _upsample_bands(
+            result.reconstructed_bands, native_w, native_h
+        )
+        result.metadata = {
+            **result.metadata,
+            "processWidth": process_w,
+            "processHeight": process_h,
+            "restoredToNative": True,
+        }
+    width, height = native_w, native_h
+
+    # Previews are capped for JSON transport; width/height above stay native.
+    original_preview = _preview_rgb_capped(bands, band_order)
+    reconstructed_preview = _preview_rgb_capped(
+        result.reconstructed_bands, band_order
+    )
 
     ndvi_payload: dict[str, float] | None = None
     red_name = red_band if red_band in bands else ("red" if "red" in bands else None)

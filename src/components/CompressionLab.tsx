@@ -27,7 +27,7 @@ import {
 import { jpegRoundtripBands } from '@/lib/lossyBands'
 import { estimateByteSize } from '@/lib/metrics'
 import { fetchDemoCatalog, fetchDemoMemberFile, fetchGcsBuckets } from '@/lib/demoData'
-import { downsampleBands } from '@/lib/resize'
+import { cloneBandMap, downsampleBands, upsampleBands } from '@/lib/resize'
 import { fetchCloudRunStatus, runServerCompression, VERCEL_PROXY_UPLOAD_BYTES } from '@/lib/serverCompress'
 import {
   MAX_INGEST_BYTES,
@@ -58,6 +58,7 @@ import {
 } from '@/lib/image'
 import {
   COMPRESSION_METHODS,
+  type BandMap,
   type CompressionMethod,
   type CompressionResult,
 } from '@/lib/types'
@@ -77,6 +78,8 @@ type CompareRow = {
 type IndexCompareTarget = 'decompressed' | 'compressed'
 
 type WorkingImage = LoadedImage & {
+  /** Full-resolution bands (never downsampled). Used to restore outputs. */
+  nativeBands: BandMap
   nativeWidth: number
   nativeHeight: number
   processScale: number
@@ -184,32 +187,98 @@ const DEFAULT_PARAMS: MethodParams = {
   jpegRate: 0.45,
 }
 
-const PROCESS_DIM_OPTIONS_BROWSER = [512, 768, 1024, 1536, 2048, 3072, 4096] as const
-const PROCESS_DIM_OPTIONS_SERVER = [1024, 1536, 2048, 3072, 4096, 6144, 8192] as const
+const PROCESS_DIM_OPTIONS_BROWSER = [0, 512, 768, 1024, 1536, 2048, 3072, 4096] as const
+const PROCESS_DIM_OPTIONS_SERVER = [0, 1024, 1536, 2048, 3072, 4096, 6144, 8192] as const
 
 type Engine = 'browser' | 'cloud-run'
 
 function toWorkingImage(loaded: LoadedImage, maxDim: number): WorkingImage {
+  // Prefer an existing native raster when re-sampling a WorkingImage.
+  const prior = loaded as WorkingImage
+  const nativeBands =
+    prior.nativeBands && prior.nativeWidth && prior.nativeHeight
+      ? prior.nativeBands
+      : cloneBandMap(loaded.bands, loaded.bandOrder)
+  const nativeWidth = prior.nativeBands ? prior.nativeWidth : loaded.size.width
+  const nativeHeight = prior.nativeBands ? prior.nativeHeight : loaded.size.height
+
   const resized = downsampleBands(
-    loaded.bands,
+    nativeBands,
     loaded.bandOrder,
-    loaded.size.width,
-    loaded.size.height,
+    nativeWidth,
+    nativeHeight,
     maxDim,
+  )
+  // Cap the on-screen preview independently so Native 8k scenes stay interactive.
+  const previewSource = downsampleBands(
+    resized.bands,
+    loaded.bandOrder,
+    resized.width,
+    resized.height,
+    2048,
   )
   return {
     ...loaded,
     bands: resized.bands,
     size: { width: resized.width, height: resized.height },
     previewRgba: toPreviewRgba(
-      resized.bands,
+      previewSource.bands,
       loaded.bandOrder,
-      resized.width,
-      resized.height,
+      previewSource.width,
+      previewSource.height,
     ),
-    nativeWidth: loaded.size.width,
-    nativeHeight: loaded.size.height,
+    nativeBands,
+    nativeWidth,
+    nativeHeight,
     processScale: resized.scale,
+  }
+}
+
+/** Restore reconstructed bands to the native raster size for fair comparisons. */
+function restoreResultToNative(
+  out: CompressionResult,
+  image: WorkingImage,
+): CompressionResult {
+  if (
+    out.width === image.nativeWidth &&
+    out.height === image.nativeHeight &&
+    Object.keys(out.bands).length > 0
+  ) {
+    return out
+  }
+  if (Object.keys(out.bands).length === 0) {
+    return {
+      ...out,
+      width: image.nativeWidth,
+      height: image.nativeHeight,
+      metadata: {
+        ...out.metadata,
+        processWidth: out.width,
+        processHeight: out.height,
+        restoredToNative: out.width !== image.nativeWidth || out.height !== image.nativeHeight,
+      },
+    }
+  }
+  const bands = upsampleBands(
+    out.bands,
+    out.bandOrder,
+    out.width,
+    out.height,
+    image.nativeWidth,
+    image.nativeHeight,
+  )
+  return {
+    ...out,
+    bands,
+    width: image.nativeWidth,
+    height: image.nativeHeight,
+    decompressedBytes: estimateByteSize(bands),
+    metadata: {
+      ...out.metadata,
+      processWidth: out.width,
+      processHeight: out.height,
+      restoredToNative: true,
+    },
   }
 }
 
@@ -232,7 +301,8 @@ export default function CompressionLab() {
   const [ndwiPairLoaded, setNdwiPairLoaded] = useState(false)
   const [pairMode, setPairMode] = useState(false)
   const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
-  const [maxProcessDim, setMaxProcessDim] = useState<number>(1024)
+  // 0 = native resolution (no downsampling). Prefer this for fair comparisons.
+  const [maxProcessDim, setMaxProcessDim] = useState<number>(0)
   const [engine, setEngine] = useState<Engine>('cloud-run')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
@@ -326,29 +396,47 @@ export default function CompressionLab() {
     out: CompressionResult,
     source: WorkingImage,
   ) {
-    const decompressed = bandsToDecompressedPreview(
+    // Downloads keep full native bands on `out`; on-screen previews are capped.
+    const previewMax = 2048
+    const reconPrev = downsampleBands(
       out.bands,
       out.bandOrder,
       out.width,
       out.height,
+      previewMax,
+    )
+    const origPrev = downsampleBands(
+      source.nativeBands,
+      out.bandOrder,
+      out.width,
+      out.height,
+      previewMax,
+    )
+    const width = reconPrev.width
+    const height = reconPrev.height
+    const decompressed = bandsToDecompressedPreview(
+      reconPrev.bands,
+      out.bandOrder,
+      width,
+      height,
     )
     const compressed = bandsToCompressedArtifactPreview(
-      out.bands,
+      reconPrev.bands,
       out.bandOrder,
-      out.width,
-      out.height,
+      width,
+      height,
       jpegQualityForMethod(),
     )
     const residual = rgbaToPngDataUrl(
       residualPreviewRgba(
-        source.bands,
-        out.bands,
+        origPrev.bands,
+        reconPrev.bands,
         out.bandOrder,
-        out.width,
-        out.height,
+        width,
+        height,
       ),
-      out.width,
-      out.height,
+      width,
+      height,
     )
     setDecompressedPreview(decompressed)
     setCompressedArtifactPreview(compressed)
@@ -1117,7 +1205,13 @@ export default function CompressionLab() {
             },
           })
           setStatus(
-            `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · ${out.width}×${out.height} (native ${out.nativeWidth}×${out.nativeHeight}). NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.`,
+            `Cloud Run done in ${out.runtimeSeconds.toFixed(2)}s · output ${out.width}×${out.height}` +
+              (out.metadata &&
+              typeof out.metadata === 'object' &&
+              (out.metadata as { processWidth?: number }).processWidth
+                ? ` (compressed at ${(out.metadata as { processWidth: number }).processWidth}×${(out.metadata as { processHeight: number }).processHeight}, restored to native)`
+                : '') +
+              '. NDVI/NDWI compare stays local — use Browser (or a multi-band stack) for index comparison.',
           )
           setBusy(false)
           return
@@ -1148,16 +1242,19 @@ export default function CompressionLab() {
         : `Running ${method} in browser worker…`,
     )
     try {
-      const out = await runCompressionAsync({
-        method,
-        bands: image.bands,
-        bandOrder: image.bandOrder,
-        width: image.size.width,
-        height: image.size.height,
-        originalBytes: image.originalBytes,
-        params,
-        onProgress: (message) => setStatus(message),
-      })
+      const out = restoreResultToNative(
+        await runCompressionAsync({
+          method,
+          bands: image.bands,
+          bandOrder: image.bandOrder,
+          width: image.size.width,
+          height: image.size.height,
+          originalBytes: image.originalBytes,
+          params,
+          onProgress: (message) => setStatus(message),
+        }),
+        image,
+      )
       setResult(out)
       try {
         applyBrowserResultPreviews(out, image)
@@ -1170,8 +1267,14 @@ export default function CompressionLab() {
         console.warn(previewErr)
         return
       }
+      const processNote =
+        out.metadata?.processWidth &&
+        (out.metadata.processWidth !== out.width ||
+          out.metadata.processHeight !== out.height)
+          ? ` · compressed at ${out.metadata.processWidth}×${out.metadata.processHeight}, restored to native`
+          : ''
       setStatus(
-        `Done in ${out.runtimeSeconds.toFixed(2)}s · ratio ${fmt(out.compressionRatio, 3)} · ${out.width}×${out.height}`,
+        `Done in ${out.runtimeSeconds.toFixed(2)}s · ratio ${fmt(out.compressionRatio, 3)} · ${out.width}×${out.height}${processNote}`,
       )
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Compression failed')
@@ -1361,26 +1464,35 @@ export default function CompressionLab() {
         )
       }
 
+      // Prefer native-resolution originals so index maps match restored outputs.
+      const originalBands = image.nativeBands ?? image.bands
+
       if (indexKind === 'ndvi') {
-        const redO = image.bands[redBand]
-        const nirO = image.bands[nirBand]
+        const redO = originalBands[redBand]
+        const nirO = originalBands[nirBand]
         const redC = candidateBands[redBand]
         const nirC = candidateBands[nirBand]
         if (!redO || !nirO || !redC || !nirC) {
           setError(`Need both ${redBand} and ${nirBand} in original and candidate bands`)
           return
         }
+        if (redO.length !== redC.length || nirO.length !== nirC.length) {
+          setError(
+            `Index bands differ in size (original ${redO.length} vs candidate ${redC.length}). Re-run compression with Native processing size.`,
+          )
+          return
+        }
         const ref = computeNdvi(redO, nirO)
         const cand = computeNdvi(redC, nirC)
         setIndexMetrics(compareIndexMaps(ref, cand))
         setStatus(
-          `NDVI: original vs after-${indexCompareTarget} (local)`,
+          `NDVI: original vs after-${indexCompareTarget} (local, ${result.width}×${result.height})`,
         )
         return
       }
 
-      const greenO = image.bands[greenBand]
-      const secondO = image.bands[ndwiSecondBand]
+      const greenO = originalBands[greenBand]
+      const secondO = originalBands[ndwiSecondBand]
       const greenC = candidateBands[greenBand]
       const secondC = candidateBands[ndwiSecondBand]
       if (!greenO || !secondO || !greenC || !secondC) {
@@ -1389,11 +1501,19 @@ export default function CompressionLab() {
         )
         return
       }
+      if (greenO.length !== greenC.length || secondO.length !== secondC.length) {
+        setError(
+          `Index bands differ in size (original ${greenO.length} vs candidate ${greenC.length}). Re-run compression with Native processing size.`,
+        )
+        return
+      }
       const ref = computeNdwi(greenO, secondO)
       const cand = computeNdwi(greenC, secondC)
       setIndexMetrics(compareIndexMaps(ref, cand))
       const label = ndwiSecondBand === 'swir' ? 'MNDWI' : 'NDWI'
-      setStatus(`${label}: original vs after-${indexCompareTarget} (local)`)
+      setStatus(
+        `${label}: original vs after-${indexCompareTarget} (local, ${result.width}×${result.height})`,
+      )
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Index comparison failed')
     } finally {
@@ -1840,7 +1960,8 @@ export default function CompressionLab() {
             onChange={(e) => {
               const next = e.target.value as Engine
               setEngine(next)
-              if (next === 'cloud-run' && maxProcessDim < 1024) {
+              // Keep Native (0). Only clamp non-native sizes to engine-safe ranges.
+              if (next === 'cloud-run' && maxProcessDim > 0 && maxProcessDim < 1024) {
                 void onMaxDimChange(2048)
               } else if (next === 'browser' && maxProcessDim > 4096) {
                 void onMaxDimChange(1024)
@@ -1860,7 +1981,7 @@ export default function CompressionLab() {
           )}
 
           <label>
-            Max processing size (faster ← → sharper)
+            Max processing size (Native keeps original resolution)
             <select
               value={maxProcessDim}
               disabled={busy}
@@ -1871,11 +1992,20 @@ export default function CompressionLab() {
                 : PROCESS_DIM_OPTIONS_BROWSER
               ).map((d) => (
                 <option key={d} value={d}>
-                  {d}px
+                  {d === 0 ? 'Native (full resolution)' : `${d}px`}
                 </option>
               ))}
             </select>
           </label>
+          <p className="hint">
+            Outputs are always restored to the native pixel size for comparison
+            {image
+              ? ` (${image.nativeWidth}×${image.nativeHeight})`
+              : ''}
+            . Lower caps only speed up the compressor; choose Native for true
+            full-resolution runs
+            {engine === 'browser' ? ' (large scenes may be slow in-browser)' : ''}.
+          </p>
 
           <h2>Method</h2>
           <select
