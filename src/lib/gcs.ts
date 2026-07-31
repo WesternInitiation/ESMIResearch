@@ -203,3 +203,49 @@ export async function createGcsSignedUpload(input: {
     expiresAt: new Date(expires).toISOString(),
   }
 }
+
+export async function createGcsSignedDownload(gcsUri: string): Promise<{
+  downloadUrl: string
+  gcsUri: string
+  objectName: string
+  bucket: string
+  expiresAt: string
+}> {
+  const trimmed = gcsUri.trim()
+  if (!trimmed.startsWith('gs://')) {
+    throw new Error('gcsUri must start with gs://')
+  }
+  const rest = trimmed.slice(5)
+  const slash = rest.indexOf('/')
+  if (slash <= 0 || slash === rest.length - 1) {
+    throw new Error('Invalid gcsUri')
+  }
+  const bucketName = rest.slice(0, slash)
+  const objectName = rest.slice(slash + 1)
+  const uploadBucket = gcsUploadBucket()
+  // Only sign objects in the configured upload/results bucket (not arbitrary buckets).
+  if (!uploadBucket || bucketName !== uploadBucket) {
+    throw new Error(
+      `Refusing to sign download outside GCS_UPLOAD_BUCKET (${uploadBucket || 'unset'})`,
+    )
+  }
+  if (!objectName.startsWith('results/') && !objectName.startsWith('uploads/')) {
+    throw new Error('Refusing to sign download outside results/ or uploads/ prefixes')
+  }
+
+  const expires = Date.now() + 60 * 60 * 1000
+  const storage = storageClient()
+  const file = storage.bucket(bucketName).file(objectName)
+  const [downloadUrl] = await file.getSignedUrl({
+    version: 'v4',
+    action: 'read',
+    expires,
+  })
+  return {
+    downloadUrl,
+    gcsUri: trimmed,
+    objectName,
+    bucket: bucketName,
+    expiresAt: new Date(expires).toISOString(),
+  }
+}

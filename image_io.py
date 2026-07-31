@@ -566,8 +566,11 @@ def encode_reconstructed_image(
     """
     Encode reconstructed pixels as a downloadable image.
 
-    GeoTIFF inputs retain their raster profile and are stored with lossless DEFLATE.
-    Other inputs are exported as lossless PNG files.
+    GeoTIFF inputs keep CRS / transform / tags and are written as float32
+    GeoTIFFs (lossless DEFLATE) so analysis keeps full reconstructed precision
+    without re-quantizing to uint8/uint16. Other inputs export as a float32
+    GeoTIFF without georeferencing when rasterio is available; otherwise PNG
+    when the pixel type is display-compatible.
     """
     ordered = [reconstructed_bands[name] for name in loaded.band_order]
 
@@ -577,22 +580,28 @@ def encode_reconstructed_image(
         if loaded.raster_profile is None:
             raise ValueError("The source GeoTIFF profile is unavailable.")
 
+        # Always float32 for analysis — reconstructed values are already continuous.
+        float_bands = [np.asarray(band, dtype=np.float32) for band in ordered]
+        height, width = float_bands[0].shape[:2]
+
         profile = loaded.raster_profile.copy()
         profile.update(
             driver="GTiff",
-            count=len(ordered),
-            height=ordered[0].shape[0],
-            width=ordered[0].shape[1],
-            dtype=ordered[0].dtype,
+            count=len(float_bands),
+            height=height,
+            width=width,
+            dtype="float32",
             compress="deflate",
         )
         profile.pop("blockxsize", None)
         profile.pop("blockysize", None)
         profile.pop("tiled", None)
+        # nodata from integer sources may not apply cleanly to float reconstructions.
+        profile.pop("nodata", None)
 
         with MemoryFile() as memfile:
             with memfile.open(**profile) as dataset:
-                dataset.write(np.stack(ordered, axis=0))
+                dataset.write(np.stack(float_bands, axis=0))
                 for index, name in enumerate(loaded.band_order, start=1):
                     original_description = (
                         loaded.raster_descriptions[index - 1]
@@ -611,12 +620,37 @@ def encode_reconstructed_image(
                 if loaded.raster_colorinterp is not None:
                     dataset.colorinterp = loaded.raster_colorinterp
                 if loaded.raster_mask is not None:
-                    dataset.write_mask(loaded.raster_mask)
+                    mask = loaded.raster_mask
+                    if mask.shape[0] != height or mask.shape[1] != width:
+                        # Native-size restore can change dims; skip mismatched masks.
+                        mask = None
+                    if mask is not None:
+                        dataset.write_mask(mask)
                 if loaded.raster_gcps is not None and loaded.raster_gcps[0]:
                     dataset.gcps = loaded.raster_gcps
                 if loaded.raster_rpcs is not None:
                     dataset.rpcs = loaded.raster_rpcs
                 _write_raster_tags(dataset, loaded)
+            output = memfile.read()
+        return output, "compressed_image.tif", "image/tiff"
+
+    # Non-GeoTIFF sources: still prefer float32 GeoTIFF for analysis downloads.
+    if HAS_RASTERIO:
+        float_bands = [np.asarray(band, dtype=np.float32) for band in ordered]
+        height, width = float_bands[0].shape[:2]
+        profile = {
+            "driver": "GTiff",
+            "height": height,
+            "width": width,
+            "count": len(float_bands),
+            "dtype": "float32",
+            "compress": "deflate",
+        }
+        with MemoryFile() as memfile:
+            with memfile.open(**profile) as dataset:
+                dataset.write(np.stack(float_bands, axis=0))
+                for index, name in enumerate(loaded.band_order, start=1):
+                    dataset.set_band_description(index, name)
             output = memfile.read()
         return output, "compressed_image.tif", "image/tiff"
 

@@ -33,6 +33,15 @@ export type ServerCompressResponse = {
   originalPreviewPngBase64: string
   previewPngBase64: string
   residualPreviewPngBase64?: string | null
+  /** float32 GeoTIFF artifact for analysis downloads */
+  artifactAvailable?: boolean
+  artifactFilename?: string
+  artifactMime?: string
+  artifactBytes?: number
+  artifactDtype?: string
+  artifactBase64?: string
+  artifactGcsUri?: string
+  artifactError?: string
 }
 
 /** Soft limit for multipart bodies through the Vercel /api/compress proxy. */

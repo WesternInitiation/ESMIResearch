@@ -218,9 +218,20 @@ class ArchiveImageTests(unittest.TestCase):
             loaded, {"gray": loaded.bands["gray"]}
         )
 
-        self.assertEqual(filename, "compressed_image.png")
-        self.assertEqual(mime, "image/png")
-        self.assertEqual(Image.open(io.BytesIO(output)).size, (8, 8))
+        # Prefer float32 GeoTIFF for analysis when rasterio is available.
+        if HAS_RASTERIO:
+            self.assertEqual(filename, "compressed_image.tif")
+            self.assertEqual(mime, "image/tiff")
+            with MemoryFile(output) as memfile:
+                with memfile.open() as dataset:
+                    self.assertEqual(dataset.count, 1)
+                    self.assertEqual(dataset.dtypes, ("float32",))
+                    self.assertEqual(dataset.width, 8)
+                    self.assertEqual(dataset.height, 8)
+        else:
+            self.assertEqual(filename, "compressed_image.png")
+            self.assertEqual(mime, "image/png")
+            self.assertEqual(Image.open(io.BytesIO(output)).size, (8, 8))
 
     @unittest.skipUnless(HAS_RASTERIO, "rasterio is not installed")
     def test_geotiff_export_preserves_band_count_and_georeferencing(self) -> None:
@@ -264,6 +275,7 @@ class ArchiveImageTests(unittest.TestCase):
         with MemoryFile(output) as memfile:
             with memfile.open() as dataset:
                 self.assertEqual(dataset.count, 2)
+                self.assertEqual(dataset.dtypes, ("float32", "float32"))
                 self.assertEqual(dataset.crs.to_string(), "EPSG:4326")
                 self.assertEqual(dataset.transform, transform)
                 self.assertEqual(dataset.compression.name.lower(), "deflate")
@@ -274,6 +286,8 @@ class ArchiveImageTests(unittest.TestCase):
                 self.assertEqual(dataset.tags()["PRODUCT"], "test-scene")
                 self.assertEqual(dataset.tags(1)["BAND_ROLE"], "red")
                 self.assertEqual(dataset.dataset_mask()[0, 0], 0)
+                # Reconstructed DN preserved as float32 (no uint16 re-quantization).
+                self.assertTrue(np.allclose(dataset.read(1), 1.0))
 
 
 if __name__ == "__main__":
