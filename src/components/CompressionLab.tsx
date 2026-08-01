@@ -338,9 +338,9 @@ export default function CompressionLab() {
   const [ndwiPairLoaded, setNdwiPairLoaded] = useState(false)
   const [pairMode, setPairMode] = useState(false)
   const [pendingRedSingle, setPendingRedSingle] = useState<LoadedImage | null>(null)
-  // 0 = native. Default 2048 so Cloud Run finishes under Vercel’s old sync limit;
-  // Native remains available for final geospatial exports when needed.
-  const [maxProcessDim, setMaxProcessDim] = useState<number>(2048)
+  // 0 = native resolution (no downsampling). Default Native for full-res Cloud Run /
+  // GeoTIFF exports; users can drop to 1024/2048 for faster runs.
+  const [maxProcessDim, setMaxProcessDim] = useState<number>(0)
   const [engine, setEngine] = useState<Engine>('cloud-run')
   const [cloudRunOk, setCloudRunOk] = useState(false)
   const [cloudRunConfigured, setCloudRunConfigured] = useState(false)
@@ -2346,15 +2346,15 @@ export default function CompressionLab() {
               disabled={busy}
               onChange={(e) => void onMaxDimChange(Number(e.target.value))}
             >
+              <option value="0">Native (default)</option>
               <option value="1024">1024 px (fast)</option>
-              <option value="2048">2048 px (default)</option>
+              <option value="2048">2048 px</option>
               <option value="4096">4096 px</option>
-              <option value="0">Native (slow — may take several minutes)</option>
             </select>
           </label>
           <p className="hint">
-            Codecs run at this size on Cloud Run. Previews stay ≤1024px. Native is
-            best for final GeoTIFF downloads but is much slower on large Landsat scenes.
+            Codecs run at this size on Cloud Run. Previews stay ≤1024px. Native keeps
+            full Landsat resolution for GeoTIFF downloads; pick 1024/2048 for faster runs.
           </p>
 
           <h2>Method</h2>
