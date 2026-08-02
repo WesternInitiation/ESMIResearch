@@ -1,12 +1,34 @@
 # ESMIResearch
 
-Satellite image compression research workbench: SVD, wavelet, bandwidth-domain,
-and JPEG2000 methods with NDVI preservation checks and optional Supabase sharing.
+- Next.js satellite image compression research workbench
+- Upload formats: GeoTIFF, PNG, JPEG, and TAR archives
+- Compression methods: SVD, wavelet, bandwidth-domain, LZW, and JPEG2000
+- Engines: browser (Web Worker) or Google Cloud Run Python backend for larger jobs
+- Evaluation metrics: compression ratio, RMSE, MAE, PSNR, and SSIM
+- Optional NDVI/NDWI preservation checks against the original bands
+- Defaults: processing size Native; engine Cloud Run when configured
 
-**Primary UI: Vercel** (Next.js at repo root). Compression can run in the
-**browser** (Web Worker) or on **Google Cloud Run** (Python free tier) for heavier jobs.
+**Primary UI: Vercel** (Next.js at repo root). The Streamlit prototype
+(`streamlit_app.py`) remains for local research notebooks.
 
-The Streamlit prototype (`streamlit_app.py`) remains for local research notebooks.
+## Default compression settings
+
+These are the lab UI defaults (`DEFAULT_PARAMS` in
+`src/components/CompressionLab.tsx`) sent to both the browser worker and Cloud
+Run unless you change the sliders. Processing size defaults to **Native**
+(no downsampling); engine defaults to **Cloud Run** when configured.
+
+| Method | Default settings |
+|--------|------------------|
+| **SVD** | Fixed rank `k = 24` (slider range 1–64). Per-band truncated SVD. |
+| **Wavelet** | Family `db4`, keep fraction `0.08`, levels `3`. LL coefficients are always retained; keep fraction budgets the remaining detail coeffs. Browser engine uses multilevel Haar; Cloud Run uses the selected family (default `db4`). |
+| **Bandwidth** | Low-frequency keep fraction `0.12` (centered FFT passband). |
+| **JPEG2000** | Quality-like rate `0.45` (0.1–0.95). Browser uses a JPEG encode/decode stand-in at that quality; Cloud Run maps it to an OpenJPEG rate ≈ `round((1 − 0.45) × 40 + 1) = 23`. |
+| **LZW** | No tunable knobs. Each band is min–max quantized to uint8, then classic LZW with max dictionary size `4096` (12-bit codes). |
+
+Python module fallbacks (if a call omits params) match these for wavelet /
+bandwidth / JPEG quality; Cloud Run’s Form default for SVD rank is `32` when
+the field is absent, but the Next.js UI always sends `24`.
 
 ## Deploy on Vercel
 
@@ -60,8 +82,8 @@ signed URL, then Cloud Run downloads `gcs_uri`. Method / NDVI compare stay in th
 
 - Upload GeoTIFF (`.tif` / `.tiff`), PNG, JPEG, WebP, BMP, GIF, JPEG 2000, or **TAR / TAR.GZ / ZIP** archives of band files (**up to ~2 GiB** in the browser / Streamlit)
 - Engines: **Browser** (Web Worker, large files) or **Cloud Run** (Python; direct HTTP uploads ~30 MB max due to platform limits)
-- Methods: SVD, wavelet, bandwidth, JPEG2000
-- Per-band RMSE / MAE / PSNR / SSIM + optional NDVI
+- Methods: SVD, wavelet, bandwidth, JPEG2000, LZW (see [defaults](#default-compression-settings))
+- Per-band RMSE / MAE / PSNR / SSIM + optional NDVI/NDWI
 - Optional Supabase save + shared run links
 
 ## Streamlit prototype (local / research)
