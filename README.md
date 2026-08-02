@@ -1,16 +1,15 @@
 # ESMIResearch
 
-A Next.js web application for satellite image compression research. It supports
-GeoTIFF, PNG, JPEG, and TAR archive uploads. Images can be compressed with SVD,
-wavelet, bandwidth-domain, LZW, and JPEG2000 methods, either in the browser via a
-Web Worker or on a Google Cloud Run Python backend for larger jobs. Reconstructed
-results are evaluated with compression ratio, RMSE, MAE, PSNR, and SSIM, with
-optional NDVI/NDWI preservation checks against the original bands.
+- Next.js satellite image compression research workbench
+- Upload formats: GeoTIFF, PNG, JPEG, and TAR archives
+- Compression methods: SVD, wavelet, bandwidth-domain, LZW, and JPEG2000
+- Engines: browser (Web Worker) or Google Cloud Run Python backend for larger jobs
+- Evaluation metrics: compression ratio, RMSE, MAE, PSNR, and SSIM
+- Optional NDVI/NDWI preservation checks against the original bands
+- Defaults: processing size Native; engine Cloud Run when configured
 
-**Primary UI: Vercel** (Next.js at repo root). Compression can run in the
-**browser** (Web Worker) or on **Google Cloud Run** (Python) for heavier jobs.
-
-The Streamlit prototype (`streamlit_app.py`) remains for local research notebooks.
+**Primary UI: Vercel** (Next.js at repo root). The Streamlit prototype
+(`streamlit_app.py`) remains for local research notebooks.
 
 ## Default compression settings
 
